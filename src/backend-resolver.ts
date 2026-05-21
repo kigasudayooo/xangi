@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from 'fs';
-import { join } from 'path';
 import type { AgentBackend, Config, EffortLevel } from './config.js';
 import { getBackendDisplayName } from './agent-runner.js';
+import { resolveEnvFilePath } from './env-persist.js';
 
 /**
  * Local LLM の動作モード
@@ -80,14 +80,15 @@ export class BackendResolver {
       }
     }
 
-    // .envファイルのパスを検出（永続化用）
-    // xangiの起動ディレクトリに.envがあればそれを使う
+    // .env ファイルのパスを検出 (永続化用)。XANGI_ENV_PATH 環境変数があればそれを優先、
+    // 無ければ process.cwd() の .env をデフォルトに使う。
+    // 読み取れない場合は永続化しない (Docker 環境で .env ファイルが mount されていない等)。
     try {
-      const candidatePath = join(process.cwd(), '.env');
+      const candidatePath = resolveEnvFilePath();
       readFileSync(candidatePath, 'utf-8');
       this.envFilePath = candidatePath;
     } catch {
-      // .envが見つからない場合は永続化しない（Docker環境等）
+      // 永続化スキップ
     }
   }
 

@@ -252,3 +252,512 @@ describe('loadMessagesFromTranscript', () => {
     expect(restored[0].images).toBeUndefined();
   });
 });
+
+describe('local-llm runner: idempotent tool cache', () => {
+  function makeSession(): import('../src/local-llm/runner.js').Session {
+    return {
+      messages: [],
+      updatedAt: Date.now(),
+      activeToolNames: new Set(),
+      recentToolCallSigs: [],
+      idempotentResultCache: new Map(),
+    };
+  }
+
+  describe('isIdempotentToolCall', () => {
+    it('returns true for wc -c command', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', { command: 'echo "test" | wc -c' })).toBe(true);
+    });
+
+    it('returns true for base64 encode', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', { command: 'echo "test" | base64' })).toBe(true);
+    });
+
+    it('returns true for sha256sum and md5sum', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', { command: 'echo "test" | sha256sum' })).toBe(true);
+      expect(isIdempotentToolCall('exec', { command: 'echo "test" | md5sum' })).toBe(true);
+    });
+
+    it('returns true for python urllib.parse.quote', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(
+        isIdempotentToolCall('exec', {
+          command: `python3 -c "import urllib.parse; print(urllib.parse.quote('test'))"`,
+        })
+      ).toBe(true);
+    });
+
+    it('returns true for python hashlib usage', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(
+        isIdempotentToolCall('exec', {
+          command: `python3 -c "import hashlib; print(hashlib.md5(b'x').hexdigest())"`,
+        })
+      ).toBe(true);
+    });
+
+    it('handles script field (bash tool)', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('bash', { script: 'echo "x" | wc -c' })).toBe(true);
+    });
+
+    it('handles code field (python tool)', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(
+        isIdempotentToolCall('python', {
+          code: `import hashlib\nprint(hashlib.md5(b'x').hexdigest())`,
+        })
+      ).toBe(true);
+    });
+
+    it('returns false for git push (side effect)', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', { command: 'git push origin main' })).toBe(false);
+    });
+
+    it('returns false for curl (network)', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', { command: 'curl https://example.com' })).toBe(false);
+    });
+
+    it('returns false for redirect to file (>)', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', { command: 'echo "test" > /tmp/file' })).toBe(false);
+    });
+
+    it('returns false for append to file (>>)', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', { command: 'echo "test" >> /tmp/file' })).toBe(false);
+    });
+
+    it('returns false for rm', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', { command: 'rm /tmp/foo' })).toBe(false);
+    });
+
+    it('returns false for docker', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', { command: 'docker compose up -d' })).toBe(false);
+    });
+
+    it('returns false for empty/null/non-object args', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', {})).toBe(false);
+      expect(isIdempotentToolCall('exec', null)).toBe(false);
+      expect(isIdempotentToolCall('exec', 'string')).toBe(false);
+      expect(isIdempotentToolCall('exec', undefined)).toBe(false);
+    });
+
+    it('returns false for unrelated command (no idempotent pattern)', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      expect(isIdempotentToolCall('exec', { command: 'ls -la /tmp' })).toBe(false);
+    });
+
+    it('prioritizes side-effect over idempotent pattern (mixed)', async () => {
+      const { isIdempotentToolCall } = await import('../src/local-llm/runner.js');
+      // wc -c は冪等パターンだが、>> redirect 混じりなので副作用優先で false
+      expect(
+        isIdempotentToolCall('exec', { command: 'echo "test" | wc -c >> /tmp/count.log' })
+      ).toBe(false);
+    });
+  });
+
+  describe('cacheIdempotentResult / getCachedIdempotentResult', () => {
+    it('returns undefined on cache miss', async () => {
+      const { getCachedIdempotentResult } = await import('../src/local-llm/runner.js');
+      const session = makeSession();
+      expect(getCachedIdempotentResult(session, 'unknown::{}')).toBeUndefined();
+    });
+
+    it('stores and retrieves result by signature', async () => {
+      const { cacheIdempotentResult, getCachedIdempotentResult, toolCallSignature } =
+        await import('../src/local-llm/runner.js');
+      const session = makeSession();
+      const sig = toolCallSignature('exec', { command: 'echo "x" | wc -c' });
+      cacheIdempotentResult(session, sig, '2\n');
+      expect(getCachedIdempotentResult(session, sig)).toBe('2\n');
+    });
+
+    it('evicts oldest entry (FIFO) when cache exceeds limit (32)', async () => {
+      const { cacheIdempotentResult, getCachedIdempotentResult, toolCallSignature } =
+        await import('../src/local-llm/runner.js');
+      const session = makeSession();
+      for (let i = 0; i < 33; i++) {
+        const sig = toolCallSignature('exec', { command: `echo "${i}" | wc -c` });
+        cacheIdempotentResult(session, sig, `out${i}`);
+      }
+      const firstSig = toolCallSignature('exec', { command: 'echo "0" | wc -c' });
+      expect(getCachedIdempotentResult(session, firstSig)).toBeUndefined();
+      const lastSig = toolCallSignature('exec', { command: 'echo "32" | wc -c' });
+      expect(getCachedIdempotentResult(session, lastSig)).toBe('out32');
+    });
+
+    it('handles missing idempotentResultCache (backward compat for restored sessions)', async () => {
+      const { cacheIdempotentResult, getCachedIdempotentResult } = await import(
+        '../src/local-llm/runner.js'
+      );
+      const session = {
+        messages: [],
+        updatedAt: Date.now(),
+        activeToolNames: new Set(),
+        recentToolCallSigs: [],
+        recentNormSigs: [],
+        idempotentResultCache: undefined as unknown as Map<string, string>,
+      } as import('../src/local-llm/runner.js').Session;
+      expect(getCachedIdempotentResult(session, 'sig')).toBeUndefined();
+      cacheIdempotentResult(session, 'sig', 'out');
+      expect(getCachedIdempotentResult(session, 'sig')).toBe('out');
+    });
+  });
+});
+
+describe('local-llm runner: normalized signature + similarity loop detection (PR-A)', () => {
+  function makeSession(): import('../src/local-llm/runner.js').Session {
+    return {
+      messages: [],
+      updatedAt: Date.now(),
+      activeToolNames: new Set(),
+      recentToolCallSigs: [],
+      recentNormSigs: [],
+      idempotentResultCache: new Map(),
+    };
+  }
+
+  describe('normalizeSignature', () => {
+    it('lowercases the input', async () => {
+      const { normalizeSignature } = await import('../src/local-llm/runner.js');
+      expect(normalizeSignature('Tool_search::{"query":"ArXiv"}')).toBe('tool search query arxiv');
+    });
+
+    it('replaces digits with n (integers and decimals)', async () => {
+      const { normalizeSignature } = await import('../src/local-llm/runner.js');
+      expect(normalizeSignature('search::{"k":42,"r":3.14}')).toBe('search k n r n');
+    });
+
+    it('collapses ASCII punctuation to spaces and compresses whitespace', async () => {
+      const { normalizeSignature } = await import('../src/local-llm/runner.js');
+      expect(normalizeSignature('a,b,,c   d')).toBe('a b c d');
+    });
+
+    it('keeps non-ASCII characters as-is', async () => {
+      const { normalizeSignature } = await import('../src/local-llm/runner.js');
+      expect(normalizeSignature('検索::"arxiv 論文"')).toContain('arxiv 論文');
+      expect(normalizeSignature('検索::"arxiv 論文"')).toContain('検索');
+    });
+
+    it('returns empty string for empty input', async () => {
+      const { normalizeSignature } = await import('../src/local-llm/runner.js');
+      expect(normalizeSignature('')).toBe('');
+    });
+  });
+
+  describe('trigrams', () => {
+    it('returns trigram set with space padding', async () => {
+      const { trigrams } = await import('../src/local-llm/runner.js');
+      const grams = trigrams('abc');
+      // padded ' abc ', trigrams: ' ab', 'abc', 'bc '
+      expect(grams.has(' ab')).toBe(true);
+      expect(grams.has('abc')).toBe(true);
+      expect(grams.has('bc ')).toBe(true);
+    });
+
+    it('returns empty Set for empty string', async () => {
+      const { trigrams } = await import('../src/local-llm/runner.js');
+      expect(trigrams('').size).toBe(0);
+    });
+
+    it('handles single character', async () => {
+      const { trigrams } = await import('../src/local-llm/runner.js');
+      // padded ' a ', single trigram ' a '
+      expect(trigrams('a').size).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  describe('jaccardSimilarity', () => {
+    it('returns 1 for identical strings', async () => {
+      const { jaccardSimilarity } = await import('../src/local-llm/runner.js');
+      expect(jaccardSimilarity('hello world', 'hello world')).toBe(1);
+    });
+
+    it('returns 1 for both empty strings', async () => {
+      const { jaccardSimilarity } = await import('../src/local-llm/runner.js');
+      expect(jaccardSimilarity('', '')).toBe(1);
+    });
+
+    it('returns high similarity for near-duplicate strings', async () => {
+      const { jaccardSimilarity } = await import('../src/local-llm/runner.js');
+      const sim = jaccardSimilarity(
+        'tool_search query arxiv paper',
+        'tool_search query arxiv papers'
+      );
+      expect(sim).toBeGreaterThan(0.8);
+    });
+
+    it('returns low similarity for unrelated strings', async () => {
+      const { jaccardSimilarity } = await import('../src/local-llm/runner.js');
+      const sim = jaccardSimilarity('abcdef', 'xyzwvu');
+      expect(sim).toBeLessThan(0.2);
+    });
+
+    it('is symmetric', async () => {
+      const { jaccardSimilarity } = await import('../src/local-llm/runner.js');
+      const a = 'foo bar baz';
+      const b = 'foo bar qux';
+      expect(jaccardSimilarity(a, b)).toBe(jaccardSimilarity(b, a));
+    });
+  });
+
+  describe('countSimilarMatches', () => {
+    it('counts entries meeting the threshold', async () => {
+      const { countSimilarMatches } = await import('../src/local-llm/runner.js');
+      const sigs = [
+        'tool search query arxiv paper',
+        'tool search query arxiv papers',
+        'tool search query arxiv articles',
+        'unrelated stuff foo bar',
+      ];
+      const target = 'tool search query arxiv paper';
+      const count = countSimilarMatches(sigs, target, 0.6);
+      // First 3 should match (arxiv variants), unrelated should not
+      expect(count).toBeGreaterThanOrEqual(3);
+    });
+
+    it('returns 0 when no entries meet the threshold', async () => {
+      const { countSimilarMatches } = await import('../src/local-llm/runner.js');
+      expect(countSimilarMatches(['abc', 'def'], 'xyz', 0.9)).toBe(0);
+    });
+
+    it('uses default threshold (0.85) when omitted', async () => {
+      const { countSimilarMatches } = await import('../src/local-llm/runner.js');
+      const sigs = ['hello world', 'hello world'];
+      expect(countSimilarMatches(sigs, 'hello world')).toBe(2);
+    });
+  });
+
+  describe('recordToolCallAndDetectLoop', () => {
+    it('returns kind=none for the first call', async () => {
+      const { recordToolCallAndDetectLoop, toolCallSignature } = await import(
+        '../src/local-llm/runner.js'
+      );
+      const session = makeSession();
+      const sig = toolCallSignature('exec', { command: 'ls' });
+      expect(recordToolCallAndDetectLoop(session, sig).kind).toBe('none');
+    });
+
+    it('detects exact loop after 3 identical calls', async () => {
+      const { recordToolCallAndDetectLoop, toolCallSignature } = await import(
+        '../src/local-llm/runner.js'
+      );
+      const session = makeSession();
+      const sig = toolCallSignature('tool_search', { query: 'arxiv' });
+      const r1 = recordToolCallAndDetectLoop(session, sig);
+      const r2 = recordToolCallAndDetectLoop(session, sig);
+      const r3 = recordToolCallAndDetectLoop(session, sig);
+      expect(r1.kind).toBe('none');
+      expect(r2.kind).toBe('none');
+      expect(r3.kind).toBe('exact');
+      expect(r3.repeats).toBe(3);
+    });
+
+    it('detects similar loop with near-duplicate args (3rd call)', async () => {
+      const { recordToolCallAndDetectLoop, toolCallSignature } = await import(
+        '../src/local-llm/runner.js'
+      );
+      const session = makeSession();
+      // 3 different but very similar queries (Jaccard >= 0.85 each pair)
+      const s1 = toolCallSignature('tool_search', { query: 'arxiv recent papers' });
+      const s2 = toolCallSignature('tool_search', { query: 'arxiv recent papers!' });
+      const s3 = toolCallSignature('tool_search', { query: 'arxiv recent paper' });
+      const r1 = recordToolCallAndDetectLoop(session, s1);
+      const r2 = recordToolCallAndDetectLoop(session, s2);
+      const r3 = recordToolCallAndDetectLoop(session, s3);
+      expect(r1.kind).toBe('none');
+      // r2 may or may not fire similar (depends on threshold). 3rd should fire.
+      expect(r3.kind).toBe('similar');
+      expect(r3.repeats ?? 0).toBeGreaterThanOrEqual(3);
+    });
+
+    it('does not fire similar for unrelated calls', async () => {
+      const { recordToolCallAndDetectLoop, toolCallSignature } = await import(
+        '../src/local-llm/runner.js'
+      );
+      const session = makeSession();
+      const calls = [
+        toolCallSignature('exec', { command: 'ls -la' }),
+        toolCallSignature('read', { path: '/foo' }),
+        toolCallSignature('write', { path: '/bar', content: 'xyz' }),
+      ];
+      for (const sig of calls) {
+        expect(recordToolCallAndDetectLoop(session, sig).kind).toBe('none');
+      }
+    });
+
+    it('exact detection takes precedence over similar', async () => {
+      const { recordToolCallAndDetectLoop, toolCallSignature } = await import(
+        '../src/local-llm/runner.js'
+      );
+      const session = makeSession();
+      const sig = toolCallSignature('exec', { command: 'echo test | wc -c' });
+      recordToolCallAndDetectLoop(session, sig);
+      recordToolCallAndDetectLoop(session, sig);
+      const r3 = recordToolCallAndDetectLoop(session, sig);
+      expect(r3.kind).toBe('exact');
+    });
+
+    it('returns boolean true via recordToolCallAndCheckLoop wrapper on either kind', async () => {
+      const { recordToolCallAndCheckLoop, toolCallSignature } = await import(
+        '../src/local-llm/runner.js'
+      );
+      const session = makeSession();
+      const sig = toolCallSignature('tool_search', { query: 'foo' });
+      recordToolCallAndCheckLoop(session, sig);
+      recordToolCallAndCheckLoop(session, sig);
+      expect(recordToolCallAndCheckLoop(session, sig)).toBe(true);
+    });
+  });
+});
+
+describe('local-llm runner: compactOldToolResults (Prune)', () => {
+  function makeSessionWith(messages: Array<Record<string, unknown>>): import('../src/local-llm/runner.js').Session {
+    return {
+      messages: messages as never,
+      updatedAt: Date.now(),
+      activeToolNames: new Set(),
+      recentToolCallSigs: [],
+      recentNormSigs: [],
+      idempotentResultCache: new Map(),
+    };
+  }
+
+  const bigBody = (n: number, fill: string = 'x') => fill.repeat(n);
+
+  it('returns 0 compacted when message count <= recentKeepCount', async () => {
+    const { compactOldToolResults } = await import('../src/local-llm/runner.js');
+    const session = makeSessionWith([
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'yo' },
+    ]);
+    const result = compactOldToolResults(session, 10);
+    expect(result.compactedCount).toBe(0);
+    expect(result.bytesReclaimed).toBe(0);
+  });
+
+  it('preserves recent N tool results (within recentKeepCount)', async () => {
+    const { compactOldToolResults } = await import('../src/local-llm/runner.js');
+    // 直近 2 件は保護、それ以前の tool 結果のみ圧縮対象
+    const session = makeSessionWith([
+      { role: 'user', content: 'q1' },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 't1', name: 'exec', arguments: { command: 'ls' } }],
+      },
+      { role: 'tool', content: bigBody(1000), toolCallId: 't1' }, // 古い、圧縮対象
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'q2' },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 't2', name: 'exec', arguments: { command: 'pwd' } }],
+      },
+      { role: 'tool', content: bigBody(1000), toolCallId: 't2' }, // 直近、保護
+    ]);
+    const result = compactOldToolResults(session, 2);
+    expect(result.compactedCount).toBe(1);
+    expect((session.messages[2] as { content: string }).content).toContain('[exec]');
+    expect((session.messages[2] as { content: string }).content).toContain('pruned from old turn');
+    expect((session.messages[6] as { content: string }).content.length).toBe(1000); // 直近保護
+  });
+
+  it('skips tool results shorter than 200 chars (already cheap)', async () => {
+    const { compactOldToolResults } = await import('../src/local-llm/runner.js');
+    const session = makeSessionWith([
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 't1', name: 'exec', arguments: { command: 'echo' } }],
+      },
+      { role: 'tool', content: 'short result', toolCallId: 't1' }, // 短い、スキップ
+      { role: 'user', content: 'q2' },
+      { role: 'user', content: 'q3' },
+      { role: 'user', content: 'q4' },
+      { role: 'user', content: 'q5' },
+      { role: 'user', content: 'q6' },
+      { role: 'user', content: 'q7' },
+      { role: 'user', content: 'q8' },
+      { role: 'user', content: 'q9' },
+      { role: 'user', content: 'q10' },
+      { role: 'user', content: 'q11' },
+    ]);
+    const result = compactOldToolResults(session, 2);
+    expect(result.compactedCount).toBe(0); // 短すぎてスキップ
+    expect((session.messages[1] as { content: string }).content).toBe('short result');
+  });
+
+  it('dedups same-path read tool results, keeping the latest', async () => {
+    const { compactOldToolResults } = await import('../src/local-llm/runner.js');
+    const path = '/tmp/foo.md';
+    const session = makeSessionWith([
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'r1', name: 'read', arguments: { path } }],
+      },
+      { role: 'tool', content: bigBody(1500, 'a'), toolCallId: 'r1' }, // 1 回目、deduped 候補
+      { role: 'user', content: 'reread' },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'r2', name: 'read', arguments: { path } }],
+      },
+      { role: 'tool', content: bigBody(1500, 'b'), toolCallId: 'r2' }, // 2 回目、最新 (古い範囲内ならこっちが残る)
+      // 直近 2 件保護で oldIndexEnd = 7 - 2 = 5、index 5 以降は保護
+      { role: 'user', content: 'q3' },
+      { role: 'assistant', content: 'done' },
+    ]);
+    const result = compactOldToolResults(session, 2);
+    // r1 は deduped、r2 は古い範囲内の最新なので [read] (M chars, pruned from old turn) になる
+    expect(result.compactedCount).toBe(2);
+    expect((session.messages[1] as { content: string }).content).toContain('deduped');
+    expect((session.messages[1] as { content: string }).content).toContain(path);
+    expect((session.messages[4] as { content: string }).content).toContain('[read]');
+    expect((session.messages[4] as { content: string }).content).toContain('pruned from old turn');
+  });
+
+  it('is idempotent (already pruned messages are skipped on second pass)', async () => {
+    const { compactOldToolResults } = await import('../src/local-llm/runner.js');
+    const session = makeSessionWith([
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 't1', name: 'exec', arguments: { command: 'ls' } }],
+      },
+      { role: 'tool', content: bigBody(500), toolCallId: 't1' },
+      { role: 'user', content: 'a' },
+      { role: 'user', content: 'b' },
+      { role: 'user', content: 'c' },
+    ]);
+    const first = compactOldToolResults(session, 2);
+    expect(first.compactedCount).toBe(1);
+    const firstContent = (session.messages[1] as { content: string }).content;
+    const second = compactOldToolResults(session, 2);
+    expect(second.compactedCount).toBe(0); // 既に pruned、再度スキップ
+    expect((session.messages[1] as { content: string }).content).toBe(firstContent);
+  });
+
+  it('handles tool message without toolCallId gracefully', async () => {
+    const { compactOldToolResults } = await import('../src/local-llm/runner.js');
+    const session = makeSessionWith([
+      { role: 'tool', content: bigBody(1000) }, // toolCallId なし
+      { role: 'user', content: 'q1' },
+      { role: 'user', content: 'q2' },
+      { role: 'user', content: 'q3' },
+    ]);
+    const result = compactOldToolResults(session, 2);
+    expect(result.compactedCount).toBe(1);
+    expect((session.messages[0] as { content: string }).content).toContain('[tool]');
+  });
+});

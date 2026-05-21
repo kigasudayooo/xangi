@@ -71,6 +71,8 @@ describe('recordToolCallAndCheckLoop', () => {
     updatedAt: 0,
     activeToolNames: new Set(),
     recentToolCallSigs: [],
+    recentNormSigs: [],
+    idempotentResultCache: new Map(),
   });
 
   it('1 回目はループ判定にならない', () => {
@@ -92,12 +94,22 @@ describe('recordToolCallAndCheckLoop', () => {
     expect(recordToolCallAndCheckLoop(s, 'X')).toBe(true);
   });
 
-  it('間に別シグネチャが挟まればカウントリセット', () => {
+  it('間に別シグネチャが挟まれば exact カウントはリセット (ただし PR-A の similar 軸で発火する)', () => {
     const s = newSession();
     recordToolCallAndCheckLoop(s, 'X');
     recordToolCallAndCheckLoop(s, 'X');
-    recordToolCallAndCheckLoop(s, 'Y'); // リセット
-    expect(recordToolCallAndCheckLoop(s, 'X')).toBe(false); // X 連続は 1 回
+    recordToolCallAndCheckLoop(s, 'Y'); // exact 連続切れる
+    // PR-A 以降: normSig 'x' が過去 2 件残ってる → similar 検出が発火
+    // boolean wrapper は exact|similar のいずれかで true
+    expect(recordToolCallAndCheckLoop(s, 'X')).toBe(true);
+  });
+
+  it('間に別シグネチャを挟んで X 1 回だけなら exact も similar も発火しない', () => {
+    const s = newSession();
+    recordToolCallAndCheckLoop(s, 'X');
+    recordToolCallAndCheckLoop(s, 'Y');
+    // X は履歴に 1 件のみ、similar 閾値 (2 件) 未満 → 発火しない
+    expect(recordToolCallAndCheckLoop(s, 'X')).toBe(false);
   });
 
   it('バッファは 8 件で push 押し出し', () => {

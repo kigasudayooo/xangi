@@ -39,7 +39,10 @@ import { prependRuntimeContext } from '../runtime-context.js';
 import {
   containsPseudoToolCall,
   stripPseudoToolCalls,
-  PSEUDO_TOOLCALL_FEEDBACK_PROMPT,
+  parsePseudoToolCall,
+  isSafeForRescue,
+  buildStructuredFeedback,
+  StreamingDriftBuffer,
   FRIENDLY_FALLBACK_MESSAGE,
 } from './pseudo-toolcall.js';
 
@@ -123,6 +126,95 @@ export function loadContextBudget(env: NodeJS.ProcessEnv = process.env): Context
   };
 }
 
+/**
+ * 古い tool 結果メッセージを 1 行サマリに置換して context を圧縮する (Prune)。
+ *
+ * - 直近 `recentKeepCount` 件は保護 (本文を保持)
+ * - それより古い tool 結果は `[<tool_name>] (M chars, pruned from old turn)` に置換
+ * - 同一 file path の `read` 重複は最新のみ本文を残し、それ以外は `(deduped - see latest read of same path below)` に置換
+ *
+ * Hermes Agent / sst/opencode の context_compressor / overflow.ts を参考にした
+ * 上流対策。LLM が tool 結果を呼び出すたびに増える context を、古い分から構造的に
+ * 圧縮することで KV cache 効率と LLM の集中を改善する。head/tail 切り詰め
+ * (`trimToolResult`) より粒度が粗いが、古い結果は本文不要という前提で削り込む。
+ *
+ * - 本文が極端に短い結果 (200 char 未満) は元から圧縮済 / コスト低なのでスキップ
+ * - 既に「(... chars, pruned from old turn)」サマリ形式 (再呼出による idempotent) もスキップ
+ */
+export function compactOldToolResults(
+  session: Session,
+  recentKeepCount: number
+): { compactedCount: number; bytesReclaimed: number } {
+  const messages = session.messages;
+  if (messages.length <= recentKeepCount) {
+    return { compactedCount: 0, bytesReclaimed: 0 };
+  }
+
+  const oldIndexEnd = messages.length - recentKeepCount;
+
+  // assistant の toolCalls から tool_call_id → name / args のマップを構築
+  const callIdToName = new Map<string, string>();
+  const callIdToArgs = new Map<string, unknown>();
+  for (const msg of messages) {
+    if (msg.role === 'assistant' && msg.toolCalls) {
+      for (const tc of msg.toolCalls) {
+        callIdToName.set(tc.id, tc.name);
+        callIdToArgs.set(tc.id, tc.arguments);
+      }
+    }
+  }
+
+  // 同一 file path の read 重複検出: 古い範囲内での「最新の index」を記録
+  const latestReadIdxByPath = new Map<string, number>();
+  for (let i = 0; i < oldIndexEnd; i++) {
+    const msg = messages[i];
+    if (msg.role !== 'tool' || !msg.toolCallId) continue;
+    const name = callIdToName.get(msg.toolCallId);
+    if (name !== 'read') continue;
+    const args = callIdToArgs.get(msg.toolCallId);
+    if (!args || typeof args !== 'object') continue;
+    const path = (args as Record<string, unknown>).path;
+    if (typeof path !== 'string') continue;
+    latestReadIdxByPath.set(path, i);
+  }
+
+  let compactedCount = 0;
+  let bytesReclaimed = 0;
+  const PRUNE_MIN_BYTES = 200; // これより短い結果はスキップ
+  const ALREADY_PRUNED_MARKER = ', pruned from old turn)';
+
+  for (let i = 0; i < oldIndexEnd; i++) {
+    const msg = messages[i];
+    if (msg.role !== 'tool') continue;
+    const originalSize = msg.content.length;
+    if (originalSize < PRUNE_MIN_BYTES) continue;
+    if (msg.content.endsWith(ALREADY_PRUNED_MARKER)) continue;
+
+    const name = msg.toolCallId ? (callIdToName.get(msg.toolCallId) ?? 'tool') : 'tool';
+
+    let summary: string;
+    if (name === 'read' && msg.toolCallId) {
+      const args = callIdToArgs.get(msg.toolCallId);
+      const path =
+        args && typeof args === 'object'
+          ? ((args as Record<string, unknown>).path as unknown)
+          : undefined;
+      if (typeof path === 'string' && latestReadIdxByPath.get(path) !== i) {
+        summary = `[read] path=${path} (${originalSize} chars, deduped - see latest read of same path below)`;
+      } else {
+        summary = `[read] (${originalSize} chars${ALREADY_PRUNED_MARKER}`;
+      }
+    } else {
+      summary = `[${name}] (${originalSize} chars${ALREADY_PRUNED_MARKER}`;
+    }
+    msg.content = summary;
+    compactedCount += 1;
+    bytesReclaimed += originalSize - summary.length;
+  }
+
+  return { compactedCount, bytesReclaimed };
+}
+
 /** ツール結果を切り詰める（head/tail方式、karaagebot準拠） */
 function trimToolResult(content: string, maxChars: number = MAX_TOOL_OUTPUT_CHARS): string {
   if (content.length <= maxChars) return content;
@@ -136,7 +228,7 @@ function trimToolResult(content: string, maxChars: number = MAX_TOOL_OUTPUT_CHAR
 }
 
 /** セッション（会話履歴） */
-interface Session {
+export interface Session {
   messages: LLMMessage[];
   updatedAt: number;
   /**
@@ -151,6 +243,18 @@ interface Session {
    * 「Repeated call: 別アプローチ取れ」を tool result に差し替える。
    */
   recentToolCallSigs: string[];
+  /**
+   * recentToolCallSigs に対応する正規化シグネチャ (normalizeSignature 適用後)。
+   * args 微差を吸収して「同じ意図 / 別 wording」のループを Jaccard 類似度で
+   * 検出するために使う。
+   */
+  recentNormSigs: string[];
+  /**
+   * 冪等な tool_call (wc -c / base64 / hash / URL encode 等) の結果キャッシュ。
+   * 同一シグネチャが args 微差で再呼出されたら exec せずキャッシュ返却。
+   * 冪等・低価値 tool は 2 回目以降キャッシュ再利用する戦略。
+   */
+  idempotentResultCache: Map<string, string>;
 }
 
 /** 同一 tool_call が何回連続したらループと判定するか */
@@ -158,6 +262,19 @@ const REPEATED_TOOL_CALL_THRESHOLD = 3;
 
 /** 直近 tool_call シグネチャを何件保持するか */
 const RECENT_TOOL_CALL_BUFFER = 8;
+
+/** 冪等キャッシュの上限 (FIFO で古いものから捨てる) */
+const IDEMPOTENT_CACHE_LIMIT = 32;
+
+/** 正規化シグネチャの Jaccard 類似度の発火閾値 (0..1) */
+const SIMILAR_SIGNATURE_THRESHOLD = 0.85;
+
+/**
+ * 直近の正規化シグネチャ群と類似度しきい値を超えるエントリが何件あったら
+ * 類似ループと判定するか (今回を含めず、過去履歴中の件数)。
+ * 値 2 = 過去 2 件以上類似 → 今回で 3 件目 → 発火 (完全一致 3 回と同等の厳しさ)。
+ */
+const SIMILAR_LOOP_MATCH_COUNT = 2;
 
 /**
  * tool_call をシグネチャ文字列に正規化する (順序非依存)。
@@ -191,18 +308,15 @@ export function countTrailingRepeats(sigs: string[], target: string): number {
 }
 
 /**
- * セッションに tool_call シグネチャを記録 (バッファ上限で押し出し)、
- * 同一シグネチャが THRESHOLD 回連続したらループ判定して true を返す。
+ * セッションに tool_call シグネチャを記録 + 完全一致ループ判定。
  *
- * @returns true = ループ検出 (今回の実行をスキップして強制 feedback すべき)
+ * 後方互換のため boolean を返す wrapper。詳細な kind ('exact'/'similar') が
+ * 必要な場合は recordToolCallAndDetectLoop を直接使う。
+ *
+ * @returns true = exact または similar のいずれかでループ検出
  */
 export function recordToolCallAndCheckLoop(session: Session, sig: string): boolean {
-  const priorRepeats = countTrailingRepeats(session.recentToolCallSigs, sig);
-  session.recentToolCallSigs.push(sig);
-  if (session.recentToolCallSigs.length > RECENT_TOOL_CALL_BUFFER) {
-    session.recentToolCallSigs.shift();
-  }
-  return priorRepeats + 1 >= REPEATED_TOOL_CALL_THRESHOLD;
+  return recordToolCallAndDetectLoop(session, sig).kind !== 'none';
 }
 
 /** ループ検出時に LLM に返す tool result メッセージ */
@@ -211,6 +325,192 @@ export function repeatedToolCallErrorMessage(toolName: string, repeats: number):
 1. Call this tool with different arguments
 2. Call a different tool from the active tool list
 3. Stop calling tools and respond to the user in plain text — even if you can't fully answer, explain what you tried and what's missing.`;
+}
+
+/**
+ * 類似ループ検出時に LLM に返す tool result メッセージ。
+ * 「args 微差を試しても結果は変わらない、別 intent / 別 tool / 終了 を選べ」。
+ */
+export function similarToolCallErrorMessage(toolName: string, count: number): string {
+  return `Tool '${toolName}' has been called with similar (normalized) arguments ${count} times within the recent window. Small wording tweaks won't change the result. Stop calling this tool with near-duplicate args. Try one of:
+1. Call this tool with a substantially different intent or arguments
+2. Call a different tool from the active tool list
+3. Stop calling tools and respond to the user in plain text — explain what you tried and what's missing.`;
+}
+
+/** ループ検出の種類: 'none' = 未検出 / 'exact' = 完全一致 / 'similar' = 類似一致 */
+export type LoopKind = 'none' | 'exact' | 'similar';
+
+/**
+ * tool_call シグネチャを「意図の同一性」レベルに正規化する。
+ * - lowercase
+ * - 数字 (整数/小数) を 'N' に置換
+ * - ASCII 句読点を空白に置換 → 連続空白を 1 個に圧縮
+ * - 前後空白を trim
+ *
+ * これで「args 微差で同じ意図」を Jaccard 類似度で検出しやすい形に揃える。
+ */
+export function normalizeSignature(sig: string): string {
+  return sig
+    .toLowerCase()
+    .replace(/\d+(?:\.\d+)?/g, 'n')
+    .replace(/[`~!@#$%^&*()_\-+=[\]{};':"\\|,.<>/?]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 文字 trigram の Set を返す (短い文字列でも 1 個以上は出る、空文字列は空 Set) */
+export function trigrams(s: string): Set<string> {
+  const grams = new Set<string>();
+  if (s.length === 0) return grams;
+  const padded = ` ${s} `;
+  for (let i = 0; i < padded.length - 2; i++) {
+    grams.add(padded.slice(i, i + 3));
+  }
+  return grams;
+}
+
+/**
+ * 文字 trigram ベースの Jaccard 類似度 (0..1)。
+ * 言語非依存、計算 O(N+M)、短い tool_call args なら数 μs。
+ * - 同一文字列: 1
+ * - 完全に重複なし: 0
+ * - 両方空文字列: 1 (扱いを定義)
+ */
+export function jaccardSimilarity(a: string, b: string): number {
+  if (a === b) return 1;
+  const A = trigrams(a);
+  const B = trigrams(b);
+  if (A.size === 0 && B.size === 0) return 1;
+  let inter = 0;
+  for (const x of A) if (B.has(x)) inter++;
+  const union = A.size + B.size - inter;
+  return union === 0 ? 0 : inter / union;
+}
+
+/**
+ * normSigs (過去の正規化シグネチャ群) のうち target との Jaccard 類似度が
+ * threshold 以上のエントリ数を返す。
+ */
+export function countSimilarMatches(
+  normSigs: string[],
+  target: string,
+  threshold: number = SIMILAR_SIGNATURE_THRESHOLD
+): number {
+  let count = 0;
+  for (const ns of normSigs) {
+    if (jaccardSimilarity(ns, target) >= threshold) count++;
+  }
+  return count;
+}
+
+/**
+ * セッションに tool_call シグネチャを記録 + ループ判定。
+ *
+ * - exact: 完全一致が REPEATED_TOOL_CALL_THRESHOLD (=3) 回連続
+ * - similar: 正規化シグネチャの Jaccard 類似度 >= SIMILAR_SIGNATURE_THRESHOLD
+ *   なエントリが直近 RECENT_TOOL_CALL_BUFFER 件中 SIMILAR_LOOP_MATCH_COUNT 件以上
+ *
+ * exact が優先 (完全に同一 args の繰り返しは確実なループ判定)。
+ */
+export function recordToolCallAndDetectLoop(
+  session: Session,
+  sig: string
+): { kind: LoopKind; repeats?: number } {
+  // exact 用バッファ更新
+  const priorRepeats = countTrailingRepeats(session.recentToolCallSigs, sig);
+  session.recentToolCallSigs.push(sig);
+  if (session.recentToolCallSigs.length > RECENT_TOOL_CALL_BUFFER) {
+    session.recentToolCallSigs.shift();
+  }
+
+  if (priorRepeats + 1 >= REPEATED_TOOL_CALL_THRESHOLD) {
+    return { kind: 'exact', repeats: priorRepeats + 1 };
+  }
+
+  // similar 用: 既存バッファ (push 前の履歴) と比較してから今回を push
+  const normSig = normalizeSignature(sig);
+  if (!session.recentNormSigs) session.recentNormSigs = [];
+  const similarPriorCount = countSimilarMatches(
+    session.recentNormSigs,
+    normSig,
+    SIMILAR_SIGNATURE_THRESHOLD
+  );
+  session.recentNormSigs.push(normSig);
+  if (session.recentNormSigs.length > RECENT_TOOL_CALL_BUFFER) {
+    session.recentNormSigs.shift();
+  }
+
+  if (similarPriorCount >= SIMILAR_LOOP_MATCH_COUNT) {
+    // 過去 N 件と類似 (今回含めると N+1 件目)
+    return { kind: 'similar', repeats: similarPriorCount + 1 };
+  }
+
+  return { kind: 'none' };
+}
+
+/**
+ * 冪等な (副作用なし・args 同じなら結果同一) tool_call を検出する。
+ * 主に exec / bash / shell 系の `command` / `script` / `code` 文字列を見て、
+ * 計算・エンコード・ハッシュ系のコマンドを正規表現で判定。
+ *
+ * 副作用ありそうなパターン (リダイレクト / rm / curl / git 等) が含まれていれば
+ * 冪等扱いしない。安全側に倒す。
+ */
+export function isIdempotentToolCall(name: string, args: unknown): boolean {
+  if (!args || typeof args !== 'object') return false;
+  const argsRec = args as Record<string, unknown>;
+  const commandStr = String(argsRec.command ?? argsRec.script ?? argsRec.code ?? '');
+  if (!commandStr) return false;
+
+  // 副作用ありそうなパターン: 冪等扱いしない (安全側)
+  const SIDE_EFFECT_PATTERNS = [
+    />>?\s*[^|&\s]/, // > or >> でファイル等に書き込み (パイプ/AND 連結は除く)
+    /\b(rm|mv|cp|mkdir|touch|chmod|chown|ln)\b/,
+    /\b(curl|wget|fetch|nc)\b/,
+    /\b(git|npm|pip|uv|docker|systemctl|apt|yum|brew|pm2)\b/,
+    /\b(kill|killall)\b/,
+  ];
+  for (const re of SIDE_EFFECT_PATTERNS) {
+    if (re.test(commandStr)) return false;
+  }
+
+  // 冪等パターン: 計算・エンコード・ハッシュ系
+  const IDEMPOTENT_PATTERNS = [
+    /\bwc\b\s+-[clmw]/, // wc -c / -l / -m / -w (文字数測定)
+    /\bbase64\b/, // base64 単発 (encode/decode)
+    /\b(?:md5|sha1|sha224|sha256|sha384|sha512)sum\b/, // ハッシュ系
+    /\bcksum\b/,
+    /\burllib\.parse\.(?:quote|unquote)/, // Python URL encode/decode
+    /\b(?:quote_plus|unquote_plus)\b/,
+    /\bimport\s+hashlib\b/, // Python hashlib import
+    /\bhashlib\.[a-z0-9]+\(/, // hashlib.md5(...) 等
+    /\bprintf\b.*%[bs]/, // printf '%s' 整形 (限定的)
+  ];
+  for (const re of IDEMPOTENT_PATTERNS) {
+    if (re.test(commandStr)) return true;
+  }
+  return false;
+}
+
+/** 冪等キャッシュから結果を取得 (HIT なら exec をスキップして即返却) */
+export function getCachedIdempotentResult(session: Session, sig: string): string | undefined {
+  return session.idempotentResultCache?.get(sig);
+}
+
+/**
+ * 冪等 tool_call の結果をキャッシュに保存。
+ * 上限 IDEMPOTENT_CACHE_LIMIT を超えたら最古エントリから削除 (FIFO)。
+ */
+export function cacheIdempotentResult(session: Session, sig: string, output: string): void {
+  if (!session.idempotentResultCache) {
+    session.idempotentResultCache = new Map();
+  }
+  if (session.idempotentResultCache.size >= IDEMPOTENT_CACHE_LIMIT) {
+    const firstKey = session.idempotentResultCache.keys().next().value;
+    if (firstKey !== undefined) session.idempotentResultCache.delete(firstKey);
+  }
+  session.idempotentResultCache.set(sig, output);
 }
 
 /** モード別の機能フラグ */
@@ -865,21 +1165,38 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
           continue;
         }
 
-        // 同一 tool_call が連発するループ検出 (Step B)
+        // 同一 / 類似 tool_call ループ検出 + 冪等キャッシュ短絡
         const sig = toolCallSignature(toolCall.name, toolCall.arguments);
-        const isLoop = recordToolCallAndCheckLoop(session, sig);
+        const loopResult = recordToolCallAndDetectLoop(session, sig);
         let result;
-        if (isLoop) {
+        if (loopResult.kind !== 'none') {
+          const repeats = loopResult.repeats ?? REPEATED_TOOL_CALL_THRESHOLD;
+          const errorMsg =
+            loopResult.kind === 'exact'
+              ? repeatedToolCallErrorMessage(toolCall.name, repeats)
+              : similarToolCallErrorMessage(toolCall.name, repeats);
           console.warn(
-            `[local-llm] Repeated tool_call loop detected (${REPEATED_TOOL_CALL_THRESHOLD}x): ${sig.slice(0, 200)}`
+            `[local-llm] Tool call loop detected (${loopResult.kind}, ${repeats}x): ${sig.slice(0, 200)}`
           );
           result = {
             success: false,
             output: '',
-            error: repeatedToolCallErrorMessage(toolCall.name, REPEATED_TOOL_CALL_THRESHOLD),
+            error: errorMsg,
           };
         } else {
-          result = await executeTool(toolCall.name, toolCall.arguments, toolContext);
+          // 冪等キャッシュ HIT 判定: 計算/エンコード/ハッシュ系で同 signature を
+          // 2 回目以降叩こうとしたら 1 回目の結果を即返却 (exec スキップ)
+          const cached = getCachedIdempotentResult(session, sig);
+          if (cached !== undefined) {
+            console.log(`[local-llm] Idempotent cache hit (skip exec): ${sig.slice(0, 200)}`);
+            result = { success: true, output: cached };
+          } else {
+            result = await executeTool(toolCall.name, toolCall.arguments, toolContext);
+            // 冪等パターンなら結果をキャッシュ (次回以降 HIT させる)
+            if (result.success && isIdempotentToolCall(toolCall.name, toolCall.arguments)) {
+              cacheIdempotentResult(session, sig, result.output);
+            }
+          }
         }
         const rawOutput = result.success
           ? result.output
@@ -1011,21 +1328,38 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
             continue;
           }
 
-          // 同一 tool_call が連発するループ検出 (Step B)
+          // 同一 / 類似 tool_call ループ検出 + 冪等キャッシュ短絡
           const sig = toolCallSignature(toolCall.name, toolCall.arguments);
-          const isLoop = recordToolCallAndCheckLoop(session, sig);
+          const loopResult = recordToolCallAndDetectLoop(session, sig);
           let result;
-          if (isLoop) {
+          if (loopResult.kind !== 'none') {
+            const repeats = loopResult.repeats ?? REPEATED_TOOL_CALL_THRESHOLD;
+            const errorMsg =
+              loopResult.kind === 'exact'
+                ? repeatedToolCallErrorMessage(toolCall.name, repeats)
+                : similarToolCallErrorMessage(toolCall.name, repeats);
             console.warn(
-              `[local-llm] Repeated tool_call loop detected (${REPEATED_TOOL_CALL_THRESHOLD}x): ${sig.slice(0, 200)}`
+              `[local-llm] Tool call loop detected (${loopResult.kind}, ${repeats}x): ${sig.slice(0, 200)}`
             );
             result = {
               success: false,
               output: '',
-              error: repeatedToolCallErrorMessage(toolCall.name, REPEATED_TOOL_CALL_THRESHOLD),
+              error: errorMsg,
             };
           } else {
-            result = await executeTool(toolCall.name, toolCall.arguments, toolContext);
+            // 冪等キャッシュ HIT 判定: 計算/エンコード/ハッシュ系で同 signature を
+            // 2 回目以降叩こうとしたら 1 回目の結果を即返却 (exec スキップ)
+            const cached = getCachedIdempotentResult(session, sig);
+            if (cached !== undefined) {
+              console.log(`[local-llm] Idempotent cache hit (skip exec): ${sig.slice(0, 200)}`);
+              result = { success: true, output: cached };
+            } else {
+              result = await executeTool(toolCall.name, toolCall.arguments, toolContext);
+              // 冪等パターンなら結果をキャッシュ (次回以降 HIT させる)
+              if (result.success && isIdempotentToolCall(toolCall.name, toolCall.arguments)) {
+                cacheIdempotentResult(session, sig, result.output);
+              }
+            }
           }
           const rawToolOutput = result.success
             ? result.output
@@ -1071,6 +1405,10 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
     // Step D: retry でも drift しか出なければ親切な fallback メッセージに差し替える。
     const finalChatStreamOnce = async (): Promise<string> => {
       let acc = '';
+      // hold buffer: streaming 中の擬似 tool_call drift を Discord に流す前に検出 + 抑止。
+      // 最終 drift 検証 (Step C/D) は flush 後の fullText に対して既存通り走る。
+      const driftBuffer = new StreamingDriftBuffer();
+      let totalDroppedDuringStream = false;
       try {
         for await (const chunk of this.llm.chatStream(session.messages, {
           systemPrompt,
@@ -1078,8 +1416,13 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
           toolChoice: 'none',
           signal: abortController.signal,
         })) {
-          acc += chunk;
-          callbacks.onText?.(chunk, acc);
+          const { release, dropped } = driftBuffer.feed(chunk);
+          if (dropped) totalDroppedDuringStream = true;
+          if (release.length > 0) {
+            acc += release;
+            callbacks.onText?.(release, acc);
+          }
+          // release が空でも続行 (次の chunk で確定するまで hold)
         }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
@@ -1087,28 +1430,163 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
         logError(this.workdir, logId, `LLM chatStream failed: ${errorMsg}`);
         throw err;
       }
+      // stream 終了: 残った hold を最終応答にマージ (Step C/D の最終 drift 検証に通す)
+      const { release: tail, droppedAny } = driftBuffer.flush();
+      if (tail.length > 0) {
+        acc += tail;
+        callbacks.onText?.(tail, acc);
+      }
+      if (totalDroppedDuringStream || droppedAny) {
+        console.warn(
+          `[local-llm] StreamingDriftBuffer dropped partial drift patterns during streaming`
+        );
+      }
       return acc;
     };
 
     let fullText = await finalChatStreamOnce();
 
-    // Step C: strict drift 検出 → LLM feedback → retry 1 回
-    if (containsPseudoToolCall(fullText)) {
+    // Step C: strict drift 検出 → parse-and-execute rescue または
+    // structured feedback で bounded retry (Kmax=2)
+    //
+    // 旧実装は generic prompt で 1 回 retry → strip して短い fallback で出力意図を
+    // 捨てていた。今回 parse 試行 → 安全なら rescue 実行、危険なら構造化エラーで
+    // self-correct を促す方式に変更。
+    const MAX_DRIFT_RESCUE_RETRIES = 2;
+    const rescueToolContext = {
+      workspace: this.workdir,
+      channelId: options?.channelId,
+      activateTools: (names: string[]) => {
+        for (const n of names) session.activeToolNames.add(n);
+      },
+    };
+    let driftRetryCount = 0;
+
+    while (containsPseudoToolCall(fullText) && driftRetryCount < MAX_DRIFT_RESCUE_RETRIES) {
       console.warn(
-        `[local-llm] Pseudo tool_call drift detected in chatStream output. Raw head: ${fullText.slice(0, 200)}`
+        `[local-llm] Pseudo tool_call drift detected (retry ${driftRetryCount + 1}/${MAX_DRIFT_RESCUE_RETRIES}). Raw head: ${fullText.slice(0, 200)}`
       );
+
+      const parsed = parsePseudoToolCall(fullText);
+
+      // assistant に raw drift を必ず積む (LLM が「自分が何を吐いたか」を見られるように)
       session.messages.push({ role: 'assistant', content: fullText });
-      session.messages.push({ role: 'system', content: PSEUDO_TOOLCALL_FEEDBACK_PROMPT });
+
+      if (parsed) {
+        const safety = isSafeForRescue(parsed.name, parsed.args);
+        const sig = toolCallSignature(parsed.name, parsed.args);
+
+        // 同一 pseudo call が既に実行済み (冪等キャッシュ HIT) なら再実行禁止、
+        // already_executed feedback で回答生成へ寄せる
+        const cachedResult = getCachedIdempotentResult(session, sig);
+        if (cachedResult !== undefined) {
+          console.log(
+            `[local-llm] Pseudo tool_call already_executed: ${parsed.name} (sig matches cache)`
+          );
+          session.messages.push({
+            role: 'system',
+            content: buildStructuredFeedback({
+              kind: 'already_executed',
+              attempted_tool: parsed.name,
+              attempted_args: parsed.args,
+              reason:
+                'This tool call was already executed earlier in this turn. Result is in the conversation history.',
+              hint: 'Do not re-execute. Read the prior tool result and respond to the user based on it.',
+              allowed_actions: [
+                'Respond to the user using the prior tool result',
+                'Call a different tool if you need new information',
+              ],
+            }),
+          });
+        } else if (safety.safe) {
+          // read-only safe → 救済実行
+          // loop counter にも積む (rescue が無限ループに化けるのを防ぐ)
+          const loopResult = recordToolCallAndDetectLoop(session, sig);
+          if (loopResult.kind !== 'none') {
+            console.warn(
+              `[local-llm] Pseudo tool_call rescue blocked by loop detection (${loopResult.kind}): ${sig.slice(0, 200)}`
+            );
+            session.messages.push({
+              role: 'system',
+              content: buildStructuredFeedback({
+                kind: 'already_executed',
+                attempted_tool: parsed.name,
+                attempted_args: parsed.args,
+                reason: `Loop detected: this tool/args pattern has been called ${loopResult.repeats ?? REPEATED_TOOL_CALL_THRESHOLD} times.`,
+                hint: 'Try a different approach. Either use different args, call a different tool, or respond to the user with what you have.',
+                allowed_actions: [
+                  'Call a different tool with proper function_calling structure',
+                  'Respond in plain text describing what you tried',
+                ],
+              }),
+            });
+          } else {
+            console.log(
+              `[local-llm] Pseudo tool_call rescued: ${parsed.name}(${JSON.stringify(parsed.args).slice(0, 100)})`
+            );
+            const result = await executeTool(parsed.name, parsed.args, rescueToolContext);
+            const rawOutput = result.success
+              ? result.output
+              : `Tool ${parsed.name} failed: ${result.error}`;
+            if (result.success && isIdempotentToolCall(parsed.name, parsed.args)) {
+              cacheIdempotentResult(session, sig, result.output);
+            }
+            // rescue 経路では tool_call_id が無いので、system message として tool 結果を注入
+            // (function_calling 経路の tool role と混ぜると schema が崩れるため)
+            session.messages.push({
+              role: 'system',
+              content: `[RESCUED TOOL RESULT]\nTool: ${parsed.name}\nArgs: ${JSON.stringify(parsed.args)}\nResult:\n${rawOutput}\n[END RESCUED TOOL RESULT]\n\nUse this result to compose your final reply to the user. Do NOT call the same tool again in pseudo format.`,
+            });
+          }
+        } else {
+          // 副作用ありの可能性 → 構造化 rejection
+          console.warn(
+            `[local-llm] Pseudo tool_call rejected (unsafe): ${parsed.name} — ${safety.reason}`
+          );
+          session.messages.push({
+            role: 'system',
+            content: buildStructuredFeedback({
+              kind: 'unsafe_tool_in_pseudo_format',
+              attempted_tool: parsed.name,
+              attempted_args: parsed.args,
+              reason: safety.reason ?? 'Tool is not in the safe rescue allowlist.',
+              hint: 'If you really need this tool, use the proper function_calling structure (not pseudo text). For read-only context gathering, prefer tools like `discord_history`, `read`, `glob`, `grep`, or `tool_search`.',
+              allowed_actions: [
+                'Call the tool using proper function_calling structure',
+                'Choose a different read-only tool to gather context',
+                'Respond in plain text without tool use',
+              ],
+            }),
+          });
+        }
+      } else {
+        // parse 失敗 (anchored grammar にマッチしない形式 or args parse 失敗)
+        console.warn(`[local-llm] Pseudo tool_call drift could not be parsed`);
+        session.messages.push({
+          role: 'system',
+          content: buildStructuredFeedback({
+            kind: 'unparseable_pseudo_call',
+            reason:
+              'Pseudo tool_call text detected but could not be parsed (malformed args or unknown format).',
+            hint: 'Use proper function_calling structure for tool invocation. Do not write `call:fn{args}` as text.',
+            allowed_actions: [
+              'Call a tool using proper function_calling structure',
+              'Respond to the user in plain text without tool_call-like syntax',
+            ],
+          }),
+        });
+      }
+
+      driftRetryCount++;
       fullText = await finalChatStreamOnce();
     }
 
-    // Step D: retry 後も strict drift しか出ない → strip + 親切な fallback
+    // 最終 fallback: bounded retry 上限を超えても drift が残る → strip + 親切な fallback
     if (containsPseudoToolCall(fullText)) {
       const cleaned = stripPseudoToolCalls(fullText);
       console.warn(
-        `[local-llm] Drift persisted after Step C retry. Raw head: ${fullText.slice(0, 200)}, cleaned: "${cleaned.slice(0, 100)}"`
+        `[local-llm] Drift persisted after ${MAX_DRIFT_RESCUE_RETRIES} rescue retries. Raw head: ${fullText.slice(0, 200)}, cleaned: "${cleaned.slice(0, 100)}"`
       );
-      // cleaned に意味のあるテキストが残っていればそれを使い、空なら friendly fallback
       fullText = cleaned || FRIENDLY_FALLBACK_MESSAGE;
     } else {
       // strict drift は無いが cosmetic leak (先頭/末尾の bare `thought\n` 等) は除去する。
@@ -1248,6 +1726,8 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
         // 起動時の常駐 tool 名で初期化（per-session 拡張可）
         activeToolNames: new Set(this.defaultActiveToolNames),
         recentToolCallSigs: [],
+        recentNormSigs: [],
+        idempotentResultCache: new Map(),
       };
       this.sessions.set(sessionId, session);
 
@@ -1269,7 +1749,8 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
 
   /**
    * コンテキスト刈り込み（karaagebot準拠）
-   * 1. ツール結果を contextBudget.toolResultMaxChars に切り詰め
+   * 0. 古い tool 結果を 1 行サマリに圧縮 (Prune、直近 contextKeepLast 件は保護)
+   * 1. ツール結果を contextBudget.toolResultMaxChars に切り詰め (head/tail 方式)
    * 2. 直近 contextBudget.contextKeepLast 件を保護
    * 3. 合計文字数が contextBudget.contextMaxChars を超えたら古いメッセージから削除
    * 4. メッセージ数が contextBudget.maxSessionMessages を超えたら古いものを削除
@@ -1278,7 +1759,18 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
     const { contextMaxChars, contextKeepLast, toolResultMaxChars, maxSessionMessages } =
       this.contextBudget;
 
-    // ツール結果を切り詰め（コンテキスト内）
+    // (0) 古い tool 結果を 1 行サマリに圧縮 (Prune)
+    // 直近 contextKeepLast 件は保護、それより古い tool 結果は本文を削除して
+    // 「[<tool>] (M chars, pruned from old turn)」形式に置換。同一 file の read
+    // 重複は最新のみ残す。
+    const pruned = compactOldToolResults(session, contextKeepLast);
+    if (pruned.compactedCount > 0) {
+      console.log(
+        `[local-llm] Pruned ${pruned.compactedCount} old tool result(s), reclaimed ${pruned.bytesReclaimed} bytes`
+      );
+    }
+
+    // (1) ツール結果を head/tail 切り詰め（直近 contextKeepLast 件はここで切り詰められる、古いものは (0) で既に短い）
     for (const msg of session.messages) {
       if (msg.role === 'tool' && msg.content.length > toolResultMaxChars) {
         const head = Math.floor(toolResultMaxChars * 0.4);

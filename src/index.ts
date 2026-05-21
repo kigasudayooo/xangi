@@ -30,7 +30,7 @@ import {
   buildPromptWithAttachments,
 } from './file-utils.js';
 import { initSettings, loadSettings, formatSettings } from './settings.js';
-import { readFileSync, writeFileSync } from 'fs';
+import { updateEnvKeyValue } from './env-persist.js';
 import lockfile from 'proper-lockfile';
 import {
   DISCORD_MAX_LENGTH,
@@ -1150,18 +1150,10 @@ async function main() {
       }
       config.discord.autoReplyChannels = channels;
 
-      // .env に永続化
-      try {
-        const envPath = join(process.cwd(), '.env');
-        const envContent = readFileSync(envPath, 'utf-8');
-        const newValue = channels.join(',');
-        const updated = envContent.replace(
-          /^AUTO_REPLY_CHANNELS=.*$/m,
-          `AUTO_REPLY_CHANNELS=${newValue}`
-        );
-        writeFileSync(envPath, updated, 'utf-8');
-      } catch (e) {
-        console.error('[xangi] Failed to persist AUTO_REPLY_CHANNELS to .env:', e);
+      // .env に永続化 (Docker 環境で .env ファイルが無い場合は graceful skip)
+      const persistResult = updateEnvKeyValue('AUTO_REPLY_CHANNELS', channels.join(','));
+      if (!persistResult.ok) {
+        console.warn(`[xangi] AUTO_REPLY_CHANNELS persistence skipped: ${persistResult.reason}`);
       }
 
       const status = isCurrentlyOn ? '❌ OFF' : '✅ ON';
@@ -1178,17 +1170,15 @@ async function main() {
       const nextEnabled = !wasEnabled;
       config.discord.respondToBotsEnabled = nextEnabled;
 
-      // .env に永続化
-      try {
-        const envPath = join(process.cwd(), '.env');
-        const envContent = readFileSync(envPath, 'utf-8');
-        const line = `RESPOND_TO_BOTS_ENABLED=${nextEnabled ? 'true' : 'false'}`;
-        const updated = envContent.includes('RESPOND_TO_BOTS_ENABLED=')
-          ? envContent.replace(/^RESPOND_TO_BOTS_ENABLED=.*$/m, line)
-          : envContent.trimEnd() + '\n' + line + '\n';
-        writeFileSync(envPath, updated, 'utf-8');
-      } catch (e) {
-        console.error('[xangi] Failed to persist RESPOND_TO_BOTS_ENABLED to .env:', e);
+      // .env に永続化 (Docker 環境で .env ファイルが無い場合は graceful skip)
+      const persistResult = updateEnvKeyValue(
+        'RESPOND_TO_BOTS_ENABLED',
+        nextEnabled ? 'true' : 'false'
+      );
+      if (!persistResult.ok) {
+        console.warn(
+          `[xangi] RESPOND_TO_BOTS_ENABLED persistence skipped: ${persistResult.reason}`
+        );
       }
 
       const whitelist = config.discord.respondToBots ?? [];
