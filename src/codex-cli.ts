@@ -40,6 +40,11 @@ interface CodexEvent {
     cached_input_tokens?: number;
     output_tokens?: number;
   };
+  // エラーイベント用（type: 'error' は message、type: 'turn.failed' は error.message）
+  message?: string;
+  error?: {
+    message?: string;
+  };
   // フォールバック用
   content?: string;
   result?: string;
@@ -145,6 +150,38 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
     return null;
   }
 
+  /**
+   * JSONL 行から Codex 側のエラーメッセージを抽出する。
+   * Codex は失敗時に stdout へ `error` / `turn.failed` イベントを流すが、
+   * exit code だけ見ていると「利用上限到達」等の本当の理由が握り潰される。
+   */
+  private extractErrorMessage(json: CodexEvent): string | undefined {
+    if (json.type === 'error' && json.message) {
+      return json.message;
+    }
+    if (json.type === 'turn.failed' && json.error?.message) {
+      return json.error.message;
+    }
+    return undefined;
+  }
+
+  /**
+   * exit code !== 0 時に投げるエラーメッセージを組み立てる。
+   * Codex の error イベント本文 > stderr > exit code のみ、の優先順位で
+   * できるだけ具体的な理由をユーザーに見せる。
+   */
+  private buildExitError(code: number | null, codexErrorMessage?: string, stderr?: string): Error {
+    const base = `Codex CLI exited with code ${code}`;
+    if (codexErrorMessage?.trim()) {
+      return new Error(`${base}: ${codexErrorMessage.trim()}`);
+    }
+    const trimmedStderr = stderr?.trim();
+    if (trimmedStderr) {
+      return new Error(`${base}: ${trimmedStderr}`);
+    }
+    return new Error(base);
+  }
+
   async run(rawPrompt: string, options?: RunOptions): Promise<RunResult> {
     const prompt = prependRuntimeContext(rawPrompt);
     const args = this.buildArgs(prompt, options);
@@ -203,6 +240,7 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
       let stdout = '';
       let stderr = '';
       let sessionId = '';
+      let codexErrorMessage: string | undefined;
 
       proc.stdout.on('data', (data) => {
         const chunk = data.toString();
@@ -215,6 +253,8 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
             const json = JSON.parse(line) as CodexEvent;
             const sid = this.extractSessionId(json);
             if (sid) sessionId = sid;
+            const errMsg = this.extractErrorMessage(json);
+            if (errMsg) codexErrorMessage = errMsg;
           } catch {
             // JSONパースエラーは無視
           }
@@ -233,7 +273,7 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
         }
 
         if (code !== 0) {
-          reject(new Error(`Codex CLI exited with code ${code}: ${stderr}`));
+          reject(this.buildExitError(code, codexErrorMessage, stderr));
           return;
         }
 
@@ -331,6 +371,8 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
       let fullText = '';
       let sessionId = '';
       let buffer = '';
+      let stderr = '';
+      let codexErrorMessage: string | undefined;
 
       proc.stdout.on('data', (data) => {
         buffer += data.toString();
@@ -345,6 +387,10 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
             // セッションID抽出
             const sid = this.extractSessionId(json);
             if (sid) sessionId = sid;
+
+            // エラーイベント抽出（利用上限到達などの本当の理由）
+            const errMsg = this.extractErrorMessage(json);
+            if (errMsg) codexErrorMessage = errMsg;
 
             // テキスト抽出
             const extracted = this.extractText(json);
@@ -366,7 +412,9 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
       });
 
       proc.stderr.on('data', (data) => {
-        console.error('[codex] stderr:', data.toString());
+        const chunk = data.toString();
+        stderr += chunk;
+        console.error('[codex] stderr:', chunk);
       });
 
       proc.on('close', (code) => {
@@ -382,6 +430,8 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
             const json = JSON.parse(buffer) as CodexEvent;
             const sid = this.extractSessionId(json);
             if (sid) sessionId = sid;
+            const errMsg = this.extractErrorMessage(json);
+            if (errMsg) codexErrorMessage = errMsg;
             const extracted = this.extractText(json);
             if (extracted) {
               fullText = extracted.text;
@@ -392,7 +442,7 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
         }
 
         if (code !== 0) {
-          const error = new Error(`Codex CLI exited with code ${code}`);
+          const error = this.buildExitError(code, codexErrorMessage, stderr);
           callbacks.onError?.(error);
           reject(error);
           return;

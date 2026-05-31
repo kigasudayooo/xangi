@@ -620,6 +620,13 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
   private readonly sessions = new Map<string, Session>();
   private readonly sessionTtlMs = 60 * 60 * 1000; // 1時間
   private readonly activeAbortControllers = new Map<string, AbortController>();
+  /**
+   * per-call の構造化添付ファイル収集（channelId キー）。
+   * attach 系ツール（send_file）が attachFile コールバック経由で realpath を積み、
+   * run()/runStream() が RunResult.attachments として返す。
+   * activeAbortControllers と同じく per-channel 直列実行を前提に channelId でキーする。
+   */
+  private readonly pendingAttachments = new Map<string, Set<string>>();
   /** 個別機能フラグ */
   readonly enableTools: boolean;
   readonly enableSkills: boolean;
@@ -863,6 +870,16 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
     return { ...this.startupFlags };
   }
 
+  /** この channel の per-call 添付収集 Set を初期化（空にする）。 */
+  private resetAttachments(channelId: string): void {
+    this.pendingAttachments.set(channelId, new Set());
+  }
+
+  /** この channel に積まれた構造化添付（realpath）を配列で返す。 */
+  private drainAttachments(channelId: string): string[] {
+    return [...(this.pendingAttachments.get(channelId) ?? [])];
+  }
+
   async run(rawPrompt: string, options?: RunOptions): Promise<RunResult> {
     const sessionId = options?.sessionId || crypto.randomUUID();
     this.cleanupSessions();
@@ -873,6 +890,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
     const appSid = options?.appSessionId || channelId;
 
     const session = this.getOrCreateSession(sessionId, appSid);
+    this.resetAttachments(channelId);
     this.maybeEmitSessionStart(appSid, channelId);
     this.bumpTurnIndex(appSid);
     const callFlags = this.resolveCallModeFlags(options?.localLlmMode);
@@ -919,7 +937,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
       logResponse(this.workdir, appSid, { result, sessionId });
 
       this.timeoutController.clear(channelId, 'completed');
-      return { result, sessionId };
+      return { result, sessionId, attachments: this.drainAttachments(channelId) };
     } catch (err) {
       // セッション履歴に起因するエラーの場合、セッションをクリアしてリトライ
       if (session.messages.length > 1 && isSessionRelatedError(err)) {
@@ -980,6 +998,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
       return { result: errorMsg, sessionId };
     } finally {
       this.activeAbortControllers.delete(channelId);
+      this.pendingAttachments.delete(channelId);
       // 'completed' 経路で既に clear 済みなら no-op。エラー or タイムアウトで未 clear なら 'error'。
       this.timeoutController.clear(channelId, 'error');
     }
@@ -999,6 +1018,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
     const appSid = options?.appSessionId || channelId;
 
     const session = this.getOrCreateSession(sessionId, appSid);
+    this.resetAttachments(channelId);
     this.maybeEmitSessionStart(appSid, channelId);
     this.bumpTurnIndex(appSid);
     const callFlags = this.resolveCallModeFlags(options?.localLlmMode);
@@ -1043,7 +1063,11 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
       logResponse(this.workdir, appSid, { result: fullText, sessionId });
 
       this.timeoutController.clear(channelId, 'completed');
-      const result: RunResult = { result: fullText, sessionId };
+      const result: RunResult = {
+        result: fullText,
+        sessionId,
+        attachments: this.drainAttachments(channelId),
+      };
       callbacks.onComplete?.(result);
       return result;
     } catch (err) {
@@ -1106,6 +1130,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
       return { result: errorMsg, sessionId };
     } finally {
       this.activeAbortControllers.delete(channelId);
+      this.pendingAttachments.delete(channelId);
       this.timeoutController.clear(channelId, 'error');
     }
   }
@@ -1245,6 +1270,9 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
           console.log(
             `[local-llm] tool_search activated: ${names.join(', ')} (active: ${session.activeToolNames.size})`
           );
+        },
+        attachFile: (resolvedPath: string) => {
+          this.pendingAttachments.get(channelId)?.add(resolvedPath);
         },
         trajectoryLogToolSearch: (event: {
           query: string;
@@ -1447,6 +1475,9 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
               `[local-llm] tool_search activated: ${names.join(', ')} (active: ${session.activeToolNames.size})`
             );
           },
+          attachFile: (resolvedPath: string) => {
+            this.pendingAttachments.get(channelId)?.add(resolvedPath);
+          },
           trajectoryLogToolSearch: (event: {
             query: string;
             candidates: Array<{ name: string; type: 'tool' | 'skill'; score: number }>;
@@ -1643,6 +1674,9 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
       channelId: options?.channelId,
       activateTools: (names: string[]) => {
         for (const n of names) session.activeToolNames.add(n);
+      },
+      attachFile: (resolvedPath: string) => {
+        this.pendingAttachments.get(channelId)?.add(resolvedPath);
       },
     };
     let driftRetryCount = 0;

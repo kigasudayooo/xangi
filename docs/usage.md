@@ -885,6 +885,15 @@ AIエージェント（CLI spawn / Local LLM exec）に渡す環境変数は `sr
 | `XANGI_EVENTS_ENABLED` | `false` で SSE 配信を完全無効化（接続要求は 503） | `true` |
 | `XANGI_INSTANCE_ID` | 送信元インスタンスの識別子。未指定なら `xangi-<hostname>-<sha1(DATA_DIR)[:6]>` で自動採番 | `auto` |
 
+### Pet からの入力 (`POST /api/pet/inbox`)
+
+`xangi-pet` などの consumer 側 UI からテキストを 1 行投げ込むための書き込み endpoint。受理されたら 202 が即返り、応答は既存の events SSE 経由で broadcast される。詳細とリクエスト形式は [外部イベントストリーム#Pet からの入力経路](events.md#pet-からの入力経路-post-apipetinbox) を参照。
+
+| 変数 | 説明 | デフォルト |
+|------|------|-----------|
+| `XANGI_PET_INBOX_ENABLED` | `false` で書き込み経路を完全無効化（503 を返す） | `true` |
+| `XANGI_PET_INBOX_TOKEN` | 設定時は `Authorization: Bearer <token>` 必須。未設定時は loopback + LAN (RFC1918) + Tailscale (CGNAT 100.64/10) からのみ許可 (グローバル IP は 403) | (未設定) |
+
 ### GitHub App認証（オプション）
 
 GitHub App設定があれば、`gh` CLI実行時にインストールトークンを自動生成。PATや `gh auth login` が不要に。

@@ -189,3 +189,78 @@ describe('CodexRunner buildArgs', () => {
     expect(resumeIndex).toBeLessThan(args.length - 1); // prompt is last
   });
 });
+
+describe('CodexRunner エラー本文の救出', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /**
+   * stdout に流すイベントを emit してから code で close する。
+   */
+  async function emitEventsThenClose(events: object[], code: number) {
+    const { getMockProcess } = await import('child_process');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const mockProcess = (getMockProcess as () => any)();
+    for (const ev of events) {
+      mockProcess.stdout.emit('data', Buffer.from(JSON.stringify(ev) + '\n'));
+    }
+    mockProcess.emit('close', code);
+  }
+
+  it('runStream: error イベントの message を exit エラーに含める', async () => {
+    const runner = new CodexRunner({});
+    let captured: Error | undefined;
+    const promise = runner.runStream('hi', { onError: (e) => (captured = e) });
+
+    await emitEventsThenClose(
+      [{ type: 'error', message: "You've hit your usage limit. try again at 5:58 AM." }],
+      1
+    );
+
+    await expect(promise).rejects.toThrow(/exited with code 1/);
+    await promise.catch(() => {});
+    expect(captured?.message).toContain('usage limit');
+    expect(captured?.message).toContain('5:58 AM');
+  });
+
+  it('runStream: turn.failed イベントの error.message を救出する', async () => {
+    const runner = new CodexRunner({});
+    const promise = runner.runStream('hi', {});
+
+    await emitEventsThenClose(
+      [{ type: 'turn.failed', error: { message: 'rate limited' } }],
+      1
+    );
+
+    await expect(promise).rejects.toThrow(/rate limited/);
+  });
+
+  it('run: error イベントが無ければ従来どおり exit code のみ', async () => {
+    const runner = new CodexRunner({});
+    const promise = runner.run('hi');
+
+    await emitEventsThenClose([], 1);
+
+    await expect(promise).rejects.toThrow(/Codex CLI exited with code 1/);
+  });
+
+  it('runStream: exit 0 なら error イベントが無くても正常完了', async () => {
+    const runner = new CodexRunner({});
+    const promise = runner.runStream('hi', {});
+
+    await emitEventsThenClose(
+      [
+        { type: 'item.completed', item: { type: 'agent_message', text: 'done' } },
+      ],
+      0
+    );
+
+    const result = await promise;
+    expect(result.result).toBe('done');
+  });
+});

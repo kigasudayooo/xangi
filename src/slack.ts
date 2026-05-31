@@ -1,7 +1,7 @@
 import { App, LogLevel } from '@slack/bolt';
 import type { WebClient } from '@slack/web-api';
 import type { Config } from './config.js';
-import type { AgentRunner } from './agent-runner.js';
+import type { AgentRunner, RunResult } from './agent-runner.js';
 import { processManager } from './process-manager.js';
 import type { Skill } from './skills.js';
 import { formatSkillList } from './skills.js';
@@ -936,6 +936,7 @@ async function processMessage(
 
     let result: string;
     let newSessionId: string;
+    let structuredAttachments: string[] | undefined;
 
     if (useStreaming && showThinking) {
       // ストリーミング + 思考表示モード
@@ -968,7 +969,7 @@ async function processMessage(
           .catch(() => {});
       }, 1000);
 
-      let streamResult: { result: string; sessionId: string };
+      let streamResult: RunResult;
       try {
         streamResult = await runWithBubbleEvents(
           agentRunner,
@@ -1026,6 +1027,7 @@ async function processMessage(
       }
       result = streamResult.result;
       newSessionId = streamResult.sessionId;
+      structuredAttachments = streamResult.attachments;
     } else {
       // 非ストリーミング or 思考非表示モード
       // 考え中アニメーション
@@ -1060,6 +1062,7 @@ async function processMessage(
         );
         result = runResult.result;
         newSessionId = runResult.sessionId;
+        structuredAttachments = runResult.attachments;
       } finally {
         clearInterval(thinkingInterval);
       }
@@ -1078,8 +1081,8 @@ async function processMessage(
     }
     console.log(`[slack] Final result length: ${result.length}`);
 
-    // ファイルパスを抽出して添付送信
-    const filePaths = extractFilePaths(result);
+    // ファイルパスを抽出して添付送信（テキスト由来 + 構造化 attachments を合算・重複排除）
+    const filePaths = [...new Set([...extractFilePaths(result), ...(structuredAttachments ?? [])])];
     const displayText = filePaths.length > 0 ? stripFilePaths(result) : result;
 
     // 最終結果を更新（長い場合は分割送信）

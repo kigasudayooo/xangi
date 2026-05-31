@@ -9,6 +9,7 @@ import type { LLMTool, ToolContext, ToolResult, ToolHandler, ToolCatalogEntry } 
 import { getSafeEnv } from '../safe-env.js';
 import { getGitHubEnv } from '../github-auth.js';
 import { loadSkills, type Skill } from '../skills.js';
+import { resolveAttachmentPath } from '../file-utils.js';
 
 // child_process を遅延ロード（テストのvi.mockとの衝突を避けるため）
 async function shellExec(
@@ -527,13 +528,13 @@ const webFetchToolHandler: ToolHandler = {
 const sendFileToolHandler: ToolHandler = {
   name: 'send_file',
   description:
-    'Send a local file to the user as a chat attachment. Use this whenever the user wants the actual file delivered (HTML/text/source/image/audio/PDF/zip etc.), instead of pasting its contents inline. The file is attached to the next chat message.',
+    'Send a local file to the user as a chat attachment. Use this whenever you produced or fetched a file (image/audio/video/PDF/zip/HTML/text/source etc.) that the user should receive — for example right after a skill generates an image at outputs/foo.png. ALWAYS call this tool to deliver files; do NOT just write the path or [IMAGE:...] in your reply text. The file is attached to the next chat message.',
   parameters: {
     type: 'object',
     properties: {
       path: {
         type: 'string',
-        description: 'Path to the file (absolute or relative to workspace).',
+        description: 'Path to the file (absolute preferred, or relative to the workspace).',
       },
     },
     required: ['path'],
@@ -544,26 +545,25 @@ const sendFileToolHandler: ToolHandler = {
       return { success: false, output: '', error: 'path must be a non-empty string' };
     }
 
-    let resolved: string;
-    try {
-      resolved = resolveWorkspacePath(filePath, context.workspace);
-    } catch (err) {
-      return { success: false, output: '', error: String(err) };
-    }
-
-    if (!existsSync(resolved)) {
-      return { success: false, output: '', error: `File not found: ${resolved}` };
+    // file-utils と同じサンドボックス（realpath + allowlist）で検証する。
+    // ワークスペース subtree / 添付保存先 / /tmp / ATTACHMENT_ALLOWED_DIRS 内の実在
+    // ファイルのみ許可（生成スキルが /tmp に吐くケースもカバー）。許可外は null。
+    const resolved = resolveAttachmentPath(filePath, context.workspace);
+    if (!resolved) {
+      return {
+        success: false,
+        output: '',
+        error: `Cannot attach: file not found or outside allowed directories: ${filePath}`,
+      };
     }
     const stat = statSync(resolved);
-    if (!stat.isFile()) {
-      return { success: false, output: '', error: `Not a file: ${resolved}` };
-    }
 
-    // 結果に MEDIA: 形式でパスを含めると、runner 側の mediaPattern が拾って
-    // 添付として送信される。LLM が応答テキストに MEDIA: を書く必要はない。
+    // 構造化経路: runner が attachFile 経由で RunResult.attachments に集約する。
+    // 出力テキストに MEDIA: は書かない（テキスト往復は冗長で、二重添付の元になるため）。
+    context.attachFile?.(resolved);
     return {
       success: true,
-      output: `MEDIA:${resolved}\nQueued ${filePath} (${stat.size} bytes) as attachment.`,
+      output: `Queued ${filePath} (${stat.size} bytes) as attachment.`,
     };
   },
 };

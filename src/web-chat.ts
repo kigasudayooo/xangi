@@ -38,6 +38,7 @@ import { flowFromHostPlatform, getInterChatConfig } from './inter-instance-chat/
 import { setupAutoTalk } from './inter-instance-chat/auto-talk.js';
 import { resolveAccessUrls, formatAccessUrls } from './access-urls.js';
 import { handleEventsStreamRequest } from './events-stream-server.js';
+import { handlePetInboxRequest } from './pet-inbox-server.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -129,6 +130,20 @@ export function startWebChat(options: WebChatOptions): void {
     if (url === '/api/events/stream') {
       try {
         const handled = handleEventsStreamRequest(req, res);
+        if (handled) return;
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+        }
+        return;
+      }
+    }
+
+    // pet からのテキスト送信 (xangi-pet などの consumer 側 UI から POST される)
+    if (url === '/api/pet/inbox') {
+      try {
+        const handled = await handlePetInboxRequest(req, res, agentRunner);
         if (handled) return;
       } catch (err) {
         if (!res.headersSent) {

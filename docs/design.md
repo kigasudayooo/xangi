@@ -687,6 +687,35 @@ AIが出力する特殊コマンドを検出して自動実行：
 CLIツール（`xangi-cmd`）は xangi 内蔵の tool-server（HTTPエンドポイント）経由で実行される。
 DISCORD_TOKEN 等のシークレットは xangi プロセス内に閉じ込められ、AI CLI からはアクセスできない。
 
+### 添付ファイル抽出（read leniently, attach narrowly）
+
+AI の応答テキストからファイルパスを拾って添付する処理（`src/file-utils.ts` の `extractFilePaths`）は、format-drift を前提に「寛容に読むが、添付してよい場所は狭く保つ」方針で設計している。
+
+背景: Local LLM（Gemma 4 等）は添付構文を揺らして出力する。正規の `MEDIA:/path` のほか、`[IMAGE:outputs/foo.png]` や `![alt](foo.png)` のように学習データ由来の埋め込み構文を hallucinate しがちで、これらは従来パーサが認識せず「画像は作ったのに 1 枚も添付されない」事故になっていた。また従来は `/任意/絶対パス.png` を無条件で拾っていたため、`/etc/...` のような想定外ファイルが添付され得る穴もあった。
+
+設計は「正規ルート（ツール）＋ 明示マーカーの寛容パース ＋ サンドボックス」の 3 段:
+
+1. 正規 = `send_file` ツール → 構造化 `RunResult.attachments`（下記サブセクション）。生成物送信の本来経路。
+2. 寛容パーサ = `extractFilePaths`。LLM が send_file を呼ばず応答テキストに添付意図を書いた場合の救済。対象は **明示マーカーのみ**:
+   - `MEDIA:path`
+   - `[IMAGE:|FILE:|VIDEO:|AUDIO:|MEDIA:path]`（角括弧マーカー）
+   - `![alt](path)` / `[label](path)`（markdown）
+   - マーカー無しの「裸パス」を散文から拾う tier は **設けない**。誤添付（本文中のパス文字列が意図せず添付される）リスクの割に得るものが少なく、攻撃面を広げるため。
+3. サンドボックス = 上記いずれの候補も `fs.realpathSync` で正規化してから allowlist ルート（WORKSPACE subtree 全体・添付保存先・`/tmp`・`ATTACHMENT_ALLOWED_DIRS`）との `startsWith` 判定。`..`・symlink によるサンドボックス脱出を防ぎ、存在確認・ファイル/ディレクトリ判定も兼ねる。
+
+- 相対パスは `WORKSPACE_PATH` 基準で解決（従来は cwd 基準で取りこぼしていた）。
+- 寛容化と同時に「絶対パス無条件添付の穴」を塞いでいる点が重要（寛容化だけ入れるとむしろセキュリティが緩むため）。
+- 補助として、チャット PF 共通プロンプト（`xangi-commands-chat-platform.ts`）でも「添付は `MEDIA:/絶対パス` で出す、`[IMAGE:]` 等は使わない」と明示し、ツール・パーサ・プロンプトの多段で守る。
+
+#### 構造化添付チャネル（RunResult.attachments）
+
+テキストからパスを拾う経路（上記 2）は救済であって、本来の経路ではない。Local LLM には添付専用ツール `send_file` があり、これを呼ぶのが正規ルート:
+
+- `send_file(path)` は `resolveAttachmentPath`（上記と同じ realpath + allowlist サンドボックスを共有）で検証し、`ToolContext.attachFile` コールバック経由で realpath を runner に登録する。出力テキストには `MEDIA:` 等を一切書かない（テキスト往復は冗長で二重添付の元になるため、構造化チャネルに一本化）。
+- runner（`LocalLLMRunner`）は per-call（channelId キー）で添付を集約し、`RunResult.attachments: string[]` として返す。Discord/Slack の送信側は `extractFilePaths(text)`（テキスト救済）と `RunResult.attachments`（構造化）を **合算・realpath で重複排除** して添付する。
+- 構造化チャネルはテキストの往復に依存しないため、応答テキストが drift / strip されても添付が生き残る。
+- プロンプトでも「ファイルを作ったら必ず `send_file` を呼ぶ、パスを本文に書くだけにしない」と誘導する。
+
 ### 永続化戦略
 
 | データ | 保存先 | 形式 |

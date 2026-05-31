@@ -38,6 +38,7 @@ import {
   STREAM_UPDATE_INTERVAL_MS,
   TIMEOUT_EXTEND_ENABLED,
 } from './constants.js';
+import { splitMessage } from './message-split.js';
 import {
   Scheduler,
   parseScheduleInput,
@@ -72,38 +73,6 @@ import { getEventsConfig, threadIdFor, turnIdFor } from './events-emitter.js';
 import { runWithBubbleEvents } from './bubble-events-runner.js';
 import { startInterInstanceChat, getInterChatConfig } from './inter-instance-chat/index.js';
 dotenvConfig({ override: true });
-
-/** メッセージを指定文字数で分割（カスタムセパレータ対応、デフォルトは行単位） */
-function splitMessage(text: string, maxLength: number, separator: string = '\n'): string[] {
-  const chunks: string[] = [];
-  const blocks = text.split(separator);
-  let current = '';
-  for (const block of blocks) {
-    const sep = current ? separator : '';
-    if (current.length + sep.length + block.length > maxLength) {
-      if (current) chunks.push(current.trim());
-      // 単一ブロックがmaxLengthを超える場合は行単位でフォールバック
-      if (block.length > maxLength) {
-        const lines = block.split('\n');
-        current = '';
-        for (const line of lines) {
-          if (current.length + line.length + 1 > maxLength) {
-            if (current) chunks.push(current.trim());
-            current = line;
-          } else {
-            current += (current ? '\n' : '') + line;
-          }
-        }
-      } else {
-        current = block;
-      }
-    } else {
-      current += sep + block;
-    }
-  }
-  if (current) chunks.push(current.trim());
-  return chunks;
-}
 
 /** スケジュール一覧をDiscord向けに分割する */
 function splitScheduleContent(content: string, maxLength: number): string[] {
@@ -1113,8 +1082,10 @@ async function main() {
 
         setSession(channelId, runResult.sessionId);
 
-        // ファイルパスを抽出して添付送信
-        const filePaths = extractFilePaths(runResult.result);
+        // ファイルパスを抽出して添付送信（テキスト由来 + 構造化 attachments を合算・重複排除）
+        const filePaths = [
+          ...new Set([...extractFilePaths(runResult.result), ...(runResult.attachments ?? [])]),
+        ];
         const displayText =
           filePaths.length > 0 ? stripFilePaths(runResult.result) : runResult.result;
 
@@ -1695,7 +1666,11 @@ async function main() {
           scope: 'scheduler',
         });
         const freshAppSessionId = `${schedAppSessionId}-${Date.now()}`;
-        const { result, sessionId: newSessionId } = await agentRunner.run(agentPrompt, {
+        const {
+          result,
+          sessionId: newSessionId,
+          attachments,
+        } = await agentRunner.run(agentPrompt, {
           skipPermissions: config.agent.config.skipPermissions ?? false,
           sessionId: undefined,
           channelId,
@@ -1705,8 +1680,8 @@ async function main() {
         // スケジューラーのセッションは scheduler スコープで保存
         setSession(channelId, newSessionId, 'scheduler');
 
-        // 結果を送信
-        const filePaths = extractFilePaths(result);
+        // 結果を送信（テキスト由来 + 構造化 attachments を合算・重複排除）
+        const filePaths = [...new Set([...extractFilePaths(result), ...(attachments ?? [])])];
         const displayText = filePaths.length > 0 ? stripFilePaths(result) : result;
 
         // === セパレータで明示的に分割（content-digest等で複数投稿を1応答に含める用途）
@@ -1968,6 +1943,7 @@ async function processPrompt(
 
     let result: string;
     let newSessionId: string;
+    let structuredAttachments: string[] | undefined;
 
     if (useStreaming && showThinking && !needsSkipRunner) {
       // ストリーミング + 思考表示モード（persistent-runner のみ）
@@ -2096,6 +2072,7 @@ async function processPrompt(
         );
         result = runResult.result;
         newSessionId = runResult.sessionId;
+        structuredAttachments = runResult.attachments;
       } finally {
         clearInterval(thinkingInterval);
       }
@@ -2127,8 +2104,8 @@ async function processPrompt(
       `[xangi] Response length: ${result.length}, session: ${newSessionId.slice(0, 8)}...`
     );
 
-    // ファイルパスを抽出して添付送信
-    const filePaths = extractFilePaths(result);
+    // ファイルパスを抽出して添付送信（テキスト由来 + 構造化 attachments を合算・重複排除）
+    const filePaths = [...new Set([...extractFilePaths(result), ...(structuredAttachments ?? [])])];
     const displayText = filePaths.length > 0 ? stripFilePaths(result) : result;
 
     // === セパレータで明示的に分割（content-digest等で複数投稿を1応答に含める用途）

@@ -68,6 +68,12 @@ export interface ToolContext {
    */
   activateTools?: (names: string[]) => void;
   /**
+   * attach_file ツールが「検証済みの添付ファイル」を登録するためのコールバック。
+   * runner が per-call で集約し、RunResult.attachments として返す。
+   * テキスト出力（MEDIA: 等）に頼らず構造化された経路で添付を宣言する。
+   */
+  attachFile?: (resolvedPath: string) => void;
+  /**
    * tool-trajectory-logger に tool_search 結果を記録するためのフック。
    * tool_search ハンドラから候補一覧と activate 結果を流し込む。
    * runner.ts でロガー有効時のみセットされる (無効時は undefined)。

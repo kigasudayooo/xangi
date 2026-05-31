@@ -222,3 +222,91 @@ curl -N http://localhost:18888/api/events/stream
 # 3. xangi に Discord / Web からメッセージを送る
 #    → curl 側に turn.started → message.delta × N → turn.complete が流れる
 ```
+
+## Pet からの入力経路 (`POST /api/pet/inbox`)
+
+events SSE は「受信専用 broadcast」が設計の核だが、consumer 側 UI からテキストを 1 行だけ気軽に投げ込みたい用途のために、書き込み用の最小 endpoint が追加されている (`xangi-pet` のクリック → 入力欄など)。
+
+応答は同期で返らない。受理されたら 202 が即返り、agent の応答は既存の `/api/events/stream` 経由で全 consumer に broadcast される。「pet が話しかけて、その応答を全 pet で見る」が成立する。
+
+### エンドポイント
+
+```
+POST http://<xangi-host>:<WEB_CHAT_PORT>/api/pet/inbox
+Content-Type: application/json
+Authorization: Bearer <XANGI_PET_INBOX_TOKEN>   ← token 設定時のみ必須
+
+{
+  "text": "今日の天気は？",
+  "appSessionId": "<optional>"
+}
+```
+
+| フィールド | 必須 | 説明 |
+|---|---|---|
+| `text` | yes | ユーザー発話。空文字 / 8000 文字超で 400 |
+| `appSessionId` | no | 指定なら既存 web セッションへ追記。未指定なら最新 web セッションを再利用、無ければ新規作成 |
+
+### レスポンス
+
+成功 (202):
+
+```jsonc
+{
+  "accepted":     true,
+  "instance_id":  "xangi-prod",
+  "thread_id":    "web:<appSessionId>",
+  "turn_id":      "web-msg-pet-<unix-ms>",
+  "session_id":   "<appSessionId>"
+}
+```
+
+エラー:
+
+| status | reason |
+|---|---|
+| 400 | text 空 / 長すぎ / 不正 JSON |
+| 401 | token 設定済みで `Authorization` 不一致 |
+| 403 | token 未設定で **グローバル IP** からアクセス (LAN / Tailscale は通る) |
+| 409 | 同一 session に並行送信 / web 以外の platform |
+| 503 | `XANGI_PET_INBOX_ENABLED=false` で無効化 |
+
+### 環境変数
+
+| 変数 | デフォルト | 説明 |
+|---|---|---|
+| `XANGI_PET_INBOX_ENABLED` | `true` | `false` で完全に無効化 (503 を返す) |
+| `XANGI_PET_INBOX_TOKEN` | (未設定) | 設定時は `Authorization: Bearer <token>` 必須。未設定時は loopback (127.0.0.1 / ::1) のみ許可 |
+
+### 認証モデル
+
+| 条件 | 振る舞い |
+|---|---|
+| `XANGI_PET_INBOX_TOKEN` 未設定 + loopback / LAN / Tailscale | ✅ 許可 (デフォルト) |
+| `XANGI_PET_INBOX_TOKEN` 未設定 + グローバル IP | ❌ 403 |
+| `XANGI_PET_INBOX_TOKEN` 設定済み + Bearer 一致 | ✅ 許可 |
+| `XANGI_PET_INBOX_TOKEN` 設定済み + Bearer 不一致 | ❌ 401 |
+
+「ローカル」とみなす範囲:
+
+- Loopback (`127.0.0.0/8` / `::1`)
+- RFC1918 LAN (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
+- CGNAT (`100.64.0.0/10`) — Tailscale が tailnet IP に使う範囲
+- IPv6 link-local (`fe80::/10`) + ULA (`fc00::/7`)
+
+自宅 LAN や Tailscale で運用してれば pet → xangi はそのまま通る (設定ゼロ)。Cloudflare Tunnel / ngrok などでグローバル IP に出してる場合だけ `XANGI_PET_INBOX_TOKEN` を設定する。
+
+### 動作確認 (curl)
+
+```bash
+# 1. loopback から投げる (token なしでも通る)
+curl -X POST http://localhost:18888/api/pet/inbox \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"こんにちは"}'
+
+# → {"accepted":true, "thread_id":"web:...", ...}
+
+# 2. 別ターミナルで events SSE を購読しておくと、上の curl の結果として
+#    turn.started → message.delta × N → turn.complete が流れる
+curl -N http://localhost:18888/api/events/stream
+```

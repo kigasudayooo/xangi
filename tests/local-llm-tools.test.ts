@@ -225,30 +225,44 @@ describe('tool registry', () => {
 });
 
 describe('send_file tool', () => {
-  it('returns MEDIA: line for an existing file', async () => {
+  it('succeeds for an existing file and confirms the attachment in output', async () => {
     const target = join(workspace, 'attach.txt');
     writeFileSync(target, 'hello attachment');
     const result = await executeTool('send_file', { path: 'attach.txt' }, context);
     expect(result.success).toBe(true);
-    expect(result.output).toMatch(/^MEDIA:.+attach\.txt/m);
+    expect(result.output).toMatch(/Queued .*attach\.txt/);
+    // 出力テキストには MEDIA: を書かない（構造化 attachFile 経路に一本化したため）
+    expect(result.output).not.toMatch(/MEDIA:/);
+  });
+
+  it('registers the resolved path via context.attachFile (structured channel)', async () => {
+    const target = join(workspace, 'attach.txt');
+    writeFileSync(target, 'hello attachment');
+    const attached: string[] = [];
+    const ctx: ToolContext = { workspace, attachFile: (p) => attached.push(p) };
+    const result = await executeTool('send_file', { path: 'attach.txt' }, ctx);
+    expect(result.success).toBe(true);
+    // realpath 正規化されたパスが構造化経路で登録される
+    expect(attached).toHaveLength(1);
+    expect(attached[0]).toMatch(/attach\.txt$/);
   });
 
   it('errors when file does not exist', async () => {
     const result = await executeTool('send_file', { path: 'nope.bin' }, context);
     expect(result.success).toBe(false);
-    expect(result.error).toMatch(/not found/i);
+    expect(result.error).toMatch(/not found|outside allowed/i);
   });
 
-  it('errors when path is a directory', async () => {
+  it('errors when path is a directory (not a file)', async () => {
     const result = await executeTool('send_file', { path: '.' }, context);
     expect(result.success).toBe(false);
-    expect(result.error).toMatch(/not a file/i);
+    expect(result.error).toMatch(/not found|outside allowed/i);
   });
 
-  it('rejects ../ traversal', async () => {
+  it('rejects a non-existent ../ traversal target', async () => {
     const result = await executeTool('send_file', { path: '../escape.txt' }, context);
     expect(result.success).toBe(false);
-    expect(result.error).toMatch(/outside workspace/);
+    expect(result.error).toMatch(/not found|outside allowed/i);
   });
 });
 

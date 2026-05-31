@@ -677,6 +677,35 @@ Detects and automatically executes special commands output by the AI:
 CLI tools (`xangi-cmd`) are executed via xangi's built-in tool-server (HTTP endpoint).
 Secrets such as DISCORD_TOKEN are confined to the xangi process and cannot be accessed from AI CLIs.
 
+### Attachment extraction (read leniently, attach narrowly)
+
+The logic that pulls file paths out of the AI's response text and attaches them (`extractFilePaths` in `src/file-utils.ts`) is designed around format-drift: "read leniently, but keep the set of attachable locations narrow".
+
+Background: Local LLMs (e.g. Gemma 4) emit attachment syntax inconsistently. Besides the canonical `MEDIA:/path`, they tend to hallucinate training-data conventions like `[IMAGE:outputs/foo.png]` or `![alt](foo.png)`. The old parser did not recognize these, causing "the image was generated but nothing got attached" failures. The old parser also accepted any absolute `/path.png` unconditionally, which could attach unintended files (e.g. under `/etc/...`).
+
+Defense is three-layered: canonical tool route + lenient parsing of explicit markers + sandbox:
+
+1. Canonical = the `send_file` tool → structured `RunResult.attachments` (see below). The intended route for delivering generated files.
+2. Lenient parser = `extractFilePaths`. Rescue for when the LLM doesn't call send_file and instead writes attachment intent into the response text. **Explicit markers only**:
+   - `MEDIA:path`
+   - `[IMAGE:|FILE:|VIDEO:|AUDIO:|MEDIA:path]` (bracket markers)
+   - `![alt](path)` / `[label](path)` (markdown)
+   - No "bare path in prose" tier — the false-positive risk (an incidental path string getting attached) outweighs the benefit and widens the attack surface.
+3. Sandbox = every candidate is canonicalized via `fs.realpathSync` before a `startsWith` check against allowlist roots (entire WORKSPACE subtree, the attachment store, `/tmp`, `ATTACHMENT_ALLOWED_DIRS`). This blocks `..` / symlink escapes and doubles as the existence / file-vs-directory check.
+
+- Relative paths are resolved against `WORKSPACE_PATH` (the old code resolved against cwd and missed them).
+- Crucially, the leniency change also closes the "unconditional absolute-path attachment" hole — adding leniency alone would otherwise loosen security.
+- As a backup, the shared chat-platform prompt (`xangi-commands-chat-platform.ts`) explicitly instructs models to emit `MEDIA:/absolute/path` and avoid `[IMAGE:]` etc., so tool, parser, and prompt defend in layers.
+
+#### Structured attachment channel (RunResult.attachments)
+
+Scraping paths from text (layer 2) is a rescue, not the intended path. Local LLMs have a dedicated `send_file` tool, and calling it is the canonical route:
+
+- `send_file(path)` validates via `resolveAttachmentPath` (sharing the same realpath + allowlist sandbox above) and registers the realpath with the runner through the `ToolContext.attachFile` callback. It writes no `MEDIA:` into its output text — the text round-trip was redundant and a source of double-attachment, so the structured channel is the single path.
+- The runner (`LocalLLMRunner`) collects attachments per-call (keyed by channelId) and returns them as `RunResult.attachments: string[]`. The Discord/Slack send path merges `extractFilePaths(text)` (text rescue) with `RunResult.attachments` (structured), deduping by realpath.
+- The structured channel does not depend on a text round-trip, so attachments survive even if the response text drifts or gets stripped.
+- The prompt also nudges models to "always call `send_file` after producing a file, don't just write the path in the reply".
+
 ### Persistence Strategy
 
 | Data | Storage Location | Format |

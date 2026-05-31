@@ -20,6 +20,12 @@ export interface RunOptions {
 export interface RunResult {
   result: string;
   sessionId: string;
+  /**
+   * 構造化された添付ファイルパス（realpath、サンドボックス検証済み）。
+   * Local LLM の attach_file ツール経由で宣言された添付。応答テキストからの
+   * MEDIA: 抽出（extractFilePaths）とは別経路で、両者は呼び出し側で合算・重複排除される。
+   */
+  attachments?: string[];
 }
 
 /** 現在処理中リクエストのタイムアウト状態 */

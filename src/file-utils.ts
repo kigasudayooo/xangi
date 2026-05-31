@@ -41,41 +41,144 @@ export async function downloadFile(
 }
 
 /**
- * Agent結果からファイルパスを抽出
- * パターン: MEDIA:/path/to/file または [ファイル](/path/to/file)
+ * 相対パスの解決基点となるワークスペースルート。
+ * Local LLM/Claude いずれの runner も WORKSPACE_PATH を持つ。未設定時は cwd。
  */
-export function extractFilePaths(text: string): string[] {
-  const paths: string[] = [];
+function getWorkspaceRoot(explicit?: string): string {
+  return explicit || process.env.WORKSPACE_PATH || process.cwd();
+}
 
-  // MEDIA:/path/to/file パターン
-  const mediaPattern = /MEDIA:\s*([^\s\n]+)/g;
-  let match;
-  while ((match = mediaPattern.exec(text)) !== null) {
-    const p = match[1].trim();
-    if (fs.existsSync(p)) {
-      paths.push(p);
-    }
-  }
-
-  // 絶対パスパターン（画像/音声/動画の拡張子を持つもの）
-  const absPathPattern =
-    /(?:^|\s)(\/[^\s]+\.(?:png|jpg|jpeg|gif|webp|mp3|mp4|wav|flac|pdf|zip))/gim;
-  while ((match = absPathPattern.exec(text)) !== null) {
-    const p = match[1].trim();
-    if (fs.existsSync(p) && !paths.includes(p)) {
-      paths.push(p);
-    }
-  }
-
-  return paths;
+function extraAllowedDirs(): string[] {
+  const extra = process.env.ATTACHMENT_ALLOWED_DIRS;
+  if (!extra) return [];
+  return extra
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((d) => path.resolve(d));
 }
 
 /**
- * テキストからファイルパス部分を除去して表示用テキストを返す
+ * 明示マーカー（MEDIA: / [IMAGE:] / markdown リンク等）で指定されたパスに
+ * 添付を許可するルート群（広め）。ワークスペース subtree 全体・添付保存先・一時領域。
+ * ここに入っていないパス（例: /etc/passwd、~/.ssh）は弾く＝既存の
+ * 「任意絶対パスが素通りで添付されてしまう穴」をここで塞ぐ。
+ * ATTACHMENT_ALLOWED_DIRS（カンマ区切り絶対パス）で追加可能。
+ */
+function getBroadAllowedRoots(workspaceRoot: string): string[] {
+  return [workspaceRoot, DOWNLOAD_DIR, os.tmpdir(), '/tmp', ...extraAllowedDirs()];
+}
+
+/**
+ * 候補文字列を絶対パスに正規化する。クォート/山括弧/file:// を剥がし、
+ * 相対パスは workspaceRoot 基準で解決する。
+ */
+function resolveCandidate(raw: string, workspaceRoot: string): string | null {
+  let p = raw.trim();
+  // 周辺の引用符・山括弧・開き括弧を除去
+  p = p
+    .replace(/^['"<(]+/, '')
+    .replace(/['">)]+$/, '')
+    .trim();
+  if (!p) return null;
+  if (p.startsWith('file://')) p = p.slice('file://'.length);
+  if (!p) return null;
+  return path.isAbsolute(p) ? path.resolve(p) : path.resolve(workspaceRoot, p);
+}
+
+/**
+ * resolved が allowedRoots のいずれかの subtree 内にある「実在ファイル」かを
+ * realpath ベースで検査する。realpath を使うことで `..` や symlink による
+ * サンドボックス脱出も防ぐ。戻り値は canonical な realpath（重複排除のため）。
+ */
+function realFileWithinRoots(resolved: string, allowedRoots: string[]): string | null {
+  let real: string;
+  try {
+    real = fs.realpathSync(resolved);
+    if (!fs.statSync(real).isFile()) return null;
+  } catch {
+    return null; // 存在しない / アクセス不可
+  }
+  for (const root of allowedRoots) {
+    let realRoot: string;
+    try {
+      realRoot = fs.realpathSync(root);
+    } catch {
+      continue; // ルートが存在しなければスキップ
+    }
+    if (real === realRoot || real.startsWith(realRoot + path.sep)) {
+      return real;
+    }
+  }
+  return null;
+}
+
+/**
+ * 応答テキストから添付マーカーのファイルパスを抽出する。
+ *
+ * 対象は明示マーカーのみ: MEDIA: / [IMAGE:|FILE:|VIDEO:|AUDIO:|MEDIA:] / markdown リンク。
+ * 相対パスは WORKSPACE_PATH 基準で解決し、候補は allowlist サンドボックス
+ * （realpath + broad roots）内の実在ファイルだけを返す。
+ */
+export function extractFilePaths(text: string, workspaceRootOverride?: string): string[] {
+  if (!text) return [];
+  const workspaceRoot = getWorkspaceRoot(workspaceRootOverride);
+  const broadRoots = getBroadAllowedRoots(workspaceRoot);
+
+  const found = new Set<string>();
+  const consider = (raw: string) => {
+    const resolved = resolveCandidate(raw, workspaceRoot);
+    if (!resolved) return;
+    const real = realFileWithinRoots(resolved, broadRoots);
+    if (real) found.add(real);
+  };
+
+  let match: RegExpExecArray | null;
+
+  // 1) MEDIA:/path/to/file（裸の MEDIA:）
+  const mediaPattern = /MEDIA:\s*([^\s\n]+)/g;
+  while ((match = mediaPattern.exec(text)) !== null) {
+    consider(match[1]);
+  }
+
+  // 2) [IMAGE:path] / [FILE:path] / [VIDEO:path] / [AUDIO:path] / [MEDIA:path]
+  const bracketPattern = /\[(?:IMAGE|FILE|VIDEO|AUDIO|MEDIA):\s*([^\]\n]+)\]/gi;
+  while ((match = bracketPattern.exec(text)) !== null) {
+    consider(match[1]);
+  }
+
+  // 3) markdown リンク / 画像  ![alt](path) または [label](path)
+  const mdLinkPattern = /!?\[[^\]]*\]\(\s*([^)\s]+)\s*\)/g;
+  while ((match = mdLinkPattern.exec(text)) !== null) {
+    consider(match[1]);
+  }
+
+  return [...found];
+}
+
+/**
+ * 単一パスを「添付してよい実在ファイル」として検証し、canonical な realpath を返す。
+ * 検証不可なら null。`attach_file` ツール等、明示的・意図的な添付呼び出しから使う想定なので
+ * broad roots（WORKSPACE subtree / 添付保存先 / tmp / ATTACHMENT_ALLOWED_DIRS）で許可する。
+ * extractFilePaths と同じサンドボックス（realpath + allowlist）を共有する。
+ */
+export function resolveAttachmentPath(raw: string, workspaceRootOverride?: string): string | null {
+  if (!raw) return null;
+  const workspaceRoot = getWorkspaceRoot(workspaceRootOverride);
+  const resolved = resolveCandidate(raw, workspaceRoot);
+  if (!resolved) return null;
+  return realFileWithinRoots(resolved, getBroadAllowedRoots(workspaceRoot));
+}
+
+/**
+ * テキストから添付マーカー（MEDIA: / 角括弧マーカー / markdown 画像）を除去して
+ * 表示用テキストを返す。
  */
 export function stripFilePaths(text: string): string {
   return text
     .replace(/MEDIA:\s*[^\s\n]+/g, '')
+    .replace(/\[(?:IMAGE|FILE|VIDEO|AUDIO|MEDIA):\s*[^\]\n]+\]/gi, '')
+    .replace(/!\[[^\]]*\]\(\s*[^)\s]+\s*\)/g, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
