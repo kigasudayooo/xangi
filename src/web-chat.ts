@@ -38,7 +38,8 @@ import { flowFromHostPlatform, getInterChatConfig } from './inter-instance-chat/
 import { setupAutoTalk } from './inter-instance-chat/auto-talk.js';
 import { resolveAccessUrls, formatAccessUrls } from './access-urls.js';
 import { handleEventsStreamRequest } from './events-stream-server.js';
-import { handlePetInboxRequest } from './pet-inbox-server.js';
+import { handlePetInboxRequest, isInboxPath } from './pet-inbox-server.js';
+import { handleEvenTerminalRequest } from './even-terminal-server.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -104,7 +105,7 @@ export function startWebChat(options: WebChatOptions): void {
 
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
     if (req.method === 'OPTIONS') {
       res.writeHead(200);
@@ -140,8 +141,22 @@ export function startWebChat(options: WebChatOptions): void {
       }
     }
 
-    // pet からのテキスト送信 (xangi-pet などの consumer 側 UI から POST される)
-    if (url === '/api/pet/inbox') {
+    // Even Terminal compatibility API (`@evenrealities/even-terminal`)
+    if (url.startsWith('/api/')) {
+      try {
+        const handled = await handleEvenTerminalRequest(req, res, agentRunner);
+        if (handled) return;
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+        }
+        return;
+      }
+    }
+
+    // 外部 device からのテキスト送信 (xangi-pet / Even G2 等の consumer 側 UI から POST される)
+    if (isInboxPath(url)) {
       try {
         const handled = await handlePetInboxRequest(req, res, agentRunner);
         if (handled) return;

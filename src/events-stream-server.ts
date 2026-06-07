@@ -28,7 +28,10 @@ const KEEPALIVE_MS = 30_000;
  */
 export function handleEventsStreamRequest(req: IncomingMessage, res: ServerResponse): boolean {
   const rawUrl = req.url || '/';
-  const url = rawUrl.split('?')[0];
+  const parsedUrl = new URL(rawUrl, 'http://xangi.local');
+  const url = parsedUrl.pathname;
+  const threadFilter =
+    parsedUrl.searchParams.get('thread_id') || parsedUrl.searchParams.get('threadId') || '';
 
   if (req.method !== 'GET' || url !== '/api/events/stream') {
     return false;
@@ -63,10 +66,12 @@ export function handleEventsStreamRequest(req: IncomingMessage, res: ServerRespo
     `event: ready\ndata: ${JSON.stringify({
       instance_id: cfg.instanceId,
       host_hint: cfg.hostHint,
+      thread_id: threadFilter || undefined,
     })}\n\n`
   );
 
   const writeEvent = (payload: PublishedEvent): void => {
+    if (threadFilter && payload.thread_id !== threadFilter) return;
     try {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     } catch {

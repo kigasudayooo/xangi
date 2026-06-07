@@ -4,7 +4,7 @@ xangiのアーキテクチャと設計思想について説明します。
 
 ## 概要
 
-xangiは「AI CLI（Claude Code / Codex CLI / Gemini CLI）やローカルLLM（Ollama等）をチャットプラットフォームから使えるようにするラッパー」です。
+xangiは「AI CLI（Claude Code / Codex CLI / Cursor CLI、legacy/API-key 用の Gemini CLI）やローカルLLM（Ollama等）をチャットプラットフォームから使えるようにするラッパー」です。
 
 ```
 User → Chat (Discord/Slack) → xangi → AI CLI → Workspace
@@ -16,7 +16,7 @@ User → Chat (Discord/Slack) → xangi → AI CLI → Workspace
 flowchart LR
     User([ユーザー]) <-->|メッセージ| chat[UI<br/>Discord / Slack<br/>ブラウザ / LINE]
     chat <-->|プロンプト| xangi[xangi]
-    xangi <-->|実行| LLM{{LLMバックエンド<br/>Claude Code / Codex<br/>Gemini CLI / Local LLM}}
+    xangi <-->|実行| LLM{{LLMバックエンド<br/>Claude Code / Codex<br/>Cursor CLI / Local LLM<br/>Gemini CLI legacy}}
     LLM <-->|ファイル操作| WS[(Workspace<br/>AGENTS.md / skills<br/>ローカル資料)]
     LLM <--> Web[Web検索]
     LLM <--> Service[Webサービス]
@@ -40,7 +40,7 @@ flowchart LR
 | Chat | ユーザーインターフェース | discord.js, @slack/bolt, http (Web Chat), @line/bot-sdk |
 | xangi | AI CLI / Local LLM の統合・制御 | index.ts, agent-runner.ts, dynamic-runner.ts |
 | Backend Resolution | チャンネル別バックエンド解決 | backend-resolver.ts, settings.ts |
-| AI Backend | 実際のAI処理 | Claude Code, Codex CLI, Gemini CLI, Local LLM (Ollama / vLLM) |
+| AI Backend | 実際のAI処理 | Claude Code, Codex CLI, Cursor CLI, Local LLM (Ollama / vLLM), Gemini CLI legacy |
 | Workspace | ファイル・スキル | skills/, AGENTS.md, ローカル資料 |
 
 ## コンポーネント
@@ -199,7 +199,7 @@ xangiがAI CLIに注入するシステムプロンプトを管理：
 - **取得**: `process.cwd()`（同期）+ `git rev-parse --show-toplevel` / `git branch --show-current`（5 秒キャッシュ）
 - **注入タイミング**: 全 backend の `run()` / `runStream()` 入口で `prependRuntimeContext()`。常駐プロセス（`persistent-runner.ts`）は `--append-system-prompt` が起動時固定なので user message 本文に注入する
 - **無効化**: `XANGI_RUNTIME_CONTEXT_ENABLED=false`（既定 true）で注入をオフにできる。雑談中心のインスタンスや、cwd ブレが事故に繋がらない用途で
-- **ツール呼び出し表示**: Discord / Slack / Web Chat に出る Bash/exec ツール呼び出しの引数表示の最大長は 200 文字。env `XANGI_TOOL_DISPLAY_MAX` で変更可
+- **ツール呼び出し表示**: Discord のツール履歴表示は `DISCORD_TOOL_HISTORY_MODE=button|inline|off` で制御する。既定は `button` で、完了後の通常メッセージには履歴を混ぜず、`Tools` ボタン押下時に押した本人だけへ ephemeral で表示する。`DISCORD_SHOW_TOOL_BUTTON=false` なら `button` モードでも `Tools` ボタンを出さない。`inline` は従来どおり本文上部に表示、`off` は完全非表示。互換設定として `DISCORD_SHOW_TOOL_USE=false` は `off`、`true` は `inline` として扱う。実行中は `DISCORD_SHOW_LIVE_TOOL_USE=false` で無効化しない限り、実コマンドが分かる raw 表示を出す。完了後は `workspace-RAG検索` などの短い履歴ラベルへ正規化し、Bash/exec は `/bin/bash -lc` などの wrapper を落として短縮表示する。実行中の Bash/exec ツール呼び出しの引数表示の最大長は 200 文字で、env `XANGI_TOOL_DISPLAY_MAX` で変更可。
 
 AGENTS.md / CHARACTER.md / USER.md 等のワークスペース設定は、各AI CLIの自動読み込み機能に委譲：
 
@@ -207,7 +207,8 @@ AGENTS.md / CHARACTER.md / USER.md 等のワークスペース設定は、各AI 
 |-----|---------------------|----------|
 | Claude Code | `CLAUDE.md` | `--append-system-prompt`（一回限り） |
 | Codex CLI | `AGENTS.md` | `<system-context>` タグで埋め込み |
-| Gemini CLI | `GEMINI.md` | CLI側で自動読み込み（xangi側の注入なし） |
+| Gemini CLI (legacy) | `GEMINI.md` | CLI側で自動読み込み（xangi側の注入なし） |
+| Cursor CLI | `AGENTS.md` | CLI側で自動読み込み（xangi側の注入なし） |
 | Local LLM | `AGENTS.md`, `MEMORY.md` | システムプロンプトに直接埋め込み（`CLAUDE.md` は通常 `AGENTS.md` のシンボリックリンクのため除外） |
 
 ### AI CLIアダプター
@@ -217,7 +218,8 @@ AGENTS.md / CHARACTER.md / USER.md 等のワークスペース設定は、各AI 
 | claude-code.ts | Claude Code | ストリーミング対応、セッション管理 |
 | persistent-runner.ts | Claude Code（常駐） | `--input-format=stream-json` で常駐プロセス化、キュー管理、サーキットブレーカー |
 | codex-cli.ts | Codex CLI | OpenAI製、0.98.0対応、cancel対応 |
-| gemini-cli.ts | Gemini CLI | Google製、セッション管理、ストリーミング対応 |
+| gemini-cli.ts | Gemini CLI legacy | 互換性維持と Enterprise / Google Cloud / paid API key 用。個人向け Pro / Ultra / 無料枠前提の新規利用は非推奨 |
+| cursor-cli.ts | Cursor CLI | `cursor-agent` コマンド、JSON/stream-json、tool call表示対応 |
 | local-llm/runner.ts | Local LLM | Ollama等のローカルLLMを直接呼び出し、ツール実行・ストリーミング対応 |
 
 #### Local LLMアダプターの詳細設計
@@ -664,7 +666,7 @@ AI CLIの実装詳細を隠蔽し、交換可能に：
 
 ```typescript
 // 設定でバックエンドを切り替え
-AGENT_BACKEND=claude-code  # or codex or gemini or local-llm
+AGENT_BACKEND=claude-code  # or codex / cursor / local-llm (gemini is legacy/API-key use)
 ```
 
 将来的に新しいAI CLIが登場しても、アダプターを追加するだけで対応可能。
@@ -818,7 +820,10 @@ src/
 ├── claude-code.ts      # Claude Codeアダプター（per-request）
 ├── persistent-runner.ts # Claude Codeアダプター（常駐プロセス）
 ├── codex-cli.ts        # Codex CLIアダプター
-├── gemini-cli.ts       # Gemini CLIアダプター
+├── gemini-cli.ts       # Gemini CLIアダプター（legacy/API-key用）
+├── cursor-cli.ts       # Cursor CLIアダプター
+├── cli-process.ts      # 単発CLI runnerのprocess/env/timeout共通部品
+├── jsonl-buffer.ts     # JSONL streamの行分割共通部品
 ├── web-chat.ts         # WebチャットUI（HTTPサーバー）
 ├── tool-server.ts      # Tool Server（AI CLI向けHTTP API）
 ├── approval.ts         # 危険コマンド検知（パターンマッチ）

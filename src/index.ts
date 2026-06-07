@@ -143,6 +143,7 @@ function createProcessingButtons(timeout?: {
  */
 type DiscordProcessingEntry = { message: Message; intervalId?: NodeJS.Timeout };
 const discordProcessingMessages = new Map<string, DiscordProcessingEntry>();
+const discordToolHistoryByMessageId = new Map<string, string[]>();
 
 /** チャンネルの現在のタイムアウト状態から Discord UI 用に整形 (top-level 版) */
 function getDiscordTimeoutInfoFor(
@@ -158,11 +159,22 @@ function getDiscordTimeoutInfoFor(
   return { remainingMs, canExtend, extendEnabled: TIMEOUT_EXTEND_ENABLED };
 }
 
-/** 完了後に表示するNew Sessionボタン */
-function createCompletedButtons(): ActionRowBuilder<ButtonBuilder> {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+/** 完了後に表示するボタン群 */
+function createCompletedButtons(options?: {
+  showTools?: boolean;
+}): ActionRowBuilder<ButtonBuilder> {
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId('xangi_new').setLabel('New').setStyle(ButtonStyle.Secondary)
   );
+  if (options?.showTools) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('xangi_tools')
+        .setLabel('Tools')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  return row;
 }
 
 /**
@@ -215,6 +227,86 @@ function formatToolInput(toolName: string, input: Record<string, unknown>): stri
       }
       return '';
   }
+}
+
+function appendToolHistory(text: string, toolHistory: string[], suffix = ''): string {
+  if (toolHistory.length === 0) return `${text}${suffix}`;
+  const base = text.trimEnd();
+  const toolDisplay = toolHistory.join('\n');
+  return `${toolDisplay}${base ? `\n\n${base}` : ''}${suffix}`;
+}
+
+function formatInternalContextCommand(command: string): string | null {
+  const normalized = command.replace(/\s+/g, ' ');
+
+  if (/(^|["'\s])xangi-cmd discord_history\b/.test(normalized)) {
+    return '🔧 Discord履歴確認';
+  }
+  if (/\b(?:127\.0\.0\.1|localhost):7890\/search\b/.test(normalized)) {
+    return '🔧 workspace-RAG検索';
+  }
+  const memoryMatch = normalized.match(/\bmemory\/(20\d{6}\.md)\b/);
+  if (memoryMatch) {
+    return `🔧 Memory参照: ${memoryMatch[1]}`;
+  }
+  if (/\bAGENTS\.md\b/.test(normalized)) {
+    return '🔧 AGENTS参照';
+  }
+  if (/\bMEMORY\.md\b/.test(normalized)) {
+    return '🔧 MEMORY参照';
+  }
+  if (/\bknowledge\/lessons_archive\.md\b/.test(normalized)) {
+    return '🔧 教訓参照';
+  }
+  const skillMatch = normalized.match(/\bskills\/([^"'`\s]+)\/SKILL\.md\b/);
+  if (skillMatch) {
+    return `🔧 Skill参照: ${skillMatch[1]}`;
+  }
+  return null;
+}
+
+function formatFinalCommandSummary(command: string): string {
+  const normalized = command.replace(/\s+/g, ' ').trim();
+  const shellMatch = normalized.match(/^\/bin\/bash -lc (?:"([^"]*)"|'([^']*)')$/);
+  const unwrapped = shellMatch ? shellMatch[1] || shellMatch[2] || normalized : normalized;
+  const maxLen = 80;
+  return unwrapped.length > maxLen ? `${unwrapped.slice(0, maxLen)}...` : unwrapped;
+}
+
+function addToolHistory(
+  toolHistory: string[],
+  toolName: string,
+  toolInput: Record<string, unknown>
+): boolean {
+  let line: string | null = null;
+  if (toolName === 'Bash' || toolName === 'exec') {
+    const command = toolInput.command || toolInput.cmd;
+    if (command) {
+      const commandString = String(command);
+      line =
+        formatInternalContextCommand(commandString) ||
+        `🔧 ${toolName}実行: \`${formatFinalCommandSummary(commandString)}\``;
+    }
+  }
+  if (!line) {
+    const inputSummary = formatToolInput(toolName, toolInput);
+    line = `🔧 ${toolName}${inputSummary}`;
+  }
+  if (toolHistory.includes(line)) return false;
+  toolHistory.push(line);
+  return true;
+}
+
+function addLiveToolHistory(
+  toolHistory: string[],
+  toolName: string,
+  toolInput: Record<string, unknown>
+): boolean {
+  const inputSummary = formatToolInput(toolName, toolInput);
+  const line = `🔧 ${toolName}${inputSummary}`;
+  if (toolHistory.includes(line)) return false;
+  toolHistory.push(line);
+  return true;
 }
 
 /**
@@ -520,6 +612,7 @@ async function main() {
                 { name: 'Claude Code', value: 'claude-code' },
                 { name: 'Codex', value: 'codex' },
                 { name: 'Gemini', value: 'gemini' },
+                { name: 'Cursor', value: 'cursor' },
                 { name: 'Local LLM', value: 'local-llm' }
               )
           )
@@ -751,6 +844,7 @@ async function main() {
       if (interaction.customId === 'xangi_new') {
         deleteSession(channelId);
         agentRunner.destroy?.(channelId);
+        discordToolHistoryByMessageId.delete(interaction.message.id);
         // ボタンを消してメッセージを更新
         await interaction
           .update({
@@ -760,6 +854,25 @@ async function main() {
         await interaction
           .followUp({ content: '🆕 新しいセッションを開始しました', ephemeral: true })
           .catch(() => {});
+        return;
+      }
+
+      if (interaction.customId === 'xangi_tools') {
+        const toolHistory = discordToolHistoryByMessageId.get(interaction.message.id);
+        if (!toolHistory || toolHistory.length === 0) {
+          await interaction
+            .reply({ content: 'ツール履歴はありません', ephemeral: true })
+            .catch(() => {});
+          return;
+        }
+        const chunks = splitMessage(`ツール履歴\n${toolHistory.join('\n')}`, DISCORD_SAFE_LENGTH);
+        await interaction.reply({
+          content: chunks[0] || 'ツール履歴はありません',
+          ephemeral: true,
+        });
+        for (let i = 1; i < chunks.length; i++) {
+          await interaction.followUp({ content: chunks[i], ephemeral: true }).catch(() => {});
+        }
         return;
       }
 
@@ -948,7 +1061,9 @@ async function main() {
             ? process.env.LOCAL_LLM_MODEL || '(デフォルト)'
             : backendValue === 'claude-code'
               ? process.env.AGENT_MODEL || 'Claude (デフォルト)'
-              : '(デフォルト)');
+              : backendValue === 'cursor'
+                ? process.env.AGENT_MODEL || 'Cursor (デフォルト)'
+                : '(デフォルト)');
         const lines = [
           `🔄 モデルを切り替えました。新しいセッションを開始します。`,
           `- バックエンド: **${display}**`,
@@ -1636,7 +1751,10 @@ async function main() {
       // 処理中メッセージを送信
       const thinkingMsg = await (
         channel as {
-          send: (content: string) => Promise<{ edit: (content: string) => Promise<unknown> }>;
+          send: (content: string) => Promise<{
+            edit: (content: string) => Promise<unknown>;
+            delete: () => Promise<unknown>;
+          }>;
         }
       ).send('🤔 考え中...');
 
@@ -1677,6 +1795,10 @@ async function main() {
 
         // 結果を送信（テキスト由来 + 構造化 attachments を合算・重複排除）
         const { filePaths, displayText } = buildAttachmentResult(result, attachments);
+        if (!displayText.trim() && filePaths.length === 0) {
+          await thinkingMsg.delete().catch(() => {});
+          return result;
+        }
 
         // === セパレータで明示的に分割（content-digest等で複数投稿を1応答に含める用途）
         // LLMが前後に空白や余分な改行を入れることがあるため、正規表現で緩くマッチ
@@ -1878,7 +2000,8 @@ async function processPrompt(
   config: ReturnType<typeof loadConfig>
 ): Promise<string | null> {
   let replyMessage: Message | null = null;
-  const toolHistory: string[] = []; // ツール実行履歴（stop時にも参照するため関数スコープ）
+  const toolHistory: string[] = []; // 完了後に表示する短いツール履歴
+  const liveToolHistory: string[] = []; // 実行中に表示する raw command 寄りのツール履歴
   let lastStreamedText = ''; // エラー時に途中テキストを残すため関数スコープ
   // xangi-events 用 ID（fire-and-forget なのでエラーで本業を止めない）
   const threadId = threadIdFor('discord', channelId);
@@ -1908,6 +2031,10 @@ async function processPrompt(
     const appSessionId = ensureSession(channelId, { platform: 'discord' });
     const useStreaming = config.discord.streaming ?? true;
     const showThinking = config.discord.showThinking ?? true;
+    const toolHistoryMode =
+      config.discord.toolHistoryMode ?? ((config.discord.showToolUse ?? true) ? 'inline' : 'off');
+    const captureToolUse = toolHistoryMode !== 'off';
+    const showLiveToolUse = captureToolUse && (config.discord.showLiveToolUse ?? true);
 
     // !skip プレフィックスの場合、ワンショットランナーを使用
     // （persistent-runner はプロセス起動時の権限設定を変えられないため）
@@ -1953,9 +2080,10 @@ async function processPrompt(
         if (firstTextReceived) return;
         dotCount = (dotCount % 3) + 1;
         const dots = '.'.repeat(dotCount);
-        const toolDisplay = toolHistory.length > 0 ? '\n' + toolHistory.join('\n') : '';
+        const toolDisplay =
+          showLiveToolUse && liveToolHistory.length > 0 ? `${liveToolHistory.join('\n')}\n\n` : '';
         const editPayload: { content: string; components?: ActionRowBuilder<ButtonBuilder>[] } = {
-          content: `🤔 考え中${dots}${toolDisplay}`,
+          content: `${toolDisplay}🤔 考え中${dots}`,
         };
         if (showButtons && !needsSkipRunner) {
           editPayload.components = [
@@ -1985,7 +2113,12 @@ async function processPrompt(
                 const streamPayload: {
                   content: string;
                   components?: ActionRowBuilder<ButtonBuilder>[];
-                } = { content: (fullText + ' ▌').slice(0, DISCORD_MAX_LENGTH) };
+                } = {
+                  content: appendToolHistory(fullText, liveToolHistory, ' ▌').slice(
+                    0,
+                    DISCORD_MAX_LENGTH
+                  ),
+                };
                 if (showButtons && !needsSkipRunner) {
                   streamPayload.components = [
                     createProcessingButtons(getDiscordTimeoutInfoFor(agentRunner, channelId)),
@@ -2002,17 +2135,21 @@ async function processPrompt(
               }
             },
             onToolUse: (toolName, toolInput) => {
-              // ツール実行履歴に追加
-              const inputSummary = formatToolInput(toolName, toolInput);
-              toolHistory.push(`🔧 ${toolName}${inputSummary}`);
-              const toolDisplay = toolHistory.join('\n');
+              if (!captureToolUse) return;
+              addToolHistory(toolHistory, toolName, toolInput);
+              if (!showLiveToolUse) return;
+              if (!addLiveToolHistory(liveToolHistory, toolName, toolInput)) return;
+              const toolDisplay = liveToolHistory.join('\n');
               const toolPayload: {
                 content: string;
                 components?: ActionRowBuilder<ButtonBuilder>[];
               } = {
                 content: firstTextReceived
-                  ? `${lastStreamedText || ''}\n\n${toolDisplay} ▌`.slice(0, DISCORD_MAX_LENGTH)
-                  : `🤔 考え中...\n${toolDisplay}`,
+                  ? appendToolHistory(lastStreamedText || '', liveToolHistory, ' ▌').slice(
+                      0,
+                      DISCORD_MAX_LENGTH
+                    )
+                  : `${toolDisplay}\n\n🤔 考え中...`,
               };
               if (showButtons && !needsSkipRunner) {
                 toolPayload.components = [
@@ -2040,8 +2177,10 @@ async function processPrompt(
       const thinkingInterval = setInterval(() => {
         dotCount = (dotCount % 3) + 1;
         const dots = '.'.repeat(dotCount);
+        const toolDisplay =
+          showLiveToolUse && liveToolHistory.length > 0 ? `${liveToolHistory.join('\n')}\n\n` : '';
         const editPayload: { content: string; components?: ActionRowBuilder<ButtonBuilder>[] } = {
-          content: `🤔 考え中${dots}`,
+          content: `${toolDisplay}🤔 考え中${dots}`,
         };
         if (showButtons && !needsSkipRunner) {
           editPayload.components = [
@@ -2056,7 +2195,25 @@ async function processPrompt(
           runner,
           prompt,
           eventCtx,
-          {},
+          {
+            onToolUse: (toolName, toolInput) => {
+              if (!captureToolUse) return;
+              addToolHistory(toolHistory, toolName, toolInput);
+              if (!showLiveToolUse) return;
+              if (!addLiveToolHistory(liveToolHistory, toolName, toolInput)) return;
+              const toolDisplay = liveToolHistory.join('\n');
+              const toolPayload: {
+                content: string;
+                components?: ActionRowBuilder<ButtonBuilder>[];
+              } = { content: `${toolDisplay}\n\n🤔 考え中...` };
+              if (showButtons && !needsSkipRunner) {
+                toolPayload.components = [
+                  createProcessingButtons(getDiscordTimeoutInfoFor(agentRunner, channelId)),
+                ];
+              }
+              replyMessage!.edit(toolPayload).catch(() => {});
+            },
+          },
           {
             skipPermissions,
             sessionId,
@@ -2100,22 +2257,33 @@ async function processPrompt(
 
     // ファイルパスを抽出して添付送信（テキスト由来 + 構造化 attachments を合算・重複排除）
     const { filePaths, displayText } = buildAttachmentResult(result, structuredAttachments);
+    const displayTextWithTools =
+      toolHistoryMode === 'inline' ? appendToolHistory(displayText, toolHistory) : displayText;
+    const showToolsButton =
+      toolHistoryMode === 'button' &&
+      (config.discord.showToolButton ?? true) &&
+      toolHistory.length > 0;
+    if (showToolsButton && replyMessage) {
+      discordToolHistoryByMessageId.set(replyMessage.id, [...toolHistory]);
+    } else if (replyMessage) {
+      discordToolHistoryByMessageId.delete(replyMessage.id);
+    }
 
     // === セパレータで明示的に分割（content-digest等で複数投稿を1応答に含める用途）
     // LLMが前後に空白や余分な改行を入れることがあるため、正規表現で緩くマッチ
     const SEPARATOR_REGEX = /\n\s*===\s*\n/;
-    const messageParts = SEPARATOR_REGEX.test(displayText)
-      ? displayText
+    const messageParts = SEPARATOR_REGEX.test(displayTextWithTools)
+      ? displayTextWithTools
           .split(SEPARATOR_REGEX)
           .map((p) => p.trim())
           .filter(Boolean)
-      : [displayText];
+      : [displayTextWithTools];
 
     // 最初のパートは既存のreplyMessageを編集して送信
     const firstChunks = splitMessage(messageParts[0], DISCORD_SAFE_LENGTH);
     await replyMessage!.edit({
       content: firstChunks[0] || '✅',
-      ...(showButtons && { components: [createCompletedButtons()] }),
+      ...(showButtons && { components: [createCompletedButtons({ showTools: showToolsButton })] }),
     });
     if ('send' in message.channel) {
       const channel = message.channel as unknown as {
@@ -2153,11 +2321,11 @@ async function processPrompt(
   } catch (error) {
     if (error instanceof Error && error.message === 'Request cancelled by user') {
       console.log('[xangi] Request cancelled by user');
-      const toolDisplay = toolHistory.length > 0 ? '\n' + toolHistory.join('\n') + '\n' : '';
       const prefix = lastStreamedText ? lastStreamedText + '\n\n' : '';
+      const stoppedText = appendToolHistory(`${prefix}🛑 停止しました`, liveToolHistory);
       await replyMessage
         ?.edit({
-          content: `${prefix}🛑 停止しました${toolDisplay}`.slice(0, DISCORD_MAX_LENGTH),
+          content: stoppedText.slice(0, DISCORD_MAX_LENGTH),
           components: [],
         })
         .catch(() => {});
@@ -2180,9 +2348,11 @@ async function processPrompt(
     }
 
     // エラー詳細を表示（途中のテキスト・ツール履歴を残す）
-    const toolDisplay = toolHistory.length > 0 ? '\n' + toolHistory.join('\n') : '';
     const prefix = lastStreamedText ? lastStreamedText + '\n\n' : '';
-    const errorMessage = `${prefix}${errorDetail}${toolDisplay}`.slice(0, DISCORD_MAX_LENGTH);
+    const errorMessage = appendToolHistory(`${prefix}${errorDetail}`, liveToolHistory).slice(
+      0,
+      DISCORD_MAX_LENGTH
+    );
     if (replyMessage) {
       await replyMessage.edit({ content: errorMessage, components: [] }).catch(() => {});
     } else {

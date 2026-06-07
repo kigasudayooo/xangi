@@ -22,6 +22,8 @@
  *   node xangi-cmd.js schedule_remove --id <id>
  *   node xangi-cmd.js schedule_toggle --id <id>
  *   node xangi-cmd.js media_send --channel <id> --file <path>
+ *   node xangi-cmd.js terminal_session [--base-url <url>] [--title <title>] [--token <token>]
+ *   node xangi-cmd.js g2_session [--base-url <url>] [--title <title>] [--token <token>]  # alias
  *   node xangi-cmd.js system_restart
  *   node xangi-cmd.js system_settings --key <key> --value <value>
  */
@@ -34,6 +36,7 @@ import { systemCmd } from './system-cmd.js';
 import { interChatCmd } from './inter-chat-cmd.js';
 import { webHistoryCmd } from './web-history-cmd.js';
 import { slackHistoryCmd } from './slack-history-cmd.js';
+import { terminalSessionCmd } from './terminal-session-cmd.js';
 
 // .env を自動読み込み（DISCORD_TOKEN等のシークレットを取得）
 function loadEnvFile(): void {
@@ -152,6 +155,8 @@ Web Chat操作:
 
 その他:
   media_send        ファイル送信
+  terminal_session  外部 device / terminal 用 Web セッション作成
+  g2_session        terminal_session の Even G2 向け alias
   system_restart    再起動
   system_settings   設定変更`);
     return;
@@ -177,6 +182,13 @@ Web Chat操作:
       result = webHistoryCmd(flags);
     } else if (command === 'slack_history') {
       result = slackHistoryCmd(flags);
+    } else if (command === 'terminal_session') {
+      result = await terminalSessionCmd(flags);
+    } else if (command === 'g2_session') {
+      result = await terminalSessionCmd(flags, {
+        defaultSource: 'g2',
+        defaultTitle: 'Even G2 Terminal',
+      });
     } else {
       console.error(`Unknown command: ${command}`);
       process.exit(1);

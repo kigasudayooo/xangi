@@ -46,6 +46,11 @@ export async function runWithBubbleEvents(
   events.turnStarted({ ...eventBase, userText });
   let errorEmitted = false;
   try {
+    const runOptions = {
+      ...options,
+      platform: options?.platform ?? ctx.platform,
+    };
+
     return await runner.runStream(
       prompt,
       {
@@ -68,7 +73,7 @@ export async function runWithBubbleEvents(
           callbacks.onError?.(error);
         },
       },
-      options
+      runOptions
     );
   } catch (e) {
     if (!errorEmitted) {

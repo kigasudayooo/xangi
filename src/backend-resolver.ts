@@ -95,27 +95,34 @@ export class BackendResolver {
   /**
    * 指定チャンネルのバックエンド設定を解決
    */
-  resolve(channelId?: string): ResolvedBackend {
+  resolve(channelId?: string, requestDefault?: ChannelOverride): ResolvedBackend {
+    const defaultBackend = requestDefault?.backend ?? this.defaultBackend;
+    const defaultModel = requestDefault?.model ?? this.defaultModel;
+    const defaultLocalLlmMode = requestDefault?.localLlmMode;
+
     if (!channelId) {
       return {
-        backend: this.defaultBackend,
-        model: this.defaultModel,
+        backend: defaultBackend,
+        model: defaultModel,
+        localLlmMode: defaultLocalLlmMode,
       };
     }
 
     const override = this.channelOverrides.get(channelId);
     if (!override) {
       return {
-        backend: this.defaultBackend,
-        model: this.defaultModel,
+        backend: defaultBackend,
+        model: defaultModel,
+        localLlmMode: defaultLocalLlmMode,
       };
     }
 
+    const resolvedBackend = override.backend ?? defaultBackend;
     return {
-      backend: override.backend ?? this.defaultBackend,
-      model: override.model ?? (override.backend ? undefined : this.defaultModel),
+      backend: resolvedBackend,
+      model: override.model ?? (override.backend ? undefined : defaultModel),
       effort: override.effort,
-      localLlmMode: override.localLlmMode,
+      localLlmMode: override.localLlmMode ?? defaultLocalLlmMode,
     };
   }
 

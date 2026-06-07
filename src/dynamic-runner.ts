@@ -11,7 +11,12 @@ import { createAgentRunner, getBackendDisplayName } from './agent-runner.js';
 import type { AgentConfig, Config } from './config.js';
 import { BackendResolver, type ResolvedBackend } from './backend-resolver.js';
 import { RunnerManager } from './runner-manager.js';
-import { deleteSession } from './sessions.js';
+import {
+  deleteSession,
+  getActiveSessionId,
+  getSessionEntry,
+  setProviderSessionId,
+} from './sessions.js';
 import type { ChatPlatform } from './prompts/index.js';
 
 /**
@@ -71,14 +76,21 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
    * チャンネルに対応するランナーを取得
    * resolvedBackendがデフォルトと同じならデフォルトランナーを返す
    */
-  private getRunner(channelId: string | undefined, resolved: ResolvedBackend): AgentRunner {
+  private getRunner(
+    channelId: string | undefined,
+    resolved: ResolvedBackend,
+    platform?: ChatPlatform
+  ): AgentRunner {
+    const runnerPlatform = platform ?? this.platform;
     if (!channelId) return this.defaultRunner;
 
     // デフォルトと同じなら共有ランナーを使用
     const resolverKey = this.makeKey(resolved);
     const defaultKey = this.makeKey(this.resolver.getDefault());
+    const platformKey = runnerPlatform ?? 'all';
+    const defaultPlatformKey = this.platform ?? 'all';
 
-    if (resolverKey === defaultKey && !resolved.effort) {
+    if (resolverKey === defaultKey && !resolved.effort && platformKey === defaultPlatformKey) {
       // チャンネル用の別ランナーがあれば破棄
       this.destroyChannelRunner(channelId);
       return this.defaultRunner;
@@ -86,7 +98,8 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
 
     // 既存のチャンネルランナーがあり、キーが一致すればそれを使う
     const existing = this.channelRunners.get(channelId);
-    if (existing && existing.key === resolverKey + (resolved.effort ?? '')) {
+    const channelRunnerKey = `${resolverKey}:${platformKey}:${resolved.effort ?? ''}`;
+    if (existing && existing.key === channelRunnerKey) {
       return existing.runner;
     }
 
@@ -94,17 +107,18 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
     this.destroyChannelRunner(channelId);
 
     // 新しいランナーを作成
-    const runner = this.createRunnerFor(resolved, channelId);
+    const runner = this.createRunnerFor(resolved, runnerPlatform, channelId);
     this.attachTimeoutBubble(runner);
     this.channelRunners.set(channelId, {
       runner,
-      key: resolverKey + (resolved.effort ?? ''),
+      key: channelRunnerKey,
     });
 
     console.log(
       `[dynamic-runner] Created channel runner for ${channelId}: ${getBackendDisplayName(resolved.backend)}` +
         (resolved.model ? ` (${resolved.model})` : '') +
-        (resolved.effort ? ` effort=${resolved.effort}` : '')
+        (resolved.effort ? ` effort=${resolved.effort}` : '') +
+        ` platform=${platformKey}`
     );
 
     return runner;
@@ -113,7 +127,11 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
   /**
    * ResolvedBackendから適切なランナーを作成
    */
-  private createRunnerFor(resolved: ResolvedBackend, _channelId?: string): AgentRunner {
+  private createRunnerFor(
+    resolved: ResolvedBackend,
+    platform?: ChatPlatform,
+    _channelId?: string
+  ): AgentRunner {
     const agentConfig: AgentConfig = {
       ...this.config.agent.config,
       model: resolved.model ?? this.config.agent.config.model,
@@ -124,13 +142,13 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
       return new RunnerManager(agentConfig, {
         maxProcesses: agentConfig.maxProcesses,
         idleTimeoutMs: agentConfig.idleTimeoutMs,
-        platform: this.platform,
+        platform,
         effort: resolved.effort,
       });
     }
 
     return createAgentRunner(resolved.backend, agentConfig, {
-      platform: this.platform,
+      platform,
     });
   }
 
@@ -159,13 +177,18 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
    */
   async run(prompt: string, options?: RunOptions): Promise<RunResult> {
     const channelId = options?.channelId;
-    const resolved = this.resolver.resolve(channelId);
-    const runner = this.getRunner(channelId, resolved);
+    const resolved = this.resolver.resolve(channelId, this.getRequestDefault(options));
+    const runner = this.getRunner(channelId, resolved, options?.platform);
 
     // effort / localLlmMode をオプションに注入（resolved 由来）
-    const runOptions = this.injectResolvedFields(options, resolved);
+    const runOptions = this.injectResolvedFields(
+      this.dropMismatchedProviderSession(options, resolved),
+      resolved
+    );
 
-    return runner.run(prompt, runOptions);
+    const result = await runner.run(prompt, runOptions);
+    this.recordResolvedBackend(runOptions, resolved, result);
+    return result;
   }
 
   /**
@@ -177,12 +200,54 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
     options?: RunOptions
   ): Promise<RunResult> {
     const channelId = options?.channelId;
-    const resolved = this.resolver.resolve(channelId);
-    const runner = this.getRunner(channelId, resolved);
+    const resolved = this.resolver.resolve(channelId, this.getRequestDefault(options));
+    const runner = this.getRunner(channelId, resolved, options?.platform);
 
-    const runOptions = this.injectResolvedFields(options, resolved);
+    const runOptions = this.injectResolvedFields(
+      this.dropMismatchedProviderSession(options, resolved),
+      resolved
+    );
 
-    return runner.runStream(prompt, callbacks, runOptions);
+    const result = await runner.runStream(prompt, callbacks, runOptions);
+    this.recordResolvedBackend(runOptions, resolved, result);
+    return result;
+  }
+
+  private dropMismatchedProviderSession(
+    options: RunOptions | undefined,
+    resolved: ResolvedBackend
+  ): RunOptions | undefined {
+    if (!options?.sessionId || !options.channelId) return options;
+
+    const appSessionId = options.appSessionId || getActiveSessionId(options.channelId);
+    const entry = appSessionId ? getSessionEntry(appSessionId) : undefined;
+    const storedBackend = entry?.agent?.backend;
+    if (!storedBackend || storedBackend === resolved.backend) return options;
+
+    console.warn(
+      `[dynamic-runner] Ignoring ${storedBackend} provider session for ${options.channelId}; resolved backend is ${resolved.backend}`
+    );
+    return { ...options, sessionId: undefined };
+  }
+
+  private getRequestDefault(options: RunOptions | undefined) {
+    if (!options?.defaultBackend && !options?.defaultModel && !options?.defaultLocalLlmMode) {
+      return undefined;
+    }
+    return {
+      backend: options.defaultBackend,
+      model: options.defaultModel,
+      localLlmMode: options.defaultLocalLlmMode,
+    };
+  }
+
+  private recordResolvedBackend(
+    options: RunOptions | undefined,
+    resolved: ResolvedBackend,
+    result: RunResult
+  ): void {
+    if (!options?.appSessionId || !result.sessionId) return;
+    setProviderSessionId(options.appSessionId, result.sessionId, resolved.backend);
   }
 
   /**

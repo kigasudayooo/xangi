@@ -4,11 +4,11 @@
 
 > **A**I **N**EON **G**ENESIS **I**NTELLIGENCE
 
-Claude Code / Codex / Gemini CLI / Local LLM をバックエンドに、Discord / Slack / ブラウザ / LINE から利用できる AI アシスタント。Discord 推奨、ブラウザ単独でも動作可。
+Claude Code / Codex / Cursor CLI / Local LLM（Gemini CLI は legacy/API-key 用）をバックエンドに、Discord / Slack / ブラウザ / LINE から利用できる AI アシスタント。Discord 推奨、ブラウザ単独でも動作可。
 
 ## Features
 
-- マルチバックエンド対応（Claude Code / Codex / Gemini CLI / Local LLM）
+- マルチバックエンド対応（Claude Code / Codex / Cursor CLI / Local LLM、Gemini CLI は legacy/API-key 用）
 - `/backend` コマンドでチャンネルごとにバックエンド・モデル・effortを動的切り替え
 - Local LLM対応（Ollama/vLLM等、エージェントモード/チャットモード切替可能）
 - Discord / Slack / Web Chat UI / LINE 対応
@@ -23,7 +23,7 @@ Claude Code / Codex / Gemini CLI / Local LLM をバックエンドに、Discord 
 flowchart LR
     User([ユーザー]) <-->|メッセージ| chat[UI<br/>Discord / Slack<br/>ブラウザ / LINE]
     chat <-->|プロンプト| xangi[xangi]
-    xangi <-->|実行| LLM{{LLMバックエンド<br/>Claude Code / Codex<br/>Gemini CLI / Local LLM}}
+    xangi <-->|実行| LLM{{LLMバックエンド<br/>Claude Code / Codex<br/>Cursor CLI / Local LLM<br/>Gemini CLI legacy}}
     LLM <-->|ファイル操作| WS[(Workspace<br/>AGENTS.md / skills<br/>ローカル資料)]
     LLM <--> Web[Web検索]
     LLM <--> Service[Webサービス]
@@ -67,7 +67,8 @@ DISCORD_ALLOWED_USER=123456789012345678
 # Node.js 22+ と使用するAI CLIが必要
 # Claude Code: curl -fsSL https://claude.ai/install.sh | bash
 # Codex CLI:   npm install -g @openai/codex
-# Gemini CLI:  npm install -g @google/gemini-cli
+# Gemini CLI (legacy/API-key): npm install -g @google/gemini-cli
+# Cursor CLI:  curl https://cursor.com/install -fsS | bash
 # Local LLM:   Ollama (https://ollama.com) をインストール
 
 npm install
@@ -77,6 +78,8 @@ npm start
 # 開発時
 npm run dev
 ```
+
+Gemini CLI backend は互換性維持と Enterprise / Google Cloud / paid API key 用に残しています。Google AI Pro / Ultra / 無料の Gemini Code Assist for individuals 前提の利用は 2026-06-18 にリクエスト提供が停止されるため、新規セットアップでは Claude Code / Codex / Cursor CLI / Local LLM を推奨します。
 
 ### 3. 動作確認
 

@@ -103,8 +103,8 @@ fires. The button **doubles the remaining time** at the moment of the click.
 - Display turns red + pulses when under 30 seconds remain
 - `延長` is disabled / hidden once the cap is reached
 
-Supported backends: Claude Code (persistent-runner), Codex CLI, Gemini CLI,
-Local LLM, Dynamic Runner (forwards to inner runner).
+Supported backends: Claude Code (persistent-runner), Codex CLI, Cursor CLI,
+Gemini CLI legacy, Local LLM, Dynamic Runner (forwards to inner runner).
 
 Programmatic API:
 
@@ -278,6 +278,7 @@ You can switch the backend, model, and effort level per channel.
 | --- | --- |
 | `/backend show` | Show the current backend and model |
 | `/backend set claude-code` | Switch to Claude Code |
+| `/backend set cursor` | Switch to Cursor CLI |
 | `/backend set local-llm --model nemotron-3-nano` | Switch to Local LLM with a specific model |
 | `/backend set claude-code --effort high` | Switch with a specific effort level |
 | `/backend reset` | Reset to the default (.env settings) |
@@ -289,7 +290,7 @@ Switching always starts a new session (conversation history is not carried over)
 
 ```bash
 # Allowed backends for switching (if unset, switching is disabled)
-ALLOWED_BACKENDS=claude-code,local-llm
+ALLOWED_BACKENDS=claude-code,cursor,local-llm
 
 # Allowed models for switching (if unset, no restriction)
 ALLOWED_MODELS=nemotron-3-nano,nemotron-3-super,qwen3.5:9b
@@ -435,7 +436,7 @@ Run in a container-isolated environment. Three containers are available:
 
 | Container | Dockerfile | Purpose |
 |---|---|---|
-| `xangi` | `Dockerfile` | Lightweight (Claude Code / Codex / Gemini CLI) |
+| `xangi` | `Dockerfile` | Lightweight (Claude Code / Codex / Cursor CLI / Gemini CLI legacy) |
 | `xangi-max` | `Dockerfile.max` | Full version (uv + Python support, for Local LLM) |
 | `xangi-gpu` | `Dockerfile.gpu` | GPU version (CUDA + PyTorch, for image generation / audio processing) |
 
@@ -819,6 +820,10 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `DISCORD_STREAMING` | Streaming output | `true` |
 | `DISCORD_SHOW_THINKING` | Show thinking process | `true` |
 | `DISCORD_SHOW_BUTTONS` | Show Stop/New Session buttons | `true` |
+| `DISCORD_TOOL_HISTORY_MODE` | Tool-use history display (`button` / `inline` / `off`) | `button` |
+| `DISCORD_SHOW_TOOL_BUTTON` | Show the Tools button in `button` mode | `true` |
+| `DISCORD_SHOW_LIVE_TOOL_USE` | Show raw tool history while running | `true` |
+| `DISCORD_SHOW_TOOL_USE` | Compatibility setting. `false` maps to `off`, `true` maps to `inline` | - |
 | `ALLOW_AUTOREPLY_COMMAND` | Enable `/autoreply` command | `true` |
 | `RESPOND_TO_BOTS` | Whitelist of bot IDs to respond to (`*` for all bots) | - |
 | `RESPOND_TO_BOTS_ENABLED` | Toggle bot-to-bot reply ON/OFF (`/respondtobots` switches at runtime) | `false` |
@@ -832,7 +837,7 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `AGENT_BACKEND` | Backend (`claude-code` / `codex` / `gemini` / `local-llm`) | `claude-code` |
+| `AGENT_BACKEND` | Backend (`claude-code` / `codex` / `cursor` / `local-llm`; `gemini` is legacy/API-key use) | `claude-code` |
 | `AGENT_MODEL` | Model to use | - |
 | `WORKSPACE_PATH` | Working directory (local execution) | `./workspace` |
 | `XANGI_WORKSPACE` | Host-side workspace path (Docker execution) | `./workspace` |
@@ -843,6 +848,9 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `ALLOWED_BACKENDS` | Allowed backends for `/backend` switching (comma-separated) | - |
 | `ALLOWED_MODELS` | Allowed models for `/backend` switching (comma-separated) | - |
 | `CHANNEL_OVERRIDES` | Per-channel backend settings (JSON) | - |
+| `CURSOR_API_KEY` | API key passed only to the Cursor CLI backend | - |
+| `CURSOR_FORCE` | Pass `--force` to Cursor CLI unless explicitly set to `false` | `true` |
+| `CURSOR_TRUST_WORKSPACE` | Pass `--trust` to Cursor CLI unless explicitly set to `false` | `true` |
 | `PERSISTENT_MODE` | Persistent process mode | `true` |
 | `MAX_PROCESSES` | Maximum concurrent processes | `10` |
 | `IDLE_TIMEOUT_MS` | Auto-terminate idle processes after | `1800000` |
@@ -864,6 +872,32 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `WEB_CHAT_PORT` | Web Chat UI port | `18888` |
 | `WEB_CHAT_UPLOAD_ACCEPT` | Upload allowlist (HTML `accept` syntax). Empty = allow all. `.ext` entries are also enforced server-side | (unset / allow all) |
 | `WEB_CHAT_DOWNLOAD_ACCEPT` | Download allowlist of extensions (e.g. `.html,.txt,.md`). Empty = allow all. Known extensions are served inline with proper Content-Type; unknown ones fall back to `Content-Disposition: attachment` | (unset / allow all) |
+
+### External Event Stream and Device Input
+
+xangi exposes response lifecycle events through pull SSE (`GET /api/events/stream`) and small write endpoints for external UI clients (`POST /api/pet/inbox`, `/api/device/inbox`, `/api/terminal/inbox`). See [External Event Stream](events.md) for schemas and examples.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `XANGI_EVENTS_ENABLED` | Set to `false` to disable SSE event streaming (connections return 503) | `true` |
+| `XANGI_INSTANCE_ID` | Stable instance identifier. Auto-derived from hostname + `DATA_DIR` hash when unset | `auto` |
+| `XANGI_PET_INBOX_ENABLED` | Set to `false` to disable pet/device inbox writes | `true` |
+| `XANGI_PET_INBOX_TOKEN` | Fallback bearer token for pet/device/terminal inbox routes | (unset) |
+| `XANGI_DEVICE_INBOX_ENABLED` | Set to `false` to disable `/api/device/inbox` and `/api/terminal/inbox` | `true` |
+| `XANGI_DEVICE_INBOX_TOKEN` | Bearer token for device/terminal routes; falls back to `XANGI_PET_INBOX_TOKEN` | (unset) |
+
+### Even Terminal Compatibility API
+
+xangi can also act as a host server for Even G2 Terminal mode (`@evenrealities/even-terminal` compatible). It exposes `/api/prompt`, `/api/events`, `/api/messages`, and related endpoints on the same Web Chat HTTP server. See [External Event Stream#Even Terminal Compatibility API](events.md#even-terminal-compatibility-api).
+
+The Even UI only offers `claude` and `codex` provider labels. xangi accepts those labels for protocol compatibility, but the actual backend is still selected by `AGENT_BACKEND`. To use a different backend / model / Local LLM mode only for Even Terminal traffic, set `XANGI_EVEN_TERMINAL_BACKEND`, `XANGI_EVEN_TERMINAL_MODEL`, and `XANGI_EVEN_TERMINAL_LOCAL_LLM_MODE`. Per-session `CHANNEL_OVERRIDES` entries for `web-chat:<appSessionId>` take precedence over these Even Terminal defaults.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `XANGI_EVEN_TERMINAL_TOKEN` | Dedicated token for the Even Terminal compatibility API. Falls back to `XANGI_DEVICE_INBOX_TOKEN`, then `XANGI_PET_INBOX_TOKEN` when unset | (unset) |
+| `XANGI_EVEN_TERMINAL_BACKEND` | Backend default used only for Even Terminal traffic (`claude-code` / `codex` / `gemini` / `local-llm`) | `AGENT_BACKEND` |
+| `XANGI_EVEN_TERMINAL_MODEL` | Model default used only for Even Terminal traffic | `AGENT_MODEL` / backend default |
+| `XANGI_EVEN_TERMINAL_LOCAL_LLM_MODE` | Local LLM mode default used only for Even Terminal traffic (`agent` / `lite` / `chat`) | `LOCAL_LLM_MODE` / `agent` |
 
 ### Scheduler
 
@@ -890,6 +924,24 @@ Without these settings, existing `gh` authentication (`gh auth login` / `GH_TOKE
 - The private key is loaded into memory at startup and is not directly accessible as a file by the AI agent
 - Token generation is performed via the tool-server's HTTP endpoint (`/github-token`), and the AI agent can only obtain short-lived installation tokens (valid for 1 hour)
 - If token generation fails, it does NOT fall back to PAT — it errors out
+
+### Gemini CLI (when `AGENT_BACKEND=gemini`)
+
+The Gemini CLI backend is a legacy backend kept for compatibility and Enterprise / Google Cloud / paid API key use. Requests for Google AI Pro / Ultra / free Gemini Code Assist for individuals stop on 2026-06-18, so it is not recommended for new setups or normal operation.
+
+Existing installations rely on Gemini CLI's own authentication and auto-loading of `GEMINI.md`. On the xangi side, configure `AGENT_BACKEND=gemini` and optionally `AGENT_MODEL`.
+
+### Cursor CLI (when `AGENT_BACKEND=cursor`)
+
+The Cursor CLI backend uses the `cursor-agent` command. Non-interactive runs use `cursor-agent -p ... --output-format json`; streaming uses `--output-format stream-json --stream-partial-output`.
+
+Set `CURSOR_API_KEY` when Cursor CLI automation needs API-key authentication. This value is passed only to the Cursor CLI child process.
+
+The Cursor CLI backend passes `--trust` by default so non-interactive xangi runs do not stop on a workspace trust prompt. Set `CURSOR_TRUST_WORKSPACE=false` when running in an untrusted workspace.
+
+The Cursor CLI backend also passes `--force` by default, matching xangi's default `SKIP_PERMISSIONS=true` behavior for Codex / Claude Code and avoiding permission waits in non-interactive chat runs. Set `CURSOR_FORCE=false` for interactive use or untrusted workspaces.
+
+Antigravity CLI (`agy`) is not exposed as an xangi backend for now. xangi will not provide `AGENT_BACKEND=antigravity` until an official machine-readable JSON/stream output contract is available.
 
 ### Local LLM (when `AGENT_BACKEND=local-llm`)
 

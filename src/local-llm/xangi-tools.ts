@@ -6,6 +6,7 @@
  */
 import { join } from 'path';
 import type { ToolHandler, ToolResult } from './types.js';
+import type { ChatPlatform } from '../prompts/index.js';
 
 const CMD_TIMEOUT_MS = 30_000;
 
@@ -384,6 +385,16 @@ export function getDiscordTools(): ToolHandler[] {
   ];
 }
 
+/** Web接続時に追加するツール */
+export function getWebTools(): ToolHandler[] {
+  return [webHistoryHandler, mediaSendHandler];
+}
+
+/** Slack接続時に追加するツール */
+export function getSlackTools(): ToolHandler[] {
+  return [slackHistoryHandler];
+}
+
 /** スケジュール関連ツール */
 export function getScheduleTools(): ToolHandler[] {
   return [scheduleListHandler, scheduleAddHandler, scheduleRemoveHandler, scheduleToggleHandler];
@@ -402,4 +413,27 @@ export function getHistoryTools(): ToolHandler[] {
 /** 全xangiツール（プラットフォーム問わず） */
 export function getAllXangiTools(): ToolHandler[] {
   return [...getDiscordTools(), ...getScheduleTools(), ...getSystemTools(), ...getHistoryTools()];
+}
+
+/** 実行プラットフォームに応じたxangiツール */
+export function getXangiTools(platform?: ChatPlatform): ToolHandler[] {
+  const commonTools = [...getScheduleTools(), ...getSystemTools()];
+
+  if (platform === 'web') {
+    return [...getWebTools(), ...commonTools];
+  }
+
+  if (platform === 'discord') {
+    return [...getDiscordTools(), ...commonTools];
+  }
+
+  if (platform === 'slack') {
+    return [...getSlackTools(), ...commonTools];
+  }
+
+  if (platform === 'line') {
+    return commonTools;
+  }
+
+  return getAllXangiTools();
 }

@@ -11,11 +11,11 @@ import type {
 import { mergeTexts, sanitizeSurrogates, prependRuntimeContext } from './agent-runner.js';
 import { stripToolCallArtifacts, finalizeDisplayText } from './tool-call-sanitize.js';
 import { DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, TIMEOUT_EXTEND_ENABLED } from './constants.js';
-import { getSafeEnv } from './base-runner.js';
 import { buildPersistentSystemPrompt } from './base-runner.js';
 import type { ChatPlatform } from './prompts/index.js';
-import { getGitHubEnv } from './github-auth.js';
 import { logPrompt, logResponse, logError } from './transcript-logger.js';
+import { buildCliEnv } from './cli-process.js';
+import { appendJsonlChunk } from './jsonl-buffer.js';
 
 /**
  * リクエストキューのアイテム
@@ -151,19 +151,10 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
 
     console.log('[persistent-runner] Starting persistent process...');
 
-    const safeEnv = getSafeEnv();
-    const childEnv: NodeJS.ProcessEnv = { ...safeEnv, ...getGitHubEnv(safeEnv) };
-    if (this.channelId) {
-      childEnv.XANGI_CHANNEL_ID = this.channelId;
-    } else {
-      // 親プロセスの XANGI_CHANNEL_ID が getSafeEnv 経由で leak しないよう明示的に削除
-      // （channelId 未バインドの runner が他チャンネル context を継承する事故を防ぐ）
-      delete childEnv.XANGI_CHANNEL_ID;
-    }
     this.process = spawn('claude', args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.workdir,
-      env: childEnv,
+      env: buildCliEnv(this.channelId),
     });
     this.processAlive = true;
 
@@ -249,13 +240,10 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
    * stdout からの出力を処理
    */
   private handleOutput(data: string): void {
-    this.buffer += data;
-    const lines = this.buffer.split('\n');
-    this.buffer = lines.pop() || '';
+    const parsed = appendJsonlChunk(this.buffer, data);
+    this.buffer = parsed.buffer;
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
-
+    for (const line of parsed.lines) {
       try {
         const json = JSON.parse(line);
         this.handleJsonMessage(json);

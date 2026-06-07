@@ -1,8 +1,10 @@
 import type { AgentBackend, AgentConfig, EffortLevel } from './config.js';
 import type { LocalLlmMode } from './backend-resolver.js';
+import type { ChatPlatform } from './prompts/index.js';
 import { ClaudeCodeRunner } from './claude-code.js';
 import { CodexRunner } from './codex-cli.js';
 import { GeminiRunner } from './gemini-cli.js';
+import { CursorRunner } from './cursor-cli.js';
 import { LocalLlmRunner } from './local-llm/runner.js';
 import { RunnerManager } from './runner-manager.js';
 export { prependRuntimeContext, buildRuntimeContextBlock } from './runtime-context.js';
@@ -12,6 +14,10 @@ export interface RunOptions {
   sessionId?: string;
   channelId?: string; // プロセス管理用
   appSessionId?: string; // xangi側セッションID（ログ用）
+  platform?: ChatPlatform; // 実行元プラットフォーム（Web/EvenとDiscordのprompt分離用）
+  defaultBackend?: AgentBackend; // 実行経路ごとの backend default（CHANNEL_OVERRIDES が優先）
+  defaultModel?: string; // 実行経路ごとの model default
+  defaultLocalLlmMode?: LocalLlmMode; // 実行経路ごとの Local LLM mode default
   effort?: EffortLevel; // Claude Code の --effort オプション
   /** Local LLM の動作モード override（per-channel override 由来）。Local LLM 以外では無視される */
   localLlmMode?: LocalLlmMode;
@@ -112,9 +118,11 @@ export function createAgentRunner(
       }
       return new ClaudeCodeRunner({ ...config, platform: options?.platform });
     case 'codex':
-      return new CodexRunner(config);
+      return new CodexRunner({ ...config, platform: options?.platform });
     case 'gemini':
       return new GeminiRunner(config);
+    case 'cursor':
+      return new CursorRunner(config);
     case 'local-llm':
       return new LocalLlmRunner({ ...config, platform: options?.platform });
     default:
@@ -162,6 +170,8 @@ export function getBackendDisplayName(backend: AgentBackend): string {
       return 'Codex';
     case 'gemini':
       return 'Gemini';
+    case 'cursor':
+      return 'Cursor';
     case 'local-llm':
       return 'Local LLM';
     default:

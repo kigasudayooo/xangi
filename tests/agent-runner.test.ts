@@ -22,6 +22,13 @@ describe('agent-runner', () => {
       expect(runner.runStream).toBeDefined();
     });
 
+    it('should create CursorRunner for cursor backend', () => {
+      const runner = createAgentRunner('cursor', {});
+      expect(runner).toBeDefined();
+      expect(runner.run).toBeDefined();
+      expect(runner.runStream).toBeDefined();
+    });
+
     it('should throw error for unknown backend', () => {
       expect(() => createAgentRunner('unknown' as any, {})).toThrow('Unknown agent backend');
     });
@@ -126,6 +133,10 @@ describe('agent-runner', () => {
 
     it('should return "Codex" for codex', () => {
       expect(getBackendDisplayName('codex')).toBe('Codex');
+    });
+
+    it('should return "Cursor" for cursor', () => {
+      expect(getBackendDisplayName('cursor')).toBe('Cursor');
     });
   });
 });

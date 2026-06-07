@@ -2,6 +2,7 @@
  * Pet からのテキスト送信用 HTTP エンドポイント。
  *
  * web-chat の HTTP サーバに相乗りする形で `POST /api/pet/inbox` をハンドルする。
+ * 同じ実装で `POST /api/device/inbox` / `POST /api/terminal/inbox` も受ける。
  * xangi-pet (Tauri デスクトップアバター) のクリック → 入力欄から送られたテキストを
  * 既存の web セッション (or 新規) に投入し、応答は既存の
  * `GET /api/events/stream` (SSE broadcast) 経由で pet 側に届く。
@@ -44,6 +45,7 @@ import { flowFromHostPlatform } from './inter-instance-chat/index.js';
 
 const MAX_TEXT_LENGTH = 8000;
 const MAX_BODY_BYTES = 64 * 1024;
+const INBOX_PATHS = new Set(['/api/pet/inbox', '/api/device/inbox', '/api/terminal/inbox']);
 
 /** 同一セッションへの並行送信を抑止する (web-chat 側とは独立の Set)。 */
 const busy = new Set<string>();
@@ -52,9 +54,30 @@ export function isPetInboxEnabled(): boolean {
   return process.env.XANGI_PET_INBOX_ENABLED !== 'false';
 }
 
-function getToken(): string | null {
-  const tk = (process.env.XANGI_PET_INBOX_TOKEN || '').trim();
-  return tk || null;
+function isInboxEnabled(path: string): boolean {
+  if (path !== '/api/pet/inbox' && process.env.XANGI_DEVICE_INBOX_ENABLED !== undefined) {
+    return process.env.XANGI_DEVICE_INBOX_ENABLED !== 'false';
+  }
+  return isPetInboxEnabled();
+}
+
+function getToken(path: string): { token: string | null; envName: string } {
+  const envName = path === '/api/pet/inbox' ? 'XANGI_PET_INBOX_TOKEN' : 'XANGI_DEVICE_INBOX_TOKEN';
+  const fallback = path === '/api/pet/inbox' ? '' : process.env.XANGI_PET_INBOX_TOKEN || '';
+  const tk = (process.env[envName] || fallback).trim();
+  return { token: tk || null, envName: tk ? envName : 'XANGI_PET_INBOX_TOKEN' };
+}
+
+function sourceLabel(path: string, source: unknown): string {
+  const raw = typeof source === 'string' ? source.trim() : '';
+  const normalized = raw ? raw.slice(0, 40) : '';
+  if (path === '/api/pet/inbox') return 'Pet';
+  if (path === '/api/terminal/inbox') return normalized ? `Terminal:${normalized}` : 'Terminal';
+  return normalized ? `Device:${normalized}` : 'Device';
+}
+
+export function isInboxPath(path: string): boolean {
+  return INBOX_PATHS.has(path);
 }
 
 /**
@@ -152,24 +175,27 @@ export async function handlePetInboxRequest(
   agentRunner: AgentRunner
 ): Promise<boolean> {
   const url = (req.url || '/').split('?')[0];
-  if (req.method !== 'POST' || url !== '/api/pet/inbox') return false;
+  if (req.method !== 'POST' || !isInboxPath(url)) return false;
 
-  if (!isPetInboxEnabled()) {
+  if (!isInboxEnabled(url)) {
     jsonResponse(res, 503, {
-      error: 'pet inbox is disabled',
-      hint: 'Set XANGI_PET_INBOX_ENABLED=true (default) to enable',
+      error: 'inbox is disabled',
+      hint:
+        url === '/api/pet/inbox'
+          ? 'Set XANGI_PET_INBOX_ENABLED=true (default) to enable'
+          : 'Set XANGI_DEVICE_INBOX_ENABLED=true (default) to enable',
     });
     return true;
   }
 
   // 認証ガード: token 設定時は Bearer 必須、未設定時は loopback のみ許可
-  const token = getToken();
+  const { token, envName } = getToken(url);
   if (token) {
     const authHeader = (req.headers.authorization || '').trim();
     if (authHeader !== `Bearer ${token}`) {
       jsonResponse(res, 401, {
         error: 'Unauthorized',
-        hint: 'Provide Authorization: Bearer <XANGI_PET_INBOX_TOKEN>',
+        hint: `Provide Authorization: Bearer <${envName}>`,
       });
       return true;
     }
@@ -201,6 +227,7 @@ export async function handlePetInboxRequest(
     jsonResponse(res, 400, { error: `text too long (max ${MAX_TEXT_LENGTH} chars)` });
     return true;
   }
+  const label = sourceLabel(url, body.source);
 
   // appSessionId 解決
   // - 指定あり: 既存 web セッションへ追記
@@ -208,7 +235,7 @@ export async function handlePetInboxRequest(
   let appSessionId = String(body.appSessionId ?? '').trim();
   if (!appSessionId) {
     const latestWeb = listAllSessions().find((s) => s.platform === 'web');
-    appSessionId = latestWeb?.id || createWebSession({ title: 'Pet inbox' });
+    appSessionId = latestWeb?.id || createWebSession({ title: `${label} inbox` });
   }
   const entry = getSessionEntry(appSessionId);
   if (!entry) {
@@ -231,8 +258,9 @@ export async function handlePetInboxRequest(
   const sessionId = getSession(ctxKey);
 
   const threadId = threadIdFor('web', appSessionId);
-  const turnId = turnIdFor('web', `pet-${Date.now()}`);
-  const threadLabel = entry.title || 'Pet inbox';
+  const turnIdPrefix = url === '/api/pet/inbox' ? 'pet' : 'device';
+  const turnId = turnIdFor('web', `${turnIdPrefix}-${Date.now()}`);
+  const threadLabel = entry.title || `${label} inbox`;
   const eventCtx = {
     threadId,
     turnId,
@@ -241,7 +269,7 @@ export async function handlePetInboxRequest(
     userText: text,
   };
 
-  const prompt = `[プラットフォーム: Web (Pet)]\n${text}`;
+  const prompt = `[プラットフォーム: Web (${label})]\n${text}`;
 
   // 202 を即返す。応答は events SSE 経由で pet 側に届く。
   const { instanceId } = getEventsConfig();
@@ -251,10 +279,11 @@ export async function handlePetInboxRequest(
     thread_id: threadId,
     turn_id: turnId,
     session_id: appSessionId,
+    events_url: `/api/events/stream?thread_id=${encodeURIComponent(threadId)}`,
   });
 
   busy.add(appSessionId);
-  console.log(`[pet-inbox] Message (session ${appSessionId}): ${text.slice(0, 100)}`);
+  console.log(`[inbox:${label}] Message (session ${appSessionId}): ${text.slice(0, 100)}`);
   flowFromHostPlatform(text, 'user');
 
   void (async () => {

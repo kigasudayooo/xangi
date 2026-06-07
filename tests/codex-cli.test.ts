@@ -155,6 +155,15 @@ describe('CodexRunner buildArgs', () => {
     expect(lastArg).toContain('test prompt');
   });
 
+  it('should pass platform-specific xangi commands in the system prompt', async () => {
+    const runner = new CodexRunner({ platform: 'discord' });
+    const { args } = await getSpawnArgs(runner, 'test prompt');
+
+    const lastArg = args[args.length - 1];
+    expect(lastArg).toContain('Discord操作');
+    expect(lastArg).not.toContain('Slack操作');
+  });
+
   it('should place prompt after resume and sessionId', async () => {
     const runner = new CodexRunner({});
     const { args } = await getSpawnArgs(runner, 'test prompt', { sessionId: 'abc-123' });
@@ -228,14 +237,59 @@ describe('CodexRunner エラー本文の救出', () => {
     expect(captured?.message).toContain('5:58 AM');
   });
 
+  it('runStream: stale resume error retries with a new session without surfacing onError', async () => {
+    const runner = new CodexRunner({});
+    const { spawn, getMockProcess } = await import('child_process');
+    const errors: Error[] = [];
+
+    const promise = runner.runStream(
+      'hi',
+      { onError: (e) => errors.push(e) },
+      { sessionId: 'old-thread' }
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const firstProcess = (getMockProcess as () => any)();
+    firstProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        JSON.stringify({
+          type: 'turn.failed',
+          error: { message: 'thread/resume failed: no rollout found for thread id old-thread' },
+        }) + '\n'
+      )
+    );
+    firstProcess.emit('close', 1);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const secondProcess = (getMockProcess as () => any)();
+    secondProcess.stdout.emit(
+      'data',
+      Buffer.from(JSON.stringify({ type: 'thread.started', thread_id: 'new-thread' }) + '\n')
+    );
+    secondProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'ok' } }) +
+          '\n'
+      )
+    );
+    secondProcess.emit('close', 0);
+
+    await expect(promise).resolves.toEqual({ result: 'ok', sessionId: 'new-thread' });
+    expect(errors).toEqual([]);
+
+    const spawnMock = spawn as ReturnType<typeof vi.fn>;
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(spawnMock.mock.calls[0][1]).toContain('resume');
+    expect(spawnMock.mock.calls[1][1]).not.toContain('resume');
+  });
+
   it('runStream: turn.failed イベントの error.message を救出する', async () => {
     const runner = new CodexRunner({});
     const promise = runner.runStream('hi', {});
 
-    await emitEventsThenClose(
-      [{ type: 'turn.failed', error: { message: 'rate limited' } }],
-      1
-    );
+    await emitEventsThenClose([{ type: 'turn.failed', error: { message: 'rate limited' } }], 1);
 
     await expect(promise).rejects.toThrow(/rate limited/);
   });
@@ -249,12 +303,73 @@ describe('CodexRunner エラー本文の救出', () => {
     await expect(promise).rejects.toThrow(/Codex CLI exited with code 1/);
   });
 
+  it('run: 空の agent_message は raw JSONL ではなく空文字として返す', async () => {
+    const runner = new CodexRunner({});
+    const promise = runner.run('hi');
+
+    await emitEventsThenClose(
+      [
+        { type: 'thread.started', thread_id: 'thread-1' },
+        { type: 'turn.started' },
+        {
+          type: 'item.completed',
+          item: {
+            id: 'item_0',
+            type: 'command_execution',
+            command: '/bin/bash -lc true',
+            aggregated_output: '',
+            exit_code: 0,
+            status: 'completed',
+          },
+        },
+        { type: 'item.completed', item: { id: 'item_1', type: 'agent_message', text: '' } },
+      ],
+      0
+    );
+
+    await expect(promise).resolves.toEqual({ result: '', sessionId: 'thread-1' });
+  });
+
   it('runStream: exit 0 なら error イベントが無くても正常完了', async () => {
     const runner = new CodexRunner({});
     const promise = runner.runStream('hi', {});
 
     await emitEventsThenClose(
+      [{ type: 'item.completed', item: { type: 'agent_message', text: 'done' } }],
+      0
+    );
+
+    const result = await promise;
+    expect(result.result).toBe('done');
+  });
+
+  it('runStream: Codex tool call event を onToolUse に流す', async () => {
+    const runner = new CodexRunner({});
+    const tools: Array<{ name: string; input: Record<string, unknown> }> = [];
+    const promise = runner.runStream('hi', {
+      onToolUse: (name, input) => tools.push({ name, input }),
+    });
+
+    await emitEventsThenClose(
       [
+        {
+          type: 'item.started',
+          item: {
+            id: 'call-1',
+            type: 'function_call',
+            name: 'exec_command',
+            arguments: '{"cmd":"ls -la"}',
+          },
+        },
+        {
+          type: 'item.completed',
+          item: {
+            id: 'call-1',
+            type: 'function_call',
+            name: 'exec_command',
+            arguments: '{"cmd":"ls -la"}',
+          },
+        },
         { type: 'item.completed', item: { type: 'agent_message', text: 'done' } },
       ],
       0
@@ -262,5 +377,47 @@ describe('CodexRunner エラー本文の救出', () => {
 
     const result = await promise;
     expect(result.result).toBe('done');
+    expect(tools).toEqual([{ name: 'exec_command', input: { cmd: 'ls -la' } }]);
+  });
+
+  it('runStream: Codex command_execution event を Bash の onToolUse に流す', async () => {
+    const runner = new CodexRunner({});
+    const tools: Array<{ name: string; input: Record<string, unknown> }> = [];
+    const promise = runner.runStream('hi', {
+      onToolUse: (name, input) => tools.push({ name, input }),
+    });
+
+    await emitEventsThenClose(
+      [
+        {
+          type: 'item.started',
+          item: {
+            id: 'item_0',
+            type: 'command_execution',
+            command: '/bin/bash -lc pwd',
+            aggregated_output: '',
+            exit_code: null,
+            status: 'in_progress',
+          },
+        },
+        {
+          type: 'item.completed',
+          item: {
+            id: 'item_0',
+            type: 'command_execution',
+            command: '/bin/bash -lc pwd',
+            aggregated_output: '/tmp\n',
+            exit_code: 0,
+            status: 'completed',
+          },
+        },
+        { type: 'item.completed', item: { type: 'agent_message', text: 'done' } },
+      ],
+      0
+    );
+
+    const result = await promise;
+    expect(result.result).toBe('done');
+    expect(tools).toEqual([{ name: 'Bash', input: { command: '/bin/bash -lc pwd' } }]);
   });
 });

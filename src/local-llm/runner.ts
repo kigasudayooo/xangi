@@ -35,7 +35,7 @@ import {
   type TranscriptEntry,
 } from '../transcript-logger.js';
 import { loadTriggers, triggersToToolHandlers, type Trigger } from './triggers.js';
-import { getAllXangiTools } from './xangi-tools.js';
+import { getXangiTools } from './xangi-tools.js';
 import { prependRuntimeContext } from '../runtime-context.js';
 import {
   containsPseudoToolCall,
@@ -738,7 +738,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
       }
 
       if (this.enableXangiCommands) {
-        const xangiTools = getAllXangiTools();
+        const xangiTools = getXangiTools(this.platform);
         dynamicTools.push(...xangiTools);
         console.log(
           `[local-llm] Xangi commands registered as tools: ${xangiTools.map((t) => t.name).join(', ')}`

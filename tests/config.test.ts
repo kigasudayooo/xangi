@@ -63,6 +63,16 @@ describe('config', () => {
     expect(config.agent.backend).toBe('codex');
   });
 
+  it('should accept cursor backend', async () => {
+    process.env.DISCORD_TOKEN = 'test-token';
+    process.env.AGENT_BACKEND = 'cursor';
+
+    const { loadConfig } = await import('../src/config.js');
+    const config = loadConfig();
+
+    expect(config.agent.backend).toBe('cursor');
+  });
+
   it('should throw error for invalid backend', async () => {
     process.env.DISCORD_TOKEN = 'test-token';
     process.env.AGENT_BACKEND = 'invalid';

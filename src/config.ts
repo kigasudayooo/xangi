@@ -1,7 +1,7 @@
 import { DEFAULT_TIMEOUT_MS } from './constants.js';
 import type { ChatPlatform } from './prompts/index.js';
 
-export type AgentBackend = 'claude-code' | 'codex' | 'gemini' | 'local-llm';
+export type AgentBackend = 'claude-code' | 'codex' | 'gemini' | 'cursor' | 'local-llm';
 
 export interface AgentConfig {
   model?: string;
@@ -26,6 +26,10 @@ export interface Config {
     autoReplyChannels?: string[];
     streaming?: boolean;
     showThinking?: boolean;
+    showToolUse?: boolean;
+    toolHistoryMode?: 'inline' | 'button' | 'off';
+    showLiveToolUse?: boolean;
+    showToolButton?: boolean;
     injectChannelTopic?: boolean;
     injectTimestamp?: boolean;
     showButtons?: boolean;
@@ -177,10 +181,11 @@ export function loadConfig(): Config {
     backend !== 'claude-code' &&
     backend !== 'codex' &&
     backend !== 'gemini' &&
+    backend !== 'cursor' &&
     backend !== 'local-llm'
   ) {
     throw new Error(
-      `Invalid AGENT_BACKEND: ${backend}. Must be 'claude-code', 'codex', 'gemini', or 'local-llm'`
+      `Invalid AGENT_BACKEND: ${backend}. Must be 'claude-code', 'codex', 'gemini', 'cursor', or 'local-llm'`
     );
   }
 
@@ -241,6 +246,16 @@ export function loadConfig(): Config {
           .filter(Boolean) || [],
       streaming: process.env.DISCORD_STREAMING !== 'false',
       showThinking: process.env.DISCORD_SHOW_THINKING !== 'false',
+      showToolUse: process.env.DISCORD_SHOW_TOOL_USE !== 'false',
+      toolHistoryMode: (() => {
+        const mode = process.env.DISCORD_TOOL_HISTORY_MODE?.trim().toLowerCase();
+        if (mode === 'inline' || mode === 'button' || mode === 'off') return mode;
+        if (process.env.DISCORD_SHOW_TOOL_USE === 'true') return 'inline';
+        if (process.env.DISCORD_SHOW_TOOL_USE === 'false') return 'off';
+        return 'button';
+      })(),
+      showLiveToolUse: process.env.DISCORD_SHOW_LIVE_TOOL_USE !== 'false',
+      showToolButton: process.env.DISCORD_SHOW_TOOL_BUTTON !== 'false',
       injectChannelTopic: process.env.INJECT_CHANNEL_TOPIC !== 'false', // デフォルトON
       injectTimestamp: process.env.INJECT_TIMESTAMP !== 'false', // デフォルトON
       showButtons: process.env.DISCORD_SHOW_BUTTONS !== 'false', // デフォルトON

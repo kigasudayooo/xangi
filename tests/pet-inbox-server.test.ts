@@ -166,6 +166,22 @@ describe('pet-inbox-server', () => {
     expect(server.lastRun!.prompt).toContain('[プラットフォーム: Web (Pet)]');
   });
 
+  it('accepts device inbox POST and returns a filtered events URL', async () => {
+    const res = await postJson(`${server.url}/api/device/inbox`, {
+      text: 'hello glasses',
+      source: 'g2',
+    });
+    expect(res.status).toBe(202);
+    const body = res.body as Record<string, unknown>;
+    expect(body.accepted).toBe(true);
+    expect(String(body.events_url)).toContain('/api/events/stream?thread_id=');
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(server.lastRun).not.toBeNull();
+    expect(server.lastRun!.prompt).toContain('hello glasses');
+    expect(server.lastRun!.prompt).toContain('[プラットフォーム: Web (Device:g2)]');
+  });
+
   it('returns 400 when text is missing or empty', async () => {
     const r1 = await postJson(`${server.url}/api/pet/inbox`, {});
     expect(r1.status).toBe(400);
@@ -261,6 +277,13 @@ describe('pet-inbox-server', () => {
     expect(
       await handlePetInboxRequest(
         { url: '/api/pet/inbox', method: 'GET' } as never,
+        fakeRes,
+        stub
+      )
+    ).toBe(false);
+    expect(
+      await handlePetInboxRequest(
+        { url: '/api/device/inbox', method: 'GET' } as never,
         fakeRes,
         stub
       )

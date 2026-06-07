@@ -132,4 +132,33 @@ describe('BackendResolver localLlmMode', () => {
     const r = resolver.resolve('ch1');
     expect(r.localLlmMode).toBe('lite');
   });
+
+  it('request default を CHANNEL_OVERRIDES より低い優先度で適用できる', () => {
+    process.env.CHANNEL_OVERRIDES = JSON.stringify({
+      ch1: { backend: 'claude-code', localLlmMode: 'agent' },
+      ch2: { localLlmMode: 'lite' },
+    });
+    const resolver = new BackendResolver(makeConfig());
+
+    const fallback = {
+      backend: 'local-llm' as const,
+      model: 'gemma-4-26b-a4b',
+      localLlmMode: 'chat' as const,
+    };
+
+    expect(resolver.resolve('new-even-session', fallback)).toMatchObject({
+      backend: 'local-llm',
+      model: 'gemma-4-26b-a4b',
+      localLlmMode: 'chat',
+    });
+    expect(resolver.resolve('ch1', fallback)).toMatchObject({
+      backend: 'claude-code',
+      localLlmMode: 'agent',
+    });
+    expect(resolver.resolve('ch2', fallback)).toMatchObject({
+      backend: 'local-llm',
+      model: 'gemma-4-26b-a4b',
+      localLlmMode: 'lite',
+    });
+  });
 });

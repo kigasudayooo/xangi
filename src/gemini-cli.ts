@@ -1,6 +1,5 @@
 import { EventEmitter } from 'events';
 import { spawn, ChildProcess } from 'child_process';
-import { processManager } from './process-manager.js';
 import type {
   AgentRunner,
   RunOptions,
@@ -10,12 +9,13 @@ import type {
   ExtendTimeoutResult,
 } from './agent-runner.js';
 import { DEFAULT_TIMEOUT_MS } from './constants.js';
-import { getSafeEnv, buildSystemPrompt } from './base-runner.js';
+import { buildSystemPrompt } from './base-runner.js';
 import { prependRuntimeContext } from './runtime-context.js';
 import type { BaseRunnerOptions } from './base-runner.js';
-import { getGitHubEnv } from './github-auth.js';
 import { logPrompt, logResponse } from './transcript-logger.js';
 import { TimeoutController } from './timeout-controller.js';
+import { buildCliEnv, clearManagedCliProcess, registerManagedCliProcess } from './cli-process.js';
+import { appendJsonlChunk, flushJsonlBuffer } from './jsonl-buffer.js';
 
 /**
  * Gemini CLI の JSON 出力形式
@@ -171,27 +171,14 @@ export class GeminiRunner extends EventEmitter implements AgentRunner {
     args: string[],
     channelId?: string
   ): Promise<{ stdout: string; sessionId: string }> {
-    const safeEnv = getSafeEnv();
     return new Promise((resolve, reject) => {
-      const childEnv: NodeJS.ProcessEnv = { ...safeEnv, ...getGitHubEnv(safeEnv) };
-      if (channelId) {
-        childEnv.XANGI_CHANNEL_ID = channelId;
-      }
       const proc = spawn('gemini', args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: this.workdir,
-        env: childEnv,
+        env: buildCliEnv(channelId),
       });
       this.currentProcess = proc;
-      if (channelId) this.activeProcesses.set(channelId, proc);
-
-      if (channelId) {
-        processManager.register(channelId, proc);
-        this.timeoutController.start(channelId, () => {
-          const p = this.activeProcesses.get(channelId);
-          if (p) p.kill();
-        });
-      }
+      registerManagedCliProcess(channelId, proc, this.activeProcesses, this.timeoutController);
 
       let stdout = '';
       let stderr = '';
@@ -207,10 +194,12 @@ export class GeminiRunner extends EventEmitter implements AgentRunner {
 
       proc.on('close', (code) => {
         this.currentProcess = null;
-        if (channelId) {
-          this.activeProcesses.delete(channelId);
-          this.timeoutController.clear(channelId, code === 0 ? 'completed' : 'error');
-        }
+        clearManagedCliProcess(
+          channelId,
+          this.activeProcesses,
+          this.timeoutController,
+          code === 0 ? 'completed' : 'error'
+        );
 
         if (code !== 0) {
           reject(new Error(`Gemini CLI exited with code ${code}: ${stderr}`));
@@ -230,10 +219,7 @@ export class GeminiRunner extends EventEmitter implements AgentRunner {
 
       proc.on('error', (err) => {
         this.currentProcess = null;
-        if (channelId) {
-          this.activeProcesses.delete(channelId);
-          this.timeoutController.clear(channelId, 'error');
-        }
+        clearManagedCliProcess(channelId, this.activeProcesses, this.timeoutController, 'error');
         reject(new Error(`Failed to spawn Gemini CLI: ${err.message}`));
       });
     });
@@ -306,39 +292,24 @@ export class GeminiRunner extends EventEmitter implements AgentRunner {
     channelId?: string,
     appSessionId?: string
   ): Promise<RunResult> {
-    const safeEnv = getSafeEnv();
     return new Promise((resolve, reject) => {
-      const childEnv: NodeJS.ProcessEnv = { ...safeEnv, ...getGitHubEnv(safeEnv) };
-      if (channelId) {
-        childEnv.XANGI_CHANNEL_ID = channelId;
-      }
       const proc = spawn('gemini', args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: this.workdir,
-        env: childEnv,
+        env: buildCliEnv(channelId),
       });
       this.currentProcess = proc;
-      if (channelId) this.activeProcesses.set(channelId, proc);
-
-      if (channelId) {
-        processManager.register(channelId, proc);
-        this.timeoutController.start(channelId, () => {
-          const p = this.activeProcesses.get(channelId);
-          if (p) p.kill();
-        });
-      }
+      registerManagedCliProcess(channelId, proc, this.activeProcesses, this.timeoutController);
 
       let fullText = '';
       let sessionId = '';
       let buffer = '';
 
       proc.stdout.on('data', (data) => {
-        buffer += data.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        const parsed = appendJsonlChunk(buffer, data.toString());
+        buffer = parsed.buffer;
 
-        for (const line of lines) {
-          if (!line.trim()) continue;
+        for (const line of parsed.lines) {
           try {
             const json = JSON.parse(line) as GeminiStreamEvent;
 
@@ -383,15 +354,17 @@ export class GeminiRunner extends EventEmitter implements AgentRunner {
 
       proc.on('close', (code) => {
         this.currentProcess = null;
-        if (channelId) {
-          this.activeProcesses.delete(channelId);
-          this.timeoutController.clear(channelId, code === 0 ? 'completed' : 'error');
-        }
+        clearManagedCliProcess(
+          channelId,
+          this.activeProcesses,
+          this.timeoutController,
+          code === 0 ? 'completed' : 'error'
+        );
 
         // 残りのバッファを処理
-        if (buffer.trim()) {
+        for (const line of flushJsonlBuffer(buffer)) {
           try {
-            const json = JSON.parse(buffer) as GeminiStreamEvent;
+            const json = JSON.parse(line) as GeminiStreamEvent;
             if (json.type === 'init' && json.session_id) {
               sessionId = json.session_id;
             }
@@ -426,10 +399,7 @@ export class GeminiRunner extends EventEmitter implements AgentRunner {
 
       proc.on('error', (err) => {
         this.currentProcess = null;
-        if (channelId) {
-          this.activeProcesses.delete(channelId);
-          this.timeoutController.clear(channelId, 'error');
-        }
+        clearManagedCliProcess(channelId, this.activeProcesses, this.timeoutController, 'error');
         const error = new Error(`Failed to spawn Gemini CLI: ${err.message}`);
         callbacks.onError?.(error);
         reject(error);

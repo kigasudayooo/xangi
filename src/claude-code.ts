@@ -4,11 +4,11 @@ import type { RunOptions, RunResult, StreamCallbacks } from './agent-runner.js';
 import { mergeTexts, sanitizeSurrogates, prependRuntimeContext } from './agent-runner.js';
 import { stripToolCallArtifacts, finalizeDisplayText } from './tool-call-sanitize.js';
 import { DEFAULT_TIMEOUT_MS } from './constants.js';
-import { getSafeEnv } from './base-runner.js';
-import { getGitHubEnv } from './github-auth.js';
 import { buildSystemPrompt } from './base-runner.js';
 import type { ChatPlatform } from './prompts/index.js';
 import { logPrompt, logResponse } from './transcript-logger.js';
+import { buildCliEnv } from './cli-process.js';
+import { appendJsonlChunk, flushJsonlBuffer } from './jsonl-buffer.js';
 
 export interface ClaudeCodeOptions {
   model?: string;
@@ -106,16 +106,11 @@ export class ClaudeCodeRunner {
   }
 
   private execute(args: string[], channelId?: string): Promise<string> {
-    const safeEnv = getSafeEnv();
     return new Promise((resolve, reject) => {
-      const childEnv = { ...safeEnv, ...getGitHubEnv(safeEnv) };
-      if (channelId) {
-        childEnv.XANGI_CHANNEL_ID = channelId;
-      }
       const proc = spawn('claude', args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: this.workdir,
-        env: childEnv,
+        env: buildCliEnv(channelId),
       });
 
       // プロセスマネージャーに登録
@@ -221,16 +216,11 @@ export class ClaudeCodeRunner {
     callbacks: StreamCallbacks,
     channelId?: string
   ): Promise<RunResult> {
-    const safeEnv = getSafeEnv();
     return new Promise((resolve, reject) => {
-      const childEnv = { ...safeEnv, ...getGitHubEnv(safeEnv) };
-      if (channelId) {
-        childEnv.XANGI_CHANNEL_ID = channelId;
-      }
       const proc = spawn('claude', args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: this.workdir,
-        env: childEnv,
+        env: buildCliEnv(channelId),
       });
 
       // プロセスマネージャーに登録
@@ -243,12 +233,10 @@ export class ClaudeCodeRunner {
       let buffer = '';
 
       proc.stdout.on('data', (data) => {
-        buffer += data.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        const parsed = appendJsonlChunk(buffer, data.toString());
+        buffer = parsed.buffer;
 
-        for (const line of lines) {
-          if (!line.trim()) continue;
+        for (const line of parsed.lines) {
           try {
             const json = JSON.parse(line);
             if (json.type === 'assistant' && json.message?.content) {
@@ -296,9 +284,9 @@ export class ClaudeCodeRunner {
         clearTimeout(timeout);
 
         // 残りのバッファを処理
-        if (buffer.trim()) {
+        for (const line of flushJsonlBuffer(buffer)) {
           try {
-            const json = JSON.parse(buffer);
+            const json = JSON.parse(line);
             if (json.type === 'assistant' && json.message?.content) {
               for (const block of json.message.content) {
                 if (block.type === 'text') {

@@ -13,6 +13,7 @@ GET http://<xangi-host>:<WEB_CHAT_PORT>/api/events/stream
 - web-chat の HTTP サーバに相乗り（デフォルト port `18888`）
 - `Content-Type: text/event-stream`
 - 接続直後に `event: ready` を 1 回（`instance_id` / `host_hint` を payload）
+- `?thread_id=web:<appSessionId>` を付けると、その thread だけをサーバ側で絞り込む
 - 以後、操作的イベント（後述）が `data: <JSON>\n\n` の形で流れる
 - 30 秒ごとに `: keepalive` コメント行（中継 proxy の idle 切断対策）
 - consumer が切断したら subscriber を解除して keepalive timer を止める
@@ -28,7 +29,7 @@ GET http://<xangi-host>:<WEB_CHAT_PORT>/api/events/stream
   - `turn.complete` または `turn.aborted` 受信後 → "idle"
 - 配信は **subscriber へのブロードキャスト**。subscriber 数が 0 でもイベントは無害（捨てるだけ）
 - subscriber が例外を投げても他の subscriber には影響しない（本業を止めない）
-- **サーバ側フィルタなし**。複数 instance / 複数 thread を区別したいときは consumer 側で `instance_id` / `thread_id` / `platform` を見て自分で絞る
+- 基本は broadcast。`thread_id` を指定した接続だけサーバ側で thread filter する。複数 instance を区別したいときは consumer 側で `instance_id` / `platform` を見て絞る
 
 ## 環境変数
 
@@ -61,7 +62,7 @@ XANGI_INSTANCE_ID=xangi-prod
 ### `event: ready`（接続直後 1 回）
 
 ```jsonc
-{ "instance_id": "xangi-prod", "host_hint": "<hostname>" }
+{ "instance_id": "xangi-prod", "host_hint": "<hostname>", "thread_id": "web:<appSessionId>" }
 ```
 
 ### 全操作イベント共通フィールド
@@ -223,9 +224,9 @@ curl -N http://localhost:18888/api/events/stream
 #    → curl 側に turn.started → message.delta × N → turn.complete が流れる
 ```
 
-## Pet からの入力経路 (`POST /api/pet/inbox`)
+## Pet / Device からの入力経路 (`POST /api/*/inbox`)
 
-events SSE は「受信専用 broadcast」が設計の核だが、consumer 側 UI からテキストを 1 行だけ気軽に投げ込みたい用途のために、書き込み用の最小 endpoint が追加されている (`xangi-pet` のクリック → 入力欄など)。
+events SSE は「受信専用 broadcast」が設計の核だが、consumer 側 UI からテキストを 1 行だけ気軽に投げ込みたい用途のために、書き込み用の最小 endpoint が追加されている (`xangi-pet` のクリック → 入力欄、Even G2 Terminal など)。
 
 応答は同期で返らない。受理されたら 202 が即返り、agent の応答は既存の `/api/events/stream` 経由で全 consumer に broadcast される。「pet が話しかけて、その応答を全 pet で見る」が成立する。
 
@@ -233,12 +234,15 @@ events SSE は「受信専用 broadcast」が設計の核だが、consumer 側 U
 
 ```
 POST http://<xangi-host>:<WEB_CHAT_PORT>/api/pet/inbox
+POST http://<xangi-host>:<WEB_CHAT_PORT>/api/device/inbox
+POST http://<xangi-host>:<WEB_CHAT_PORT>/api/terminal/inbox
 Content-Type: application/json
-Authorization: Bearer <XANGI_PET_INBOX_TOKEN>   ← token 設定時のみ必須
+Authorization: Bearer <TOKEN>   ← token 設定時のみ必須
 
 {
   "text": "今日の天気は？",
-  "appSessionId": "<optional>"
+  "appSessionId": "<optional>",
+  "source": "g2"
 }
 ```
 
@@ -246,6 +250,7 @@ Authorization: Bearer <XANGI_PET_INBOX_TOKEN>   ← token 設定時のみ必須
 |---|---|---|
 | `text` | yes | ユーザー発話。空文字 / 8000 文字超で 400 |
 | `appSessionId` | no | 指定なら既存 web セッションへ追記。未指定なら最新 web セッションを再利用、無ければ新規作成 |
+| `source` | no | `device` / `terminal` 系の表示ラベル用。例: `g2` |
 
 ### レスポンス
 
@@ -257,7 +262,8 @@ Authorization: Bearer <XANGI_PET_INBOX_TOKEN>   ← token 設定時のみ必須
   "instance_id":  "xangi-prod",
   "thread_id":    "web:<appSessionId>",
   "turn_id":      "web-msg-pet-<unix-ms>",
-  "session_id":   "<appSessionId>"
+  "session_id":   "<appSessionId>",
+  "events_url":   "/api/events/stream?thread_id=web%3A<appSessionId>"
 }
 ```
 
@@ -269,14 +275,16 @@ Authorization: Bearer <XANGI_PET_INBOX_TOKEN>   ← token 設定時のみ必須
 | 401 | token 設定済みで `Authorization` 不一致 |
 | 403 | token 未設定で **グローバル IP** からアクセス (LAN / Tailscale は通る) |
 | 409 | 同一 session に並行送信 / web 以外の platform |
-| 503 | `XANGI_PET_INBOX_ENABLED=false` で無効化 |
+| 503 | `XANGI_PET_INBOX_ENABLED=false` / `XANGI_DEVICE_INBOX_ENABLED=false` で無効化 |
 
 ### 環境変数
 
 | 変数 | デフォルト | 説明 |
 |---|---|---|
 | `XANGI_PET_INBOX_ENABLED` | `true` | `false` で完全に無効化 (503 を返す) |
-| `XANGI_PET_INBOX_TOKEN` | (未設定) | 設定時は `Authorization: Bearer <token>` 必須。未設定時は loopback (127.0.0.1 / ::1) のみ許可 |
+| `XANGI_PET_INBOX_TOKEN` | (未設定) | pet/device/terminal 共通の fallback token。設定時は `Authorization: Bearer <token>` 必須 |
+| `XANGI_DEVICE_INBOX_ENABLED` | `true` | `false` で `/api/device/inbox` と `/api/terminal/inbox` を無効化 |
+| `XANGI_DEVICE_INBOX_TOKEN` | (未設定) | device/terminal 用 token。未設定時は `XANGI_PET_INBOX_TOKEN` に fallback |
 
 ### 認証モデル
 
@@ -309,4 +317,98 @@ curl -X POST http://localhost:18888/api/pet/inbox \
 # 2. 別ターミナルで events SSE を購読しておくと、上の curl の結果として
 #    turn.started → message.delta × N → turn.complete が流れる
 curl -N http://localhost:18888/api/events/stream
+
+# 3. Even G2 等の device は thread filter 付きで購読すると、自分のセッションだけ受け取れる
+curl -N 'http://localhost:18888/api/events/stream?thread_id=web:<appSessionId>'
+```
+
+## Even Terminal 互換 API
+
+`@evenrealities/even-terminal` の公式クライアントが期待する HTTP API の最小互換レイヤも、同じ Web Chat サーバ上で提供している。Even G2 のターミナルモードから xangi を直接ホストとして指定する用途向け。
+
+公式 Even Terminal は `claude` / `codex` provider を選ばせるが、xangi ではこの値を UI 互換のラベルとして受け取るだけ。実際に使う backend は xangi の通常設定 (`AGENT_BACKEND=claude-code|codex|cursor|local-llm`。`gemini` は legacy/API-key 用) で決まる。つまり Even 側に Local LLM の選択肢が無くても、xangi 側を `AGENT_BACKEND=local-llm` にすれば Local LLM に流せる。
+
+Even Terminal 経由だけ別の backend / model / Local LLM mode を使いたい場合は、`XANGI_EVEN_TERMINAL_BACKEND` / `XANGI_EVEN_TERMINAL_MODEL` / `XANGI_EVEN_TERMINAL_LOCAL_LLM_MODE` を設定する。`CHANNEL_OVERRIDES` に `web-chat:<appSessionId>` がある場合は、個別 session の override が専用 default より優先される。
+
+### 認証
+
+公式 Even Terminal と同じく、次のどちらかで token を渡す。
+
+```
+Authorization: Bearer <TOKEN>
+?token=<TOKEN>
+```
+
+token の解決順:
+
+1. `XANGI_EVEN_TERMINAL_TOKEN`
+2. `XANGI_DEVICE_INBOX_TOKEN`
+3. `XANGI_PET_INBOX_TOKEN`
+
+いずれも未設定の場合は、loopback / LAN / Tailscale からのアクセスだけを許可する。
+
+### エンドポイント
+
+```
+GET  /api/sessions?provider=codex&token=<TOKEN>
+GET  /api/info?provider=codex&token=<TOKEN>
+GET  /api/update-check?token=<TOKEN>
+POST /api/prompt
+GET  /api/events?sessionId=<appSessionId>&token=<TOKEN>&needReplay=true
+GET  /api/messages?sessionId=<appSessionId>&token=<TOKEN>&after=0
+GET  /api/status?sessionId=<appSessionId>&token=<TOKEN>
+POST /api/permission-response
+POST /api/question-response
+POST /api/interrupt
+```
+
+`/api/prompt`:
+
+```jsonc
+{
+  "text": "メガネからの入力",
+  "sessionId": "<optional xangi web appSessionId>",
+  "provider": "codex"
+}
+```
+
+成功時は公式と同じく 202 を即返す。xangi の応答は `/api/events` に Even Terminal 風メッセージとして流れる。
+
+```jsonc
+{ "ok": true, "sessionId": "<appSessionId>", "provider": "codex" }
+```
+
+### `/api/events` のメッセージ
+
+xangi の lifecycle events は、Even Terminal が表示しやすい形に変換される。
+
+| xangi event | Even Terminal 互換 message |
+|---|---|
+| `turn.started` | `{ "type": "user_prompt", "text": "..." }` |
+| `message.delta` | `{ "type": "text_delta", "text": "..." }` |
+| `turn.complete` | `{ "type": "result", "success": true, "text": "..." }` |
+| `turn.aborted` | `{ "type": "result", "success": false, "text": "Turn aborted" }` |
+| `agent.error` | `{ "type": "error", "message": "..." }` |
+
+`permission-response` / `question-response` / `interrupt` は、現時点では xangi 側の承認・質問フローへは接続せず、互換性維持のため `{"ok":true,"ignored":true}` を返す。
+
+### 動作確認
+
+```bash
+# xangi-dev を Even Terminal host として使う例
+WEB_CHAT_ENABLED=true
+WEB_CHAT_PORT=18889
+XANGI_EVEN_TERMINAL_TOKEN=evtest123
+XANGI_EVEN_TERMINAL_BACKEND=local-llm
+XANGI_EVEN_TERMINAL_MODEL=gemma-4-26b-a4b
+XANGI_EVEN_TERMINAL_LOCAL_LLM_MODE=chat
+
+# セッション一覧
+curl 'http://127.0.0.1:18889/api/sessions?provider=codex&token=evtest123'
+
+# prompt 投入
+curl -X POST 'http://127.0.0.1:18889/api/prompt' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer evtest123' \
+  -d '{"text":"こんにちは","provider":"codex"}'
 ```

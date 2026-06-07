@@ -196,6 +196,27 @@ describe('events-stream-server', () => {
     }
   });
 
+  it('filters events when thread_id query is provided', async () => {
+    const client = await connectSse(
+      `${testServer.url}/api/events/stream?thread_id=${encodeURIComponent('web:target')}`
+    );
+    try {
+      await client.waitForFrames((f) => f.some((x) => x.event === 'ready'));
+      const ready = client.frames.find((f) => f.event === 'ready');
+      expect(JSON.parse(ready!.data!).thread_id).toBe('web:target');
+
+      const { events } = await import('../src/events-emitter.js');
+      events.turnStarted({ threadId: 'web:other', turnId: 'ignored', platform: 'web' });
+      events.turnStarted({ threadId: 'web:target', turnId: 'shown', platform: 'web' });
+
+      await client.waitForFrames((f) => f.some((x) => x.data?.includes('shown')));
+      expect(client.frames.some((x) => x.data?.includes('ignored'))).toBe(false);
+    } finally {
+      client.close();
+      await client.closed;
+    }
+  });
+
   it('broadcasts events to multiple connected clients (fan-out)', async () => {
     const a = await connectSse(`${testServer.url}/api/events/stream`);
     const b = await connectSse(`${testServer.url}/api/events/stream`);

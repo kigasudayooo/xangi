@@ -6,7 +6,7 @@ This document explains the architecture and design philosophy of xangi.
 
 ## Overview
 
-xangi is "a wrapper that makes AI CLIs (Claude Code / Codex CLI / Gemini CLI) and local LLMs (Ollama, etc.) accessible from chat platforms."
+xangi is "a wrapper that makes AI CLIs (Claude Code / Codex CLI / Cursor CLI, plus Gemini CLI for legacy/API-key use) and local LLMs (Ollama, etc.) accessible from chat platforms."
 
 ```
 User → Chat (Discord/Slack) → xangi → AI CLI → Workspace
@@ -18,7 +18,7 @@ User → Chat (Discord/Slack) → xangi → AI CLI → Workspace
 flowchart LR
     User([User]) <-->|Message| chat[UI<br/>Discord / Slack<br/>Browser / LINE]
     chat <-->|Prompt| xangi[xangi]
-    xangi <-->|Execute| LLM{{LLM Backend<br/>Claude Code / Codex<br/>Gemini CLI / Local LLM}}
+    xangi <-->|Execute| LLM{{LLM Backend<br/>Claude Code / Codex<br/>Cursor CLI / Local LLM<br/>Gemini CLI legacy}}
     LLM <-->|File Operations| WS[(Workspace<br/>AGENTS.md / skills<br/>Local docs)]
     LLM <--> Web[Web Search]
     LLM <--> Service[Web Service]
@@ -42,7 +42,7 @@ flowchart LR
 | Chat | User interface | discord.js, @slack/bolt, http (Web Chat), @line/bot-sdk |
 | xangi | AI CLI / Local LLM integration & control | index.ts, agent-runner.ts, dynamic-runner.ts |
 | Backend Resolution | Per-channel backend resolution | backend-resolver.ts, settings.ts |
-| AI Backend | Actual AI processing | Claude Code, Codex CLI, Gemini CLI, Local LLM (Ollama / vLLM) |
+| AI Backend | Actual AI processing | Claude Code, Codex CLI, Cursor CLI, Local LLM (Ollama / vLLM), Gemini CLI legacy |
 | Workspace | Files & skills | skills/, AGENTS.md, local docs |
 
 ## Components
@@ -190,6 +190,7 @@ Manages the system prompts that xangi injects into AI CLIs:
   - Slack-specific (`xangi-commands-slack.ts`): Slack-specific operations
   - Automatic platform detection: If only Discord is active, only Discord-specific commands are injected (saves tokens)
 - **Platform identification** — Each message is annotated with `[Platform: Discord]` or `[Platform: Slack]`. The AI uses the appropriate commands accordingly
+- **Tool-use display** — Discord tool-use history is controlled by `DISCORD_TOOL_HISTORY_MODE=button|inline|off`. The default is `button`: completed messages do not include the history inline, and a `Tools` button shows it only to the user who clicked it via an ephemeral response. `DISCORD_SHOW_TOOL_BUTTON=false` hides the `Tools` button even in `button` mode. `inline` keeps the previous top-of-message display, and `off` disables tool history display. For compatibility, `DISCORD_SHOW_TOOL_USE=false` maps to `off` and `true` maps to `inline`. While a turn is running, xangi shows raw commands unless `DISCORD_SHOW_LIVE_TOOL_USE=false`. After completion it normalizes internal context tools into short labels such as `workspace-RAG検索`; Bash/exec final history strips wrappers such as `/bin/bash -lc` and shows a shorter command summary. Live Bash/exec tool argument display is capped at 200 characters and can be configured with `XANGI_TOOL_DISPLAY_MAX`.
 
 AGENTS.md / CHARACTER.md / USER.md and other workspace settings are delegated to each AI CLI's auto-loading feature:
 
@@ -197,7 +198,8 @@ AGENTS.md / CHARACTER.md / USER.md and other workspace settings are delegated to
 |-----|-------------------|------------------|
 | Claude Code | `CLAUDE.md` | `--append-system-prompt` (one-time) |
 | Codex CLI | `AGENTS.md` | Embedded via `<system-context>` tag |
-| Gemini CLI | `GEMINI.md` | Auto-loaded by CLI (no xangi-side injection) |
+| Gemini CLI (legacy) | `GEMINI.md` | Auto-loaded by CLI (no xangi-side injection) |
+| Cursor CLI | `AGENTS.md` | Auto-loaded by CLI (no xangi-side injection) |
 | Local LLM | `AGENTS.md`, `MEMORY.md` | Directly embedded in system prompt (`CLAUDE.md` is typically a symlink to `AGENTS.md`, so it's excluded) |
 
 ### AI CLI Adapters
@@ -207,7 +209,8 @@ AGENTS.md / CHARACTER.md / USER.md and other workspace settings are delegated to
 | claude-code.ts | Claude Code | Streaming support, session management |
 | persistent-runner.ts | Claude Code (persistent) | Persistent process via `--input-format=stream-json`, queue management, circuit breaker |
 | codex-cli.ts | Codex CLI | Made by OpenAI, 0.98.0 compatible, cancel support |
-| gemini-cli.ts | Gemini CLI | Made by Google, session management, streaming support |
+| gemini-cli.ts | Gemini CLI legacy | Kept for compatibility and Enterprise / Google Cloud / paid API key use. Not recommended for new Pro / Ultra / free individual setups |
+| cursor-cli.ts | Cursor CLI | `cursor-agent` command, JSON/stream-json, tool call display support |
 | local-llm/runner.ts | Local LLM | Direct calls to local LLMs like Ollama, tool execution & streaming support |
 
 #### Local LLM Adapter Detailed Design
@@ -654,7 +657,7 @@ Hides AI CLI implementation details and makes them interchangeable:
 
 ```typescript
 // Switch backends via configuration
-AGENT_BACKEND=claude-code  // or codex or gemini or local-llm
+AGENT_BACKEND=claude-code  // or codex / cursor / local-llm (gemini is legacy/API-key use)
 ```
 
 When new AI CLIs emerge in the future, support can be added simply by creating a new adapter.
@@ -808,7 +811,10 @@ src/
 ├── claude-code.ts      # Claude Code adapter (per-request)
 ├── persistent-runner.ts # Claude Code adapter (persistent process)
 ├── codex-cli.ts        # Codex CLI adapter
-├── gemini-cli.ts       # Gemini CLI adapter
+├── gemini-cli.ts       # Gemini CLI adapter (legacy/API-key use)
+├── cursor-cli.ts       # Cursor CLI adapter
+├── cli-process.ts      # Shared process/env/timeout helpers for one-shot CLI runners
+├── jsonl-buffer.ts     # Shared JSONL stream line splitter
 ├── web-chat.ts         # Web Chat UI (HTTP server)
 ├── tool-server.ts      # Tool Server (HTTP API for AI CLIs)
 ├── approval.ts         # Dangerous command detection (pattern matching)

@@ -4,11 +4,11 @@
 
 > **A**I **N**EON **G**ENESIS **I**NTELLIGENCE
 
-An AI assistant for Discord / Slack / browser / LINE, powered by Claude Code / Codex / Gemini CLI / Local LLM backends. Discord recommended; browser-only mode also supported.
+An AI assistant for Discord / Slack / browser / LINE, powered by Claude Code / Codex / Cursor CLI / Local LLM backends. Gemini CLI is kept only for legacy/API-key use. Discord recommended; browser-only mode also supported.
 
 ## Features
 
-- Multi-backend support (Claude Code / Codex / Gemini CLI / Local LLM)
+- Multi-backend support (Claude Code / Codex / Cursor CLI / Local LLM; Gemini CLI is legacy/API-key use)
 - `/backend` command for dynamic per-channel backend/model/effort switching
 - Local LLM support (Ollama/vLLM, etc., with agent mode / chat mode toggle)
 - Discord / Slack / Web Chat UI / LINE support
@@ -23,7 +23,7 @@ An AI assistant for Discord / Slack / browser / LINE, powered by Claude Code / C
 flowchart LR
     User([User]) <-->|Message| chat[UI<br/>Discord / Slack<br/>Browser / LINE]
     chat <-->|Prompt| xangi[xangi]
-    xangi <-->|Execute| LLM{{LLM Backend<br/>Claude Code / Codex<br/>Gemini CLI / Local LLM}}
+    xangi <-->|Execute| LLM{{LLM Backend<br/>Claude Code / Codex<br/>Cursor CLI / Local LLM<br/>Gemini CLI legacy}}
     LLM <-->|File ops| WS[(Workspace<br/>AGENTS.md / skills<br/>Local docs)]
     LLM <--> Web[Web Search]
     LLM <--> Service[Web Service]
@@ -67,7 +67,8 @@ DISCORD_ALLOWED_USER=123456789012345678
 # Requires Node.js 22+ and at least one AI CLI
 # Claude Code: curl -fsSL https://claude.ai/install.sh | bash
 # Codex CLI:   npm install -g @openai/codex
-# Gemini CLI:  npm install -g @google/gemini-cli
+# Gemini CLI (legacy/API-key): npm install -g @google/gemini-cli
+# Cursor CLI:  curl https://cursor.com/install -fsS | bash
 # Local LLM:   Install Ollama (https://ollama.com)
 
 npm install
@@ -77,6 +78,8 @@ npm start
 # Development
 npm run dev
 ```
+
+The Gemini CLI backend is kept for compatibility and Enterprise / Google Cloud / paid API key use. Requests for Google AI Pro / Ultra / free Gemini Code Assist for individuals stop on 2026-06-18, so new setups should prefer Claude Code / Codex / Cursor CLI / Local LLM.
 
 ### 3. Verify
 
