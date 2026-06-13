@@ -1,5 +1,7 @@
+import * as fs from 'node:fs';
 import { DEFAULT_TIMEOUT_MS } from './constants.js';
 import type { ChatPlatform } from './prompts/index.js';
+import { EnvValidator } from './config-validate.js';
 
 export type AgentBackend = 'claude-code' | 'codex' | 'gemini' | 'cursor' | 'local-llm';
 
@@ -139,6 +141,10 @@ export interface Config {
 }
 
 export function loadConfig(): Config {
+  // 環境変数の検証層。不正な値は警告 + デフォルトへフォールバック
+  // （XANGI_CONFIG_STRICT=true で起動中断に格上げ）
+  const v = new EnvValidator();
+
   const discordToken = process.env.DISCORD_TOKEN;
   const slackBotToken = process.env.SLACK_BOT_TOKEN;
   const slackAppToken = process.env.SLACK_APP_TOKEN;
@@ -208,24 +214,38 @@ export function loadConfig(): Config {
 
   const agentConfig: AgentConfig = {
     model: process.env.AGENT_MODEL || undefined,
-    timeoutMs: process.env.TIMEOUT_MS ? parseInt(process.env.TIMEOUT_MS, 10) : DEFAULT_TIMEOUT_MS,
+    timeoutMs: v.int('TIMEOUT_MS', DEFAULT_TIMEOUT_MS, { min: 1000 }),
     workdir: process.env.WORKSPACE_PATH || undefined,
     skipPermissions: process.env.SKIP_PERMISSIONS !== 'false', // デフォルトで有効（Discord/Slack/Web 連携の非対話実行で permission プロンプト待ちを避けるため）
     persistent: process.env.PERSISTENT_MODE !== 'false', // デフォルトで有効
-    maxProcesses: process.env.MAX_PROCESSES ? parseInt(process.env.MAX_PROCESSES, 10) : 10,
-    idleTimeoutMs: process.env.IDLE_TIMEOUT_MS
-      ? parseInt(process.env.IDLE_TIMEOUT_MS, 10)
-      : 30 * 60 * 1000, // 30分
+    maxProcesses: v.int('MAX_PROCESSES', 10, { min: 1, max: 100 }),
+    idleTimeoutMs: v.int('IDLE_TIMEOUT_MS', 30 * 60 * 1000, { min: 1000 }), // 30分
   };
 
-  // ALLOWED_BACKENDS / ALLOWED_MODELS パース
-  const allowedBackendsRaw = process.env.ALLOWED_BACKENDS;
-  const allowedBackends: AgentBackend[] | undefined = allowedBackendsRaw
-    ? (allowedBackendsRaw
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean) as AgentBackend[])
-    : undefined;
+  // ALLOWED_BACKENDS パース（typo は警告して除外、有効な項目だけ残す）
+  const allowedBackends: AgentBackend[] | undefined = v.enumList('ALLOWED_BACKENDS', [
+    'claude-code',
+    'codex',
+    'gemini',
+    'cursor',
+    'local-llm',
+  ] as const);
+
+  // LOCAL_LLM_MODE は local-llm/runner 等で直接参照されるが、typo 検出のためここで検証する
+  v.enumOf('LOCAL_LLM_MODE', ['agent', 'lite', 'chat'] as const, 'agent');
+
+  // XANGI_HOOKS_ENABLED / XANGI_HOOKS_FILE は hooks.ts で直接参照されるが、typo 検出のためここで検証する
+  v.enumOf('XANGI_HOOKS_ENABLED', ['true', 'false'] as const, 'true');
+  {
+    const hooksFile = process.env.XANGI_HOOKS_FILE?.trim();
+    if (hooksFile && !fs.existsSync(hooksFile)) {
+      v.issue(
+        'XANGI_HOOKS_FILE',
+        hooksFile,
+        'ファイルが存在しません。hooks は無効として起動します'
+      );
+    }
+  }
 
   const allowedModelsRaw = process.env.ALLOWED_MODELS;
   const allowedModels: string[] | undefined = allowedModelsRaw
@@ -235,7 +255,7 @@ export function loadConfig(): Config {
         .filter(Boolean)
     : undefined;
 
-  return {
+  const config: Config = {
     discord: {
       enabled: !!discordToken,
       token: discordToken || '',
@@ -250,6 +270,13 @@ export function loadConfig(): Config {
       toolHistoryMode: (() => {
         const mode = process.env.DISCORD_TOOL_HISTORY_MODE?.trim().toLowerCase();
         if (mode === 'inline' || mode === 'button' || mode === 'off') return mode;
+        if (mode) {
+          v.issue(
+            'DISCORD_TOOL_HISTORY_MODE',
+            mode,
+            `許可される値は inline / button / off です。フォールバック値を使用します`
+          );
+        }
         if (process.env.DISCORD_SHOW_TOOL_USE === 'true') return 'inline';
         if (process.env.DISCORD_SHOW_TOOL_USE === 'false') return 'off';
         return 'button';
@@ -265,9 +292,7 @@ export function loadConfig(): Config {
           .map((s) => s.trim())
           .filter(Boolean) || [],
       respondToBotsEnabled: process.env.RESPOND_TO_BOTS_ENABLED === 'true', // デフォルトOFF
-      respondToBotsMaxConsecutive: process.env.RESPOND_TO_BOTS_MAX_CONSECUTIVE
-        ? parseInt(process.env.RESPOND_TO_BOTS_MAX_CONSECUTIVE, 10)
-        : 3, // デフォルト3回
+      respondToBotsMaxConsecutive: v.int('RESPOND_TO_BOTS_MAX_CONSECUTIVE', 3), // デフォルト3回、0以下は制限無効
       allowRespondToBotsCommand: process.env.ALLOW_RESPOND_TO_BOTS_COMMAND !== 'false', // デフォルトON
       allowLlmModeCommand: process.env.ALLOW_LLM_MODE_COMMAND !== 'false', // デフォルトON
     },
@@ -289,22 +314,14 @@ export function loadConfig(): Config {
       channelSecret: lineChannelSecret,
       channelAccessToken: lineChannelAccessToken,
       allowedUsers: lineAllowedUsers,
-      webhookPort: process.env.LINE_WEBHOOK_PORT
-        ? parseInt(process.env.LINE_WEBHOOK_PORT, 10)
-        : 8765,
+      webhookPort: v.int('LINE_WEBHOOK_PORT', 8765, { min: 1, max: 65535 }),
       webhookPath: process.env.LINE_WEBHOOK_PATH || '/webhook',
       loadingAnimationEnabled: process.env.LINE_LOADING_ANIMATION_ENABLED !== 'false',
-      loadingAnimationSeconds: process.env.LINE_LOADING_ANIMATION_SECONDS
-        ? parseInt(process.env.LINE_LOADING_ANIMATION_SECONDS, 10)
-        : 60,
+      loadingAnimationSeconds: v.int('LINE_LOADING_ANIMATION_SECONDS', 60, { min: 5, max: 60 }),
       slowResponseEnabled: process.env.LINE_SLOW_RESPONSE_ENABLED !== 'false',
-      slowResponseThresholdMs: process.env.LINE_SLOW_RESPONSE_THRESHOLD_MS
-        ? parseInt(process.env.LINE_SLOW_RESPONSE_THRESHOLD_MS, 10)
-        : 45000,
+      slowResponseThresholdMs: v.int('LINE_SLOW_RESPONSE_THRESHOLD_MS', 45000, { min: 1000 }),
       idleResetEnabled: process.env.LINE_IDLE_RESET_ENABLED !== 'false',
-      idleResetHours: process.env.LINE_IDLE_RESET_HOURS
-        ? parseFloat(process.env.LINE_IDLE_RESET_HOURS)
-        : 4,
+      idleResetHours: v.float('LINE_IDLE_RESET_HOURS', 4, { min: 0 }),
       resetTextPatterns: process.env.LINE_RESET_TEXT_PATTERNS
         ? process.env.LINE_RESET_TEXT_PATTERNS.split(',')
             .map((s) => s.trim())
@@ -325,4 +342,9 @@ export function loadConfig(): Config {
     // 後方互換性のため残す
     claudeCode: agentConfig,
   };
+
+  // 検証結果をまとめて報告（問題なしなら無音、XANGI_CONFIG_STRICT=true なら throw）
+  v.report();
+
+  return config;
 }

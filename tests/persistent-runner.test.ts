@@ -467,8 +467,8 @@ describe('PersistentRunner', () => {
     expect(state.active).toBe(true);
     expect(state.timeoutAt).toBeGreaterThan(Date.now());
     expect(state.maxTimeoutAt).toBeGreaterThan(state.timeoutAt!);
-    // 初期 timeoutMs = DEFAULT_TIMEOUT_MS (5 分)
-    expect(state.timeoutMs).toBe(5 * 60_000);
+    // 初期 timeoutMs = DEFAULT_TIMEOUT_MS (30 分)
+    expect(state.timeoutMs).toBe(30 * 60_000);
     expect(state.remainingMs).toBeGreaterThan(0);
   });
 
@@ -482,41 +482,41 @@ describe('PersistentRunner', () => {
 
     expect(result.ok).toBe(true);
     expect(result.timeoutAt).toBe(beforeTimeoutAt + 5 * 60_000);
-    expect(result.timeoutMs).toBe(10 * 60_000); // 5 + 5 分
+    expect(result.timeoutMs).toBe(35 * 60_000); // 30 + 5 分
     expect(result.remainingMs).toBeGreaterThan(0);
 
     const after = runner.getTimeoutState();
     expect(after.timeoutAt).toBe(beforeTimeoutAt + 5 * 60_000);
   });
 
-  it('extendTimeout fails with max_timeout_exceeded when exceeding 1h cap', async () => {
+  it('extendTimeout fails with max_timeout_exceeded when exceeding 10h cap', async () => {
     runner.run('test prompt').catch(() => {});
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    // 1 時間を超える延長を要求 → 拒否
-    const result = runner.extendTimeout(undefined, 60 * 60_000);
+    // 10 時間を超える延長を要求 → 拒否
+    const result = runner.extendTimeout(undefined, 10 * 60 * 60_000);
     expect(result.ok).toBe(false);
     expect(result.reason).toBe('max_timeout_exceeded');
     expect(result.maxTimeoutAt).toBeGreaterThan(Date.now());
 
     // 元の timeoutAt は変わっていないこと
     const state = runner.getTimeoutState();
-    expect(state.timeoutMs).toBe(5 * 60_000);
+    expect(state.timeoutMs).toBe(30 * 60_000);
   });
 
   it('extendTimeout can be called multiple times until reaching cap', async () => {
     runner.run('test prompt').catch(() => {});
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    // 5 分初期 + 11 回延長 = 60 分 (上限ぴったり手前)、12 回目で超える
-    for (let i = 0; i < 11; i++) {
-      const r = runner.extendTimeout(undefined, 5 * 60_000);
+    // 30 分初期 + 19 回 30 分延長 = 10 時間 (上限ぴったり)、20 回目で超える
+    for (let i = 0; i < 19; i++) {
+      const r = runner.extendTimeout(undefined, 30 * 60_000);
       expect(r.ok).toBe(true);
     }
     const final = runner.getTimeoutState();
-    expect(final.timeoutMs).toBe(60 * 60_000);
+    expect(final.timeoutMs).toBe(10 * 60 * 60_000);
 
-    const overflow = runner.extendTimeout(undefined, 5 * 60_000);
+    const overflow = runner.extendTimeout(undefined, 30 * 60_000);
     expect(overflow.ok).toBe(false);
     expect(overflow.reason).toBe('max_timeout_exceeded');
   });
@@ -561,7 +561,197 @@ describe('PersistentRunner', () => {
     expect(extendedSpy).toHaveBeenCalledTimes(1);
     const payload = extendedSpy.mock.calls[0][0];
     expect(payload.timeoutAt).toBeGreaterThan(Date.now());
-    expect(payload.timeoutMs).toBe(10 * 60_000);
+    expect(payload.timeoutMs).toBe(35 * 60_000);
     expect(payload.remainingMs).toBeGreaterThan(0);
+  });
+});
+
+// issue #286: どの経路でプロセスを失っても呼び出し側の Promise を必ず settle させる
+describe('PersistentRunner orphaned request prevention (issue #286)', () => {
+  let runner: PersistentRunner;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    runner = new PersistentRunner({
+      workdir: '/test/workdir',
+      skipPermissions: true,
+    });
+  });
+
+  afterEach(async () => {
+    try {
+      runner.shutdown();
+    } catch {
+      // ignore
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+
+  it('rejects in-flight request when process closes while shuttingDown flag is set', async () => {
+    const { getMockProcess } = await import('child_process');
+
+    const promise = runner.run('test prompt');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // shutdown フラグだけ立った状態 (本来 shutdown() が reject するが、
+    // 何らかの経路で currentItem が残った場合のセーフティネット)
+    (runner as unknown as { shuttingDown: boolean }).shuttingDown = true;
+    const mockProcess = getMockProcess() as unknown as { emit: (e: string, c: number) => void };
+    mockProcess.emit('close', 143);
+
+    await expect(promise).rejects.toThrow(/shutdown/);
+  });
+
+  it('rejects in-flight request when process closes while cancelling flag is set', async () => {
+    const { getMockProcess } = await import('child_process');
+
+    const promise = runner.run('test prompt');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    (runner as unknown as { cancelling: boolean }).cancelling = true;
+    const mockProcess = getMockProcess() as unknown as { emit: (e: string, c: number) => void };
+    mockProcess.emit('close', 143);
+
+    await expect(promise).rejects.toThrow(/cancellation/);
+  });
+
+  it('ignores stale close events from a previous process', async () => {
+    const { getMockProcess } = await import('child_process');
+
+    // 1 つ目のプロセスがクラッシュ
+    const promise1 = runner.run('prompt 1');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const procA = getMockProcess() as unknown as {
+      emit: (e: string, c: number) => void;
+      stdout: { emit: (e: string, d: string) => void };
+    };
+    procA.emit('close', 1);
+    await expect(promise1).rejects.toThrow(/exited unexpectedly/);
+
+    // 2 つ目のリクエストが新プロセスで進行中
+    const promise2 = runner.run('prompt 2');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const procB = getMockProcess() as unknown as {
+      emit: (e: string, c: number) => void;
+      stdout: { emit: (e: string, d: string) => void };
+    };
+    expect(procB).not.toBe(procA);
+
+    // 古いプロセスの close が遅れて届いても新リクエストに影響しない
+    procA.emit('close', 143);
+
+    procB.stdout.emit(
+      'data',
+      JSON.stringify({
+        type: 'result',
+        result: 'response 2',
+        session_id: 'test-session-123',
+        is_error: false,
+      }) + '\n'
+    );
+
+    const result2 = await promise2;
+    expect(result2.result).toBe('response 2');
+  });
+
+  it('rejects queued requests on shutdown even when process is null', async () => {
+    // プロセス未起動のまま queue にアイテムが残った状況を直接再現
+    const promise = new Promise((resolve, reject) => {
+      (
+        runner as unknown as {
+          queue: Array<{ prompt: string; resolve: unknown; reject: unknown }>;
+        }
+      ).queue.push({ prompt: 'orphan', resolve, reject });
+    });
+
+    runner.shutdown();
+
+    await expect(promise).rejects.toThrow('Runner is shutting down');
+  });
+
+  it('rejects request instead of hanging when circuit breaker is open', async () => {
+    const { getMockProcess } = await import('child_process');
+
+    // 1 分以内に 3 回クラッシュさせてサーキットブレーカーを開く
+    for (let i = 0; i < 3; i++) {
+      const p = runner.run(`prompt ${i}`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      (getMockProcess() as unknown as { emit: (e: string, c: number) => void }).emit('close', 1);
+      await expect(p).rejects.toThrow();
+    }
+
+    // ブレーカーオープン中のリクエストは throw で宙吊りにならず reject される
+    await expect(runner.run('prompt after open')).rejects.toThrow(/Circuit breaker open/);
+  });
+
+  it('reports isBusy during request and idle after completion', async () => {
+    const { getMockProcess } = await import('child_process');
+
+    expect(runner.isBusy()).toBe(false);
+
+    const promise = runner.run('test prompt');
+    expect(runner.isBusy()).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const mockProcess = getMockProcess() as unknown as {
+      stdout: { emit: (e: string, d: string) => void };
+    };
+    mockProcess.stdout.emit(
+      'data',
+      JSON.stringify({
+        type: 'result',
+        result: 'done',
+        session_id: 'test-session-123',
+        is_error: false,
+      }) + '\n'
+    );
+
+    await promise;
+    expect(runner.isBusy()).toBe(false);
+  });
+
+  it('resumes queued requests after cancel when close arrives late (stale-guard regression)', async () => {
+    const { getMockProcess } = await import('child_process');
+
+    const promise1 = runner.run('one');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const procA = getMockProcess() as unknown as {
+      emit: (e: string, c: number) => void;
+      kill: () => void;
+      killed: boolean;
+    };
+
+    const promise2 = runner.run('two'); // procA が busy なのでキュー待ち
+    expect(runner.getQueueLength()).toBe(1);
+
+    // 実環境では kill() の close は非同期に届く (mock は同期 emit なので無効化して再現)
+    procA.kill = () => {
+      procA.killed = true;
+    };
+
+    expect(runner.cancel()).toBe(true);
+    await expect(promise1).rejects.toThrow('Request cancelled by user');
+
+    // 遅れて close が届く → cancelling リセット + キューの次リクエストが開始される
+    procA.emit('close', 143);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const procB = getMockProcess() as unknown as {
+      emit: (e: string, c: number) => void;
+      stdout: { emit: (e: string, d: string) => void };
+    };
+    expect(procB).not.toBe(procA);
+    procB.stdout.emit(
+      'data',
+      JSON.stringify({
+        type: 'result',
+        result: 'response two',
+        session_id: 'test-session-123',
+        is_error: false,
+      }) + '\n'
+    );
+
+    const result2 = await promise2;
+    expect(result2.result).toBe('response two');
   });
 });

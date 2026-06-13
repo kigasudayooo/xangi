@@ -47,6 +47,13 @@ vi.mock('../src/persistent-runner.js', () => {
       return this.alive;
     }
 
+    // テストから busy 状態を制御するためのフラグ (実体は currentItem/queue 判定)
+    busy = false;
+
+    isBusy() {
+      return this.busy;
+    }
+
     getQueueLength() {
       return 0;
     }
@@ -341,5 +348,59 @@ describe('RunnerManager', () => {
     expect(ch2).toBeDefined();
     expect(ch1!.idleSeconds).toBeGreaterThanOrEqual(5);
     expect(ch2!.idleSeconds).toBeLessThanOrEqual(1);
+  });
+
+  it('should not cleanup busy runners (long-running turn)', async () => {
+    const idleTimeoutMs = 10 * 60 * 1000; // 10分
+    manager = new RunnerManager({ workdir: '/test' }, { maxProcesses: 5, idleTimeoutMs });
+
+    await manager.run('msg1', { channelId: 'ch1' });
+    expect(manager.getStatus().poolSize).toBe(1);
+
+    // 長時間ターン実行中をシミュレート
+    const entry = (manager as unknown as { pool: Map<string, { runner: { busy: boolean } }> }).pool
+      .get('ch1');
+    entry!.runner.busy = true;
+
+    // アイドルタイムアウト + クリーンアップ間隔を超えて時間を進めても残る
+    vi.advanceTimersByTime(idleTimeoutMs + 5 * 60 * 1000 + 1000);
+    expect(manager.getStatus().poolSize).toBe(1);
+
+    // ターン完了後は通常どおり回収される (busy 中に lastUsed が更新されるので
+    // そこから idleTimeoutMs 経過が必要)
+    entry!.runner.busy = false;
+    vi.advanceTimersByTime(idleTimeoutMs + 5 * 60 * 1000 + 1000);
+    expect(manager.getStatus().poolSize).toBe(0);
+  });
+
+  it('should not evict busy runners (skip eviction when all busy)', async () => {
+    manager = new RunnerManager({ workdir: '/test' }, { maxProcesses: 2 });
+
+    await manager.run('msg1', { channelId: 'ch1' });
+    vi.advanceTimersByTime(1000);
+    await manager.run('msg2', { channelId: 'ch2' });
+
+    // 両方 busy にする → evict はスキップされ、プールが一時的に上限超過する
+    const pool = (manager as unknown as { pool: Map<string, { runner: { busy: boolean } }> }).pool;
+    pool.get('ch1')!.runner.busy = true;
+    pool.get('ch2')!.runner.busy = true;
+
+    vi.advanceTimersByTime(1000);
+    await manager.run('msg3', { channelId: 'ch3' });
+
+    const channelIds = manager.getStatus().channels.map((c) => c.channelId);
+    expect(channelIds).toContain('ch1');
+    expect(channelIds).toContain('ch2');
+    expect(channelIds).toContain('ch3');
+    expect(manager.getStatus().poolSize).toBe(3);
+
+    // ch1 だけ busy 解除 → 次の eviction では ch1 (最古の非busy) が選ばれる
+    pool.get('ch1')!.runner.busy = false;
+    vi.advanceTimersByTime(1000);
+    await manager.run('msg4', { channelId: 'ch4' });
+
+    const after = manager.getStatus().channels.map((c) => c.channelId);
+    expect(after).not.toContain('ch1');
+    expect(after).toContain('ch4');
   });
 });

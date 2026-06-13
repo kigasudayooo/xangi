@@ -46,6 +46,7 @@ import {
   FRIENDLY_FALLBACK_MESSAGE,
 } from './pseudo-toolcall.js';
 import { stripToolCallArtifacts } from '../tool-call-sanitize.js';
+import { createStopHookRunner, type StopHookRunner } from '../hooks.js';
 import {
   ToolTrajectoryLogger,
   loggerOptionsFromEnv,
@@ -261,6 +262,12 @@ export interface Session {
    * 冪等・低価値 tool は 2 回目以降キャッシュ再利用する戦略。
    */
   idempotentResultCache: Map<string, string>;
+  /**
+   * 現在のターン (run()/runStream() 1 回) で実際に実行されたツール名（実行順、重複あり）。
+   * Stop hook の `tools_called` ペイロードに使う。ターン開始時にリセットされる。
+   * deny / ループ遮断されたツールは「実行」に数えない（冪等キャッシュ HIT は数える）。
+   */
+  lastTurnToolNames?: string[];
 }
 
 /** 同一 tool_call が何回連続したらループと判定するか */
@@ -662,6 +669,11 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
   private readonly modelName: string;
   private readonly baseUrlForTrajectory: string;
   private readonly featuresForTrajectory: string[];
+  /**
+   * Stop hook ランナー (XANGI_HOOKS_ENABLED=true + hooks/hooks.json に Stop 定義があるときのみ非 null)。
+   * ターン終了時に外部検証プロセスを挟み、block ならフィードバックを注入して 1 回だけ継続ラウンドを回す。
+   */
+  private readonly stopHooks: StopHookRunner | null;
 
   constructor(config: AgentConfig & { platform?: ChatPlatform }) {
     super();
@@ -708,6 +720,9 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
 
     this.llm = new LLMClient(baseUrl, model, apiKey, thinking, maxTokens, numCtx, temperature);
     this.workdir = config.workdir || process.cwd();
+
+    // Stop hooks (ターン終了ゲート)。設定が無ければ null で、ゲートは素通り
+    this.stopHooks = createStopHookRunner(this.workdir);
 
     // Context budget を env から計算（明示優先、未指定なら NUM_CTX から逆算）
     this.contextBudget = loadContextBudget(process.env);
@@ -890,6 +905,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
     const appSid = options?.appSessionId || channelId;
 
     const session = this.getOrCreateSession(sessionId, appSid);
+    session.lastTurnToolNames = [];
     this.resetAttachments(channelId);
     this.maybeEmitSessionStart(appSid, channelId);
     this.bumpTurnIndex(appSid);
@@ -919,7 +935,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
     });
 
     try {
-      const result = await this.executeAgentLoop(
+      let result = await this.executeAgentLoop(
         session,
         systemPrompt,
         llmTools,
@@ -929,6 +945,30 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
         options,
         appSid
       );
+
+      // ターン終了ゲート: Stop hook が block したら 1 回だけ継続ラウンド
+      // (executeAgentLoop は assistant message を内部で push するため pushRetryToHistory=false)
+      // ツール無効モード (chat) では継続ラウンドでフィードバックに対処する手段
+      // (schedule_add 等) が無いため、ゲート自体をスキップする
+      if (callFlags.tools) {
+        result = await this.applyStopHookGate(
+          session,
+          result,
+          { channelId, appSid },
+          { pushRetryToHistory: false },
+          () =>
+            this.executeAgentLoop(
+              session,
+              systemPrompt,
+              llmTools,
+              channelId,
+              sessionId,
+              abortController,
+              options,
+              appSid
+            )
+        );
+      }
 
       this.trimSession(session, appSid, channelId);
       session.updatedAt = Date.now();
@@ -1018,6 +1058,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
     const appSid = options?.appSessionId || channelId;
 
     const session = this.getOrCreateSession(sessionId, appSid);
+    session.lastTurnToolNames = [];
     this.resetAttachments(channelId);
     this.maybeEmitSessionStart(appSid, channelId);
     this.bumpTurnIndex(appSid);
@@ -1042,7 +1083,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
     });
 
     try {
-      const fullText = await this.executeStreamLoop(
+      let fullText = await this.executeStreamLoop(
         session,
         systemPrompt,
         llmTools,
@@ -1055,6 +1096,31 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
       );
 
       session.messages.push({ role: 'assistant', content: fullText });
+
+      // ターン終了ゲート: Stop hook が block したら 1 回だけ継続ラウンド
+      // (executeStreamLoop は assistant message を push しないため pushRetryToHistory=true)
+      // ツール無効モード (chat) では継続ラウンドでフィードバックに対処する手段
+      // (schedule_add 等) が無いため、ゲート自体をスキップする
+      if (callFlags.tools) {
+        fullText = await this.applyStopHookGate(
+          session,
+          fullText,
+          { channelId, appSid },
+          { pushRetryToHistory: true },
+          () =>
+            this.executeStreamLoop(
+              session,
+              systemPrompt,
+              llmTools,
+              channelId,
+              sessionId,
+              abortController,
+              callbacks,
+              options,
+              appSid
+            )
+        );
+      }
 
       this.trimSession(session, appSid, channelId);
       session.updatedAt = Date.now();
@@ -1329,6 +1395,8 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
             error: errorMsg,
           };
         } else {
+          // Stop hook の tools_called 用に「実行された」ツール名を記録（キャッシュ HIT 含む）
+          (session.lastTurnToolNames ??= []).push(toolCall.name);
           // 冪等キャッシュ HIT 判定: 計算/エンコード/ハッシュ系で同 signature を
           // 2 回目以降叩こうとしたら 1 回目の結果を即返却 (exec スキップ)
           const cached = getCachedIdempotentResult(session, sig);
@@ -1412,6 +1480,75 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
     }
 
     return finalContent;
+  }
+
+  /**
+   * ターン終了ゲート: Stop hook 群を実行し、block されたらフィードバックを
+   * system message として注入して 1 回だけ継続ラウンドを回す。
+   *
+   * 設計原則:
+   * - フェイルオープン: hook 実行の異常はすべて素通り（firstText をそのまま返す）
+   * - 1 ターン 1 ナッジ: 継続ラウンドの結果は再チェックしない（block 無限ループ防止）。
+   *   hook は「強制」ではなく「確認を 1 回挟む」装置
+   * - 履歴整合: 呼び出し側が assistant(firstText) を履歴に積んだ後に呼ぶこと。
+   *   gate は system(feedback) を積み、継続ラウンド後に pushRetryToHistory に応じて
+   *   assistant(retryText) を積む（executeAgentLoop は内部で push するため false を渡す）
+   *
+   * @returns Discord 等へ返す最終テキスト（block 時は firstText + 継続ラウンドの連結）
+   */
+  private async applyStopHookGate(
+    session: Session,
+    firstText: string,
+    meta: { channelId: string; appSid: string },
+    opts: { pushRetryToHistory: boolean },
+    rerun: () => Promise<string>
+  ): Promise<string> {
+    if (!this.stopHooks) return firstText;
+
+    let verdict;
+    try {
+      verdict = await this.stopHooks.run({
+        hook_event_name: 'Stop',
+        session_id: meta.appSid,
+        cwd: this.workdir,
+        stop_hook_active: false,
+        last_assistant_message: firstText,
+        channel_id: meta.channelId,
+        tools_called: [...(session.lastTurnToolNames ?? [])],
+      });
+    } catch (err) {
+      console.warn(`[local-llm] Stop hook gate failed (fail-open): ${String(err)}`);
+      return firstText;
+    }
+    if (!verdict.block || !verdict.reason) return firstText;
+
+    console.log(`[local-llm] Stop hook blocked turn end: ${verdict.reason.slice(0, 200)}`);
+    this.trajectoryLogger.logRunnerEvent(this.trajectoryCommon(meta.appSid, meta.channelId), {
+      event: 'stop_hook_block',
+      details: { reason: verdict.reason.slice(0, 500) },
+    });
+
+    session.messages.push({
+      role: 'system',
+      content: `[STOP HOOK FEEDBACK]\n${verdict.reason}\n[END STOP HOOK FEEDBACK]\n\nA turn-end verification hook blocked this response. Address the feedback now (call the required tool or revise your statement), then give a short follow-up reply to the user.`,
+    });
+
+    let retryText: string;
+    try {
+      retryText = await rerun();
+    } catch (err) {
+      // 継続ラウンドの失敗で元の応答まで失わない（注入済み system message は履歴に残るが実害なし）
+      console.warn(`[local-llm] Stop hook continuation round failed: ${String(err)}`);
+      return firstText;
+    }
+    if (opts.pushRetryToHistory) {
+      session.messages.push({ role: 'assistant', content: retryText });
+    }
+
+    const trimmedRetry = retryText.trim();
+    if (!trimmedRetry) return firstText;
+    if (!firstText.trim()) return retryText;
+    return `${firstText}\n\n${trimmedRetry}`;
   }
 
   /**
@@ -1561,6 +1698,8 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
               error: errorMsg,
             };
           } else {
+            // Stop hook の tools_called 用に「実行された」ツール名を記録（キャッシュ HIT 含む）
+            (session.lastTurnToolNames ??= []).push(toolCall.name);
             // 冪等キャッシュ HIT 判定: 計算/エンコード/ハッシュ系で同 signature を
             // 2 回目以降叩こうとしたら 1 回目の結果を即返却 (exec スキップ)
             const cached = getCachedIdempotentResult(session, sig);
@@ -1838,6 +1977,7 @@ export class LocalLlmRunner extends EventEmitter implements AgentRunner {
               `[local-llm] Pseudo tool_call rescued: ${parsed.name}(${JSON.stringify(parsed.args).slice(0, 100)})`
             );
             const rescueStart = Date.now();
+            (session.lastTurnToolNames ??= []).push(parsed.name);
             const result = await executeTool(parsed.name, parsed.args, rescueToolContext);
             const rescueDuration = Date.now() - rescueStart;
             const rawOutput = result.success

@@ -62,13 +62,15 @@ export function initSessions(dataDir: string): void {
 
 /**
  * 起動時のセッション保持日数を環境変数から取得。
- * `XANGI_SESSION_RETENTION_DAYS=0` で剪定無効、未設定なら 90 日。
+ * 未設定なら 0（剪定しない）。`XANGI_SESSION_RETENTION_DAYS=90` のように
+ * 日数を指定したときだけ起動時に剪定する。
+ * sessions.json は 1 エントリ数百バイト程度なので、デフォルトでは全履歴を残す。
  */
 function getRetentionDays(): number {
   const raw = process.env.XANGI_SESSION_RETENTION_DAYS;
-  if (raw === undefined) return 90;
+  if (raw === undefined) return 0;
   const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 0) return 90;
+  if (!Number.isFinite(n) || n < 0) return 0;
   return n;
 }
 

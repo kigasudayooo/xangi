@@ -391,5 +391,36 @@ describe('sessions', () => {
         else process.env.XANGI_SESSION_RETENTION_DAYS = prev;
       }
     });
+
+    it('does not prune on initSessions when XANGI_SESSION_RETENTION_DAYS is unset (default: keep forever)', () => {
+      const sessionsPath = join(testDir, 'sessions.json');
+      const file = {
+        activeByContext: { ch: 'old_001' },
+        sessions: {
+          old_001: {
+            id: 'old_001',
+            title: 'old',
+            platform: 'discord',
+            contextKey: 'ch',
+            scope: 'interactive',
+            bootId: '',
+            createdAt: '2020-01-01T00:00:00Z',
+            updatedAt: '2020-01-01T00:00:00Z',
+            messageCount: 0,
+            archived: false,
+          },
+        },
+      };
+      require('fs').writeFileSync(sessionsPath, JSON.stringify(file));
+      const prev = process.env.XANGI_SESSION_RETENTION_DAYS;
+      delete process.env.XANGI_SESSION_RETENTION_DAYS;
+      try {
+        initSessions(testDir);
+        expect(getSessionEntry('old_001')).toBeDefined();
+        expect(getActiveSessionId('ch')).toBe('old_001');
+      } finally {
+        if (prev !== undefined) process.env.XANGI_SESSION_RETENTION_DAYS = prev;
+      }
+    });
   });
 });

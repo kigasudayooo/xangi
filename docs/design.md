@@ -38,7 +38,7 @@ flowchart LR
 | レイヤー | 役割 | 実装 |
 |----------|------|------|
 | Chat | ユーザーインターフェース | discord.js, @slack/bolt, http (Web Chat), @line/bot-sdk |
-| xangi | AI CLI / Local LLM の統合・制御 | index.ts, agent-runner.ts, dynamic-runner.ts |
+| xangi | AI CLI / Local LLM の統合・制御 | runner-manager.ts, dynamic-runner.ts, agent-runner.ts |
 | Backend Resolution | チャンネル別バックエンド解決 | backend-resolver.ts, settings.ts |
 | AI Backend | 実際のAI処理 | Claude Code, Codex CLI, Cursor CLI, Local LLM (Ollama / vLLM), Gemini CLI legacy |
 | Workspace | ファイル・スキル | skills/, AGENTS.md, ローカル資料 |
@@ -47,22 +47,30 @@ flowchart LR
 
 ### エントリーポイント（index.ts）
 
-メインのオーケストレーター。以下を統合：
+起動シーケンス専用の薄いエントリーポイント。担当は以下のみで、各機能の実体は個別モジュールに分離されている:
 
-- Discord / Slack / Web Chat / LINE クライアントの初期化
-- メッセージ受信とルーティング
-- AI CLIの呼び出し
-- スケジューラーの管理
-- コマンド処理（`xangi-cmd` CLIツール経由 + テキストパース）
+- 設定読み込みと検証（`config.ts` / `config-validate.ts`）
+- 有効化されたクライアントの起動分岐（Discord / Slack / Web Chat / LINE。Web オンリー構成では Discord Client を生成しない）
+- スケジューラー・各種 HTTP サーバー（tool-server / events-stream / event-trigger / approval-server 等）の起動
+- SIGTERM/SIGINT ハンドリング（`stream-finalizer.ts` の確定処理を含む graceful shutdown）
 
-### Discord 統合（index.ts 内）
+### Discord 統合（src/discord/）
 
-`discord.js` v14 ベース。専用ファイルは設けず `index.ts` 内で初期化:
+`discord.js` v14 ベース。役割別にモジュール分割されている:
 
-- メンション / DM / `AUTO_REPLY_CHANNELS` のいずれかに該当したメッセージを Runner に転送
+- `message-handler.ts` — MessageCreate/Update/Delete のハンドリングと `processPrompt`（メンション / DM / `AUTO_REPLY_CHANNELS` 判定 → Runner 転送）
+- `slash-commands.ts` — スラッシュコマンド定義と Interaction 処理
+- `scheduler-bridge.ts` — スケジューラの Discord 送信関数・エージェント実行関数の登録
+- `ui.ts` — ボタン行（Stop / 延長 / 残り時間表示）・処理中メッセージ管理
+- `tool-history.ts` — ツール履歴の整形・蓄積（`TOOL_HISTORY_MAX_LINES` で表示行数を制限）
+- `message-utils.ts` — Discord メッセージリンク展開・返信元引用・チャンネルメンション展開
+
+挙動:
+
 - per-channel セッション分離（`contextKey = discord:<channelId>`）
 - スレッド・添付ファイル・リアクション対応
-- ボタン UI（Stop / 延長 / 残り時間表示）を `message.edit` で 1 秒粒度に更新
+- ストリーミング表示は `stream-session.ts`（Slack / Web と共通コア）で思考表示・更新スロットリングを統一し、ボタン UI を `message.edit` で 1 秒粒度に更新
+- プロセス終了時（SIGTERM）は `stream-finalizer.ts` が実行中のストリーミング表示を「⏸ プロセス再起動により中断されました」へ確定させる（message-handler / scheduler-bridge 両経路で登録）
 
 ### Slack 統合（slack.ts）
 
@@ -221,6 +229,25 @@ AGENTS.md / CHARACTER.md / USER.md 等のワークスペース設定は、各AI 
 | gemini-cli.ts | Gemini CLI legacy | 互換性維持と Enterprise / Google Cloud / paid API key 用。個人向け Pro / Ultra / 無料枠前提の新規利用は非推奨 |
 | cursor-cli.ts | Cursor CLI | `cursor-agent` コマンド、JSON/stream-json、tool call表示対応 |
 | local-llm/runner.ts | Local LLM | Ollama等のローカルLLMを直接呼び出し、ツール実行・ストリーミング対応 |
+
+#### ワンショット CLI ランナー共通基盤（cli-runner-core.ts）
+
+claude-code / codex-cli / gemini-cli / cursor-cli の 4 アダプターは、抽象基底クラス
+`CliRunnerBase` の上に実装されている。基底クラスが以下を一手に引き受け、各アダプターは
+「コマンド引数の構築」と「JSONL イベントの解釈（`CliStreamParser`）」だけを実装する：
+
+- **プロセス管理**: spawn、`processManager` / `activeProcesses` への登録・解除、`cancel` / `hasRunner`
+- **タイムアウト**: `TimeoutController` 連動（UI の残り時間表示・延長）。channelId が無い
+  リクエストは controller の管理対象外になるため、固定タイマーでフォールバックする
+- **JSONL バッファリング**: chunk 境界をまたぐ行の組み立て（`jsonl-buffer.ts`）と、
+  プロセス終了後の残バッファ flush
+- **exit エラー構築**: 「CLI の error イベント本文 > stderr > exit code のみ」の優先順位で、
+  利用上限到達などの本当の理由を握り潰さずユーザーに見せる（全アダプター共通）
+- **エラー通知の一元化**: `callbacks.onError` の呼び出しは基底クラスが一元管理。
+  セッション resume 失敗 → 新規セッションでリトライする一次試行では `notifyOnError: false`
+  で誤エラー通知を抑制する
+- **stale session 自動回復**: 無効になった sessionId での resume 失敗を検出し、
+  新規セッションで 1 回だけ自動リトライする（claude-code / codex / gemini / cursor の全ランナー）
 
 #### Local LLMアダプターの詳細設計
 
@@ -477,6 +504,18 @@ API: `recordToolCallAndDetectLoop(session, sig)` が `{ kind: 'none' \| 'exact' 
 - `already_executed`: 同一シグネチャが冪等キャッシュ HIT / loop 検出 (再実行禁止)
 - `unparseable_pseudo_call`: drift 検出されたが parse 失敗 (malformed args / 不明形式)
 
+#### ワークスペース hooks (Stop hook ゲート)
+
+多段防御が「ツール呼び出しの形」を守る層なのに対し、hooks は「応答の中身とツール実行の整合」を検証する層。ターン終了時に外部プロセス (hook) へ最終応答テキストと実行済みツール一覧を渡し、block が返ったらフィードバックを system message として注入して 1 回だけ継続ラウンドを回す。
+
+- 契約は Claude Code / Codex CLI の Stop hook と互換 (stdin JSON、exit 0 + `{"decision":"block","reason":"..."}` または exit 2 + stderr)。同じ hook スクリプトをランタイム間で共用できる
+- xangi 拡張として `tools_called` (このターンで実際に実行されたツール名リスト、実行順) を payload に含める。ハーネス自身がツール実行を把握しているため、hook 側で transcript を parse する必要がない
+- フェイルオープン: hook 側の異常 (タイムアウト / 不正出力 / spawn 失敗 / 設定ファイル破損) はすべて素通り。ガードが本体応答を wedge しない
+- モード連動: ツール無効モード (chat) ではゲート自体をスキップする。継続ラウンドでフィードバックに対処する手段が無い状態で block すると、LLM が擬似 tool_call テキストで対処しようとして応答品質が落ちるため (実機観察)
+- 1 ターン 1 ナッジ: 継続ラウンドの結果は再チェックしない。hook は「強制」ではなく「ターン終了前に確認を 1 回挟む」装置
+- 実装: `src/hooks.ts` (設定ロード + `StopHookRunner`)、`LocalLlmRunner.applyStopHookGate()` (`run` / `runStream` 両経路に配線)。発火は tool trajectory に `stop_hook_block` イベントで記録される
+- 履歴整合: block 時は `assistant(元応答)` → `system(feedback)` → `assistant(継続応答)` の順にセッション履歴へ積まれ、次ターン以降の文脈でも「何が起きたか」が追える
+
 #### Observability: tool trajectory
 
 多段防御の発火タイミング・tool_search 採用結果・drift 救済の安全判定を後で分析できるよう、`src/tool-trajectory/` で観測ロガーを別経路で構造化記録する。既存 `transcript-logger` (`logs/sessions/`) には触らず、`logs/tool-trajectory/<appSessionId>.jsonl` に 1 line = 1 event の jsonl を append する。
@@ -526,6 +565,10 @@ env で OFF (`XANGI_TOOL_TRAJECTORY_LOG=false`) にすればロガーは完全 n
 - サーバーのシステムタイムゾーン（`TZ` 環境変数）に従う
 - Docker環境では `TZ=Asia/Tokyo` 等を設定推奨
 
+**実行の堅牢化:**
+- 再発火ガード: 前回の実行が走っている間に同じスケジュールの cron が発火した場合はスキップ（長時間ジョブの重複実行・多重投稿防止）
+- 一時的なネットワークエラー（DNS 一時失敗・接続タイムアウト等）はバックオフ後に 1 回だけ自動リトライ。エージェント側のタイムアウトや利用上限はリトライしない
+
 ### Tool Server（tool-server.ts）
 
 AI CLIが xangi の機能（Discord操作・スケジュール・システム）を安全に呼び出すための HTTP API サーバー。
@@ -539,7 +582,7 @@ AI CLI（Claude Code等）
 ```
 
 **ポート管理:**
-- ポート0でバインド（OS自動割り当て、複数インスタンスでも競合なし）
+- 前回使用ポートを dataDir に保存して再起動時に再利用（resume されたセッションの古い `XANGI_TOOL_SERVER` 参照を生かす）。使用中なら OS 自動割り当てにフォールバック、`XANGI_TOOL_SERVER_PORT` で固定も可能
 - 起動したURLを `XANGI_TOOL_SERVER` として子プロセスへ注入
 - `xangi-cmd` は `XANGI_TOOL_SERVER` を使って接続
 - 現在のチャンネルIDなどの実行文脈は HTTP リクエストの `context` に載せて tool-server へ渡す
@@ -548,6 +591,29 @@ AI CLI（Claude Code等）
 - DISCORD_TOKEN 等のシークレットは xangi プロセス内のみ
 - AI CLI には `safe-env.ts` のホワイトリストで安全な環境変数のみ渡す
 - GitHub App秘密鍵は起動時にメモリに読み込み、トークン生成は tool-server の `/github-token` エンドポイント経由（短寿命トークンのみ取得可能）
+
+### イベントトリガー（event-trigger.ts）
+
+外部イベント（ビルド完了・CI 結果・新着検知など）からエージェントターンを起動する機構。エージェントターンの起動契機は従来「プラットフォームからのメッセージ受信」と「スケジューラの時刻発火」の 2 つだったが、これに「外部イベント」を加える。
+
+```
+外部プロセス（ビルドスクリプト / CI / 監視 cron）
+  → HTTP POST /api/trigger（Bearer トークン認証）
+  → EventTrigger（検証・レート制限）
+  → scheduler に登録済みの agentRunner(prompt, channelId)
+  → エージェントターン実行 → チャンネルに結果投稿
+```
+
+**設計判断:**
+- ターン実行は scheduler の `agentRunner` 経路を再利用する。プラットフォームごとの投稿処理（thinking メッセージ・分割・添付）を持つ実行関数が既に scheduler に登録されているため、トリガー側は `Scheduler.getAgentRunner(platform)` で取得して呼ぶだけでよい
+- HTTP 応答（`202` + `triggerId`）はターン完了を待たない fire-and-forget。呼び出し側（ビルドスクリプト等）をブロックしない
+- 発火時に `⚡ trigger: <source>` ラベルをチャンネルへ先行投稿し、何が起動したか可視化する
+
+**セキュリティ:**
+- `TRIGGER_ENABLED`（デフォルト false）の明示 opt-in
+- HTTP 経由は `XANGI_TRIGGER_TOKEN` の Bearer 認証必須。トークン未設定時は有効化されていても全拒否（tool-server は 0.0.0.0 bind のため、無認証受け付けはネットワーク越しの任意プロンプト注入になる）。トークン比較は定数時間比較
+- `xangi-cmd trigger`（`/api/execute` 経由）はローカルコマンドの既存の信頼境界に従いトークン検証を省略するが、opt-in は同様に要求
+- 暴走防止: source 単位のレート制限（`TRIGGER_MIN_INTERVAL_MS`、デフォルト 10 秒、超過 `429`）と同時実行ガード（同一 source 実行中は `409`）。メッセージ長上限 4000 文字
 
 ### 承認フロー（approval.ts / approval-server.ts）
 
@@ -813,10 +879,25 @@ bin/
 └── xangi-cmd           # CLIラッパー（シェルスクリプト、tool-serverに中継）
 
 src/
-├── index.ts            # エントリーポイント、Discord統合
+├── index.ts            # エントリーポイント（起動シーケンス）
+├── stream-session.ts   # ストリーミング表示の共通コア（思考表示/更新スロットリング、Discord/Slack/Web で使用）
+├── stream-finalizer.ts # プロセス終了時に実行中ストリーミング表示を「中断」表示で確定させる registry
+├── message-split.ts    # 文字数上限に合わせたテキスト分割
+├── discord/            # Discord統合
+│   ├── ui.ts               # ボタン行・タイムアウトUI・処理中メッセージ管理
+│   ├── tool-history.ts     # ツール履歴の整形・蓄積（TOOL_HISTORY_MAX_LINES で表示制限）
+│   ├── message-utils.ts    # リンク展開・返信元引用・チャンネルメンション展開
+│   ├── message-handler.ts  # MessageCreate/Update/Delete + processPrompt
+│   ├── slash-commands.ts   # スラッシュコマンド定義・Interaction処理
+│   └── scheduler-bridge.ts # スケジューラのDiscord送信・実行関数登録
 ├── slack.ts            # Slack統合
+├── line.ts             # LINE Bot統合（Webhook + 署名検証）
+├── web-chat.ts         # WebチャットUI（HTTPサーバー）
 ├── agent-runner.ts     # AI CLIインターフェース
 ├── base-runner.ts      # システムプロンプト生成
+├── bubble-events-runner.ts # Runner実行を応答ライフサイクルイベント発火付きでラップ
+├── runtime-context.ts  # 毎ターン注入する [runtime] コンテキスト行（cwd / repo@branch）生成
+├── cli-runner-core.ts  # ワンショットCLIランナー共通基盤（CliRunnerBase）
 ├── claude-code.ts      # Claude Codeアダプター（per-request）
 ├── persistent-runner.ts # Claude Codeアダプター（常駐プロセス）
 ├── codex-cli.ts        # Codex CLIアダプター
@@ -824,21 +905,38 @@ src/
 ├── cursor-cli.ts       # Cursor CLIアダプター
 ├── cli-process.ts      # 単発CLI runnerのprocess/env/timeout共通部品
 ├── jsonl-buffer.ts     # JSONL streamの行分割共通部品
-├── web-chat.ts         # WebチャットUI（HTTPサーバー）
+├── runner-manager.ts   # 複数チャンネル同時処理（RunnerManager）
+├── dynamic-runner.ts   # 動的ランナーマネージャー
+├── backend-resolver.ts # チャンネル別バックエンド解決
+├── hooks.ts            # ワークスペースhooks（Stop hook 外部検証ゲート）
 ├── tool-server.ts      # Tool Server（AI CLI向けHTTP API）
+├── event-trigger.ts    # イベントトリガー（POST /api/trigger で外部からターン起動）
+├── events-emitter.ts   # 応答ライフサイクルイベントの event bus
+├── events-stream-server.ts # Pull型SSE配信（GET /api/events/stream、web-chatに相乗り）
+├── pet-inbox-server.ts # xangi-pets からのテキスト送信受付（POST /api/pet/inbox）
+├── even-terminal-server.ts # Even Terminal 互換 HTTP API
 ├── approval.ts         # 危険コマンド検知（パターンマッチ）
 ├── approval-server.ts  # 承認サーバー（Discord/Slack対話的承認フロー）
 ├── github-auth.ts      # GitHub App認証（秘密鍵メモリ管理・トークン生成）
-├── backend-resolver.ts # チャンネル別バックエンド解決
-├── dynamic-runner.ts   # 動的ランナーマネージャー
 ├── safe-env.ts         # 環境変数ホワイトリスト
+├── env-persist.ts      # .env パス解決と動的書き戻し（XANGI_ENV_PATH）
+├── errors.ts           # エラー分類（クライアント入力起因 → HTTP 400 等）
+├── restart-note.ts     # プロセス再起動アーティファクトの注記注入
+├── session-title.ts    # セッションタイトル導出
+├── tool-call-sanitize.ts # 表示テキストに漏れたツールコール構文の除去
+├── access-urls.ts      # 起動時に表示する Web UI アクセスURL解決
 ├── constants.ts        # アプリケーション定数
 ├── schedule-cli.ts     # スケジューラCLI（レガシー、tool-server移行済み）
 ├── cli/                # CLIモジュール（tool-serverから呼ばれる）
 │   ├── discord-api.ts  #   Discord REST API直叩き
 │   ├── schedule-cmd.ts #   スケジュール操作
 │   ├── system-cmd.ts   #   システム操作
+│   ├── slack-history-cmd.ts    # Slack履歴取得
+│   ├── web-history-cmd.ts      # Web Chat履歴取得
+│   ├── inter-chat-cmd.ts       # インスタンス間チャット操作
+│   ├── terminal-session-cmd.ts # ターミナルセッション操作
 │   └── xangi-cmd.ts    #   Node.js版CLIエントリーポイント
+├── inter-instance-chat/ # インスタンス間チャット（per-instance jsonl / auto-talk / 履歴ビューア）
 ├── local-llm/          # Local LLMアダプター
 │   ├── runner.ts       #   メインランナー（セッション管理・ツール実行ループ）
 │   ├── llm-client.ts   #   LLM APIクライアント（Ollama native + OpenAI互換）
@@ -847,7 +945,9 @@ src/
 │   ├── xangi-tools.ts  #   xangi専用ツール（function calling版）
 │   ├── image-utils.ts  #   画像処理ユーティリティ（マルチモーダル対応）
 │   ├── triggers.ts     #   トリガー機能（chatモードのマジックワード検出・実行）
+│   ├── pseudo-toolcall.ts #  擬似tool_callテキストの解析・救済（rescue allowlist）
 │   └── types.ts        #   型定義
+├── tool-trajectory/    # ツール実行軌跡の観測ログ（logs/tool-trajectory/*.jsonl）
 ├── prompts/            # プロンプト定義
 │   ├── index.ts                   # エクスポート集約
 │   ├── xangi-commands.ts          # プラットフォーム別組み立て
@@ -856,6 +956,7 @@ src/
 │   ├── xangi-commands-discord.ts  # Discord専用（xangi-cmd discord_*）
 │   ├── xangi-commands-slack.ts    # Slack専用
 │   ├── xangi-commands-web.ts      # Web専用
+│   ├── xangi-commands-line.ts     # LINE専用
 │   ├── chat-system-persistent.ts  # 常駐プロセス用システムプロンプト
 │   ├── chat-system-resume.ts      # セッション再開用システムプロンプト
 │   ├── platform-labels.ts         # プラットフォーム表示名
@@ -863,11 +964,11 @@ src/
 ├── scheduler.ts        # スケジューラー
 ├── skills.ts           # スキルローダー
 ├── config.ts           # 設定読み込み
+├── config-validate.ts  # 環境変数の検証層（警告+フォールバック、XANGI_CONFIG_STRICT で起動中断）
 ├── settings.ts         # ランタイム設定
 ├── sessions.ts         # セッション管理
 ├── file-utils.ts       # ファイル操作ユーティリティ
 ├── process-manager.ts  # プロセス管理
-├── runner-manager.ts   # 複数チャンネル同時処理（RunnerManager）
 ├── timeout-controller.ts # チャンネル別タイムアウト管理（start/clear/extend を共通化）
 └── transcript-logger.ts # セッション単位トランスクリプトログ
 ```

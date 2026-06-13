@@ -129,21 +129,30 @@ export class RunnerManager extends EventEmitter implements AgentRunner {
     let oldestChannel: string | null = null;
     let oldestTime = Infinity;
 
+    // 処理中のランナーを evict すると実行中のターンが中断されるため、
+    // busy でないものから選ぶ。全部 busy なら evict せずプールを一時的に
+    // 上限超過させる (次回の cleanup / eviction で回収される)
     for (const [channelId, entry] of this.pool.entries()) {
+      if (entry.runner.isBusy()) continue;
       if (entry.lastUsed < oldestTime) {
         oldestTime = entry.lastUsed;
         oldestChannel = channelId;
       }
     }
 
-    if (oldestChannel) {
-      const entry = this.pool.get(oldestChannel)!;
-      console.log(
-        `[runner-manager] Evicting LRU runner for channel ${oldestChannel} (idle ${Math.round((Date.now() - entry.lastUsed) / 1000)}s)`
+    if (!oldestChannel) {
+      console.warn(
+        `[runner-manager] All ${this.pool.size} runners are busy; skipping LRU eviction (pool may temporarily exceed ${this.maxProcesses})`
       );
-      entry.runner.shutdown();
-      this.pool.delete(oldestChannel);
+      return;
     }
+
+    const entry = this.pool.get(oldestChannel)!;
+    console.log(
+      `[runner-manager] Evicting LRU runner for channel ${oldestChannel} (idle ${Math.round((Date.now() - entry.lastUsed) / 1000)}s)`
+    );
+    entry.runner.shutdown();
+    this.pool.delete(oldestChannel);
   }
 
   /**
@@ -155,6 +164,13 @@ export class RunnerManager extends EventEmitter implements AgentRunner {
 
     for (const [channelId, entry] of this.pool.entries()) {
       if (now - entry.lastUsed > this.idleTimeoutMs) {
+        // lastUsed はリクエスト開始時刻のため、idleTimeoutMs を超える長時間
+        // ターンの最中でも「アイドル」に見える。実行中のランナーを shutdown
+        // するとターンが中断されるので、busy なら lastUsed を更新して見送る
+        if (entry.runner.isBusy()) {
+          entry.lastUsed = now;
+          continue;
+        }
         toRemove.push(channelId);
       }
     }

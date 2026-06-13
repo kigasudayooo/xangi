@@ -8,14 +8,12 @@ Claude Code / Codex / Cursor CLI / Local LLM（Gemini CLI は legacy/API-key 用
 
 ## Features
 
-- マルチバックエンド対応（Claude Code / Codex / Cursor CLI / Local LLM、Gemini CLI は legacy/API-key 用）
-- `/backend` コマンドでチャンネルごとにバックエンド・モデル・effortを動的切り替え
-- Local LLM対応（Ollama/vLLM等、エージェントモード/チャットモード切替可能）
 - Discord / Slack / Web Chat UI / LINE 対応
-- Docker対応
-- スキルシステム
-- スケジューラー（cron / 単発 / 起動時タスク）
-- セッション永続化
+- Claude Code / Codex / Cursor CLI / Local LLM 対応
+- `/backend` でチャンネルごとに backend / model / effort を切り替え
+- スキル、スケジューラー、イベントトリガー
+- Docker、pm2、自動再起動対応
+- セッション永続化、タイムアウト延長、ワークスペース hooks
 
 ## アーキテクチャ
 
@@ -79,7 +77,7 @@ npm start
 npm run dev
 ```
 
-Gemini CLI backend は互換性維持と Enterprise / Google Cloud / paid API key 用に残しています。Google AI Pro / Ultra / 無料の Gemini Code Assist for individuals 前提の利用は 2026-06-18 にリクエスト提供が停止されるため、新規セットアップでは Claude Code / Codex / Cursor CLI / Local LLM を推奨します。
+Gemini CLI backend は legacy/API-key 用です。新規セットアップでは Claude Code / Codex / Cursor CLI / Local LLM を推奨します。
 
 ### 3. 動作確認
 
@@ -128,8 +126,10 @@ pm2 logs xangi     # ログ確認
 | `/new` | 新しいセッションを開始 |
 | `/stop` | 実行中のタスクを停止 |
 | `/settings` | 現在の設定を表示 |
+| `/backend` | チャンネルごとのバックエンド・モデル切り替え |
 | `xangi-cmd schedule_*` | スケジューラー（定期実行・リマインダー） |
 | `xangi-cmd discord_*` | Discord操作（履歴取得・メッセージ送信・検索等） |
+| `xangi-cmd trigger` | イベントトリガー（処理完了時にエージェントターンを起動） |
 
 応答メッセージにはボタン（Stop / New Session）が表示されます。`DISCORD_SHOW_BUTTONS=false` で非表示。
 
@@ -171,6 +171,10 @@ docker compose up xangi-gpu -d --build
 
 スキル（メモ管理・日記・音声文字起こし・Notion連携など）がプリセットされたスターターキットです。xangi と組み合わせることで、チャットからスキルを呼び出して日常タスクを自動化できます。
 
+## 関連プロジェクト
+
+- [xangi-stackchan](https://github.com/karaage0703/xangi-stackchan) - xangi の応答をスタックチャン（M5Stack）に喋らせる・表情/首振り連動させる常駐ブリッジ。[外部イベントストリーム](docs/events.md)の SSE を購読して動作
+
 ## 書籍
 
 📖 [生活に溶け込むAI — AIエージェントで作る、自分だけのアシスタント](https://karaage0703.booth.pm/items/8027277)
@@ -185,6 +189,7 @@ xangi を使ったAIアシスタント構築のノウハウをまとめた書籍
 - [LINE セットアップ](docs/line-setup.md) - LINE Messaging API 連携 (Tailscale Funnel での外部公開含む)
 - [設計ドキュメント](docs/design.md) - アーキテクチャ・設計思想・データフロー
 - [外部イベントストリーム](docs/events.md) - 応答ライフサイクルのイベント配信仕様
+- [インスタンス間チャット](docs/inter-instance-chat.md) - 複数インスタンス間のメッセージ交換・auto-talk
 
 ## Acknowledgments
 

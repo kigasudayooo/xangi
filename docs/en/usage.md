@@ -12,11 +12,16 @@ Detailed usage guide for xangi.
 - [Session Management](#session-management)
 - [Scheduler](#scheduler)
 - [Discord Operations (xangi-cmd)](#discord-operations-xangi-cmd)
+- [Event Trigger](#event-trigger)
 - [Runtime Settings](#runtime-settings)
 - [Autonomous AI Operations](#autonomous-ai-operations)
 - [Standalone Mode](#standalone-mode)
 - [Docker Deployment](#docker-deployment)
 - [Local LLM](#local-llm)
+- [Workspace Hooks (Stop Hook)](#workspace-hooks-stop-hook)
+- [Tool Trajectory Logger](#tool-trajectory-logger)
+- [Security](#security)
+- [Environment Variables Reference](#environment-variables-reference)
 - [Running Multiple Instances](#running-multiple-instances)
 - [Session Retention](#session-retention)
 - [Options](#options)
@@ -85,15 +90,15 @@ Set `DISCORD_SHOW_BUTTONS=false` to hide buttons.
 ### Dynamic Timeout Extension
 
 Long-running tasks (code generation, deep research, etc.) can be extended via
-the `延長` button before the initial timeout (`TIMEOUT_MS`, default 5 minutes)
+the `延長` button before the initial timeout (`TIMEOUT_MS`, default 30 minutes)
 fires. The button **doubles the remaining time** at the moment of the click.
 
-- Initial timeout: `TIMEOUT_MS` (default 5 minutes)
+- Initial timeout: `TIMEOUT_MS` (default 30 minutes)
 - Extension behavior: adds the current remaining time to the deadline → remaining time becomes **2x**
   - e.g. 3 min remaining → click → 6 min remaining
   - e.g. 30 sec remaining → click → 1 min remaining (last-resort recovery)
-- Absolute cap: `TIMEOUT_MAX_MS` (default 3600000ms = 1 hour)
-  - Increase it (e.g. `TIMEOUT_MAX_MS=21600000` = 6h) for jobs that need to run for hours
+- Absolute cap: `TIMEOUT_MAX_MS` (default 36000000ms = 10 hours)
+  - Adjust it via `TIMEOUT_MAX_MS` to allow longer runs or enforce a tighter cap (e.g. `TIMEOUT_MAX_MS=3600000` = 1h)
 - On/off: `TIMEOUT_EXTEND_ENABLED` (default `true`)
   - When `false`, the `延長` button is hidden and `extendTimeout` API returns `unsupported`
 - UI:
@@ -245,6 +250,57 @@ xangi-cmd discord_delete --channel 1234567890 --message-id 111222333
 - xangi injects `XANGI_TOOL_SERVER` into child processes at startup
 - `xangi-cmd` uses `XANGI_TOOL_SERVER` to resolve the connection endpoint
 - Runtime context such as the current channel ID is passed to the tool-server as `context`
+
+## Event Trigger
+
+You can start an agent turn from an external event (build finished, CI result, new content detected, etc.). This replaces polling (periodic schedule checks) with push (wake only when something happened), improving responsiveness and eliminating wasted turns.
+
+### Enabling
+
+Add the following to `.env` (disabled by default):
+
+```bash
+TRIGGER_ENABLED=true
+XANGI_TRIGGER_TOKEN=<long random string>   # e.g. openssl rand -hex 32
+# TRIGGER_MIN_INTERVAL_MS=10000            # minimum interval per source (default: 10s)
+```
+
+The token is mandatory. If `XANGI_TRIGGER_TOKEN` is not set, all HTTP requests are rejected even with `TRIGGER_ENABLED=true` (the tool-server is exposed on the network, so accepting unauthenticated requests would allow arbitrary prompt injection).
+
+### Firing via HTTP
+
+```bash
+curl -X POST "$XANGI_TOOL_SERVER/api/trigger" \
+  -H "Authorization: Bearer $XANGI_TRIGGER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "channel": "<channel ID>",
+    "message": "docker build finished. Check the result and report.",
+    "source": "docker-build"
+  }'
+```
+
+- `channel` (required): channel ID where the turn runs and results are posted
+- `message` (required): instruction for the agent (max 4000 chars)
+- `source` (optional): identifier of the event origin (alphanumerics plus `_.:-`, max 64 chars). Used as the display label and the rate-limit key
+- `platform` (optional): `discord` (default) or `slack`
+
+On success it returns `202 { "ok": true, "triggerId": "trg_..." }` immediately (it does not wait for the turn to finish). A `⚡ trigger: <source>` label is posted to the channel, followed by the agent's response.
+
+### Firing via xangi-cmd
+
+Local scripts can also fire a trigger via `xangi-cmd` (no token needed; `TRIGGER_ENABLED=true` is still required):
+
+```bash
+xangi-cmd trigger --channel <channel ID> --message "Build finished. Report the result." --source build
+```
+
+When `TRIGGER_ENABLED=true`, this usage is also injected into the agent's own system prompt (XANGI_COMMANDS), so the agent can proactively use the "fire a trigger to wake itself when done" pattern for long-running `nohup` jobs.
+
+### Abuse protection
+
+- Repeated fires from the same `source` within `TRIGGER_MIN_INTERVAL_MS` (default 10s) are rejected (`429`)
+- While a turn for the same `source` is running, new fires are rejected (`409`)
 
 ## Runtime Settings
 
@@ -733,6 +789,87 @@ The Local LLM backend maintains sessions (conversation history) per channel. Whe
 
 Other models available via Ollama/vLLM are also supported.
 
+## Workspace Hooks (Stop Hook)
+
+A mechanism that inserts an external verification process (hook) at the end of each agent-loop turn. The contract is compatible with the Stop hooks of Claude Code / Codex CLI, so the same hook script can be shared across runtimes. Currently only the turn end (`Stop` event) of the Local LLM backend is supported.
+
+Example use case: block a response that promises "I'll check and report later" without actually calling the schedule registration tool, and feed back a reminder to register (preventing run-and-forget).
+
+### Configuration
+
+Hooks are enabled by default. Just place `hooks/hooks.json` in your workspace and it works (no-op if absent) — the same "place it and it works" convention as skills / triggers.
+
+```bash
+# Only if you want to temporarily disable hooks (kill switch)
+# XANGI_HOOKS_ENABLED=false
+# Only if you want to relocate the config file (default: <workspace>/hooks/hooks.json)
+# XANGI_HOOKS_FILE=/path/to/hooks.json
+```
+
+Place `hooks/hooks.json` in your workspace:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      { "command": "python3 hooks/check-promise/hook.py", "timeoutMs": 10000 }
+    ]
+  }
+}
+```
+
+### Hook Contract (Claude Code Compatible)
+
+The hook is executed as a command at turn end (cwd = workspace) and receives JSON on stdin:
+
+```json
+{
+  "hook_event_name": "Stop",
+  "session_id": "...",
+  "cwd": "/path/to/workspace",
+  "stop_hook_active": false,
+  "last_assistant_message": "(final response text of this turn)",
+  "channel_id": "...",
+  "tools_called": ["exec", "schedule_add"]
+}
+```
+
+`channel_id` / `tools_called` are xangi extensions. The hook can directly check "which tools were actually executed this turn" without parsing a transcript.
+
+Ways to block (either works):
+
+- exit 0 + stdout `{"decision": "block", "reason": "..."}` (reason required)
+- exit 2 + reason text on stderr
+
+Anything else (no output / non-JSON / other exit codes / timeout / spawn failure) passes through (fail-open). Hook failures never stall the main response.
+
+### What Happens When Blocked
+
+1. The hook's reason is injected into the LLM as a system message tagged `[STOP HOOK FEEDBACK]`
+2. One (and only one) continuation round runs in the same session (tool calls allowed — e.g. the model can call `schedule_add` here to make its promise real)
+3. The final response returned to the user is the original response concatenated with the continuation round's response
+4. The continuation round's result is not re-checked (one nudge per turn, preventing block loops)
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `XANGI_HOOKS_ENABLED` | `true` | Set `false` to disable the hooks mechanism (kill switch) |
+| `XANGI_HOOKS_FILE` | `<workspace>/hooks/hooks.json` | Path to the hooks config file |
+
+### Enabling / Disabling
+
+- Global: `XANGI_HOOKS_ENABLED` (default `true`; set `false` as a kill switch to pause hooks while keeping `hooks.json` in place)
+- Mode-linked: in tool-disabled mode (`chat`), the gate itself is skipped automatically, because the LLM has no means (tool calls such as `schedule_add`) to act on the feedback in the continuation round
+- Per channel: switching a channel to `chat` via `CHANNEL_OVERRIDES`' `localLlmMode` or `/llmmode` disables hooks for that channel only
+
+### Limitations
+
+- Only the `Stop` event is supported (`PreToolUse` etc. are future extensions)
+- Only the `local-llm` backend is supported. For the `claude-code` / `codex` backends, use each CLI's own hooks mechanism (Claude Code's `.claude/settings.json` / Codex's lifecycle hooks)
+- Multiple hooks run sequentially in registration order; the first block wins
+- Hook stdout/stderr capture is limited to 64KB; timeout defaults to 10s with a 60s cap
+
 ## Tool Trajectory Logger
 
 Structured observability log of Local LLM tool usage (drift / loop / tool_search adoption mistakes). Runs independently from the existing `transcript-logger` (conversation source of truth) and is fully isolated from session restore.
@@ -823,6 +960,7 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `DISCORD_TOOL_HISTORY_MODE` | Tool-use history display (`button` / `inline` / `off`) | `button` |
 | `DISCORD_SHOW_TOOL_BUTTON` | Show the Tools button in `button` mode | `true` |
 | `DISCORD_SHOW_LIVE_TOOL_USE` | Show raw tool history while running | `true` |
+| `TOOL_HISTORY_MAX_LINES` | Max tool history lines shown (older lines collapse into a `… (+N 件省略)` summary line; `0` or less for unlimited) | `10` |
 | `DISCORD_SHOW_TOOL_USE` | Compatibility setting. `false` maps to `off`, `true` maps to `inline` | - |
 | `ALLOW_AUTOREPLY_COMMAND` | Enable `/autoreply` command | `true` |
 | `RESPOND_TO_BOTS` | Whitelist of bot IDs to respond to (`*` for all bots) | - |
@@ -842,8 +980,10 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `WORKSPACE_PATH` | Working directory (local execution) | `./workspace` |
 | `XANGI_WORKSPACE` | Host-side workspace path (Docker execution) | `./workspace` |
 | `SKIP_PERMISSIONS` | Skip permissions by default (avoids deadlocks for non-interactive chat platforms) | `true` |
-| `TIMEOUT_MS` | Initial request timeout (milliseconds) | `300000` |
-| `TIMEOUT_MAX_MS` | Absolute upper limit for timeout extension (milliseconds) | `3600000` |
+| `TIMEOUT_MS` | Initial request timeout (milliseconds) | `1800000` |
+| `XANGI_TOOL_SERVER_PORT` | Fixed port for the internal tool server. When unset, the previous port is reused (auto-assign if busy) | reuse last port |
+| `XANGI_CONFIG_STRICT` | Escalate invalid env values (non-numeric, out of range, enum typos) to startup errors. Default is warn + fall back to defaults | `false` |
+| `TIMEOUT_MAX_MS` | Absolute upper limit for timeout extension (milliseconds) | `36000000` |
 | `TIMEOUT_EXTEND_ENABLED` | Enable / disable the `延長` button | `true` |
 | `ALLOWED_BACKENDS` | Allowed backends for `/backend` switching (comma-separated) | - |
 | `ALLOWED_MODELS` | Allowed models for `/backend` switching (comma-separated) | - |
@@ -856,6 +996,13 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `IDLE_TIMEOUT_MS` | Auto-terminate idle processes after | `1800000` |
 | `DATA_DIR` | Data storage directory (schedules, sessions, etc.) | `WORKSPACE_PATH/.xangi` |
 | `GH_TOKEN` | GitHub CLI token | - |
+
+### Workspace Hooks
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `XANGI_HOOKS_ENABLED` | Run Stop hooks at turn end (see [Workspace Hooks](#workspace-hooks-stop-hook)). `false` is a kill switch | `true` |
+| `XANGI_HOOKS_FILE` | Path to the hooks config file | `<workspace>/hooks/hooks.json` |
 
 ### Tool Approval
 
@@ -1018,16 +1165,16 @@ The lock heartbeat updates the mtime every 30 seconds. Locks that haven't been u
 
 ## Session Retention
 
-To prevent `sessions.json` from growing unbounded, **stale sessions are automatically pruned at startup**.
+By default, **all session history is kept** (each `sessions.json` entry is only a few hundred bytes, so long-term growth is negligible).
 
-- Default retention: **90 days** (based on `updatedAt`)
-- Configurable via the `XANGI_SESSION_RETENTION_DAYS` environment variable
-- Set to `0` to disable pruning
+If you want to clean up old sessions, set `XANGI_SESSION_RETENTION_DAYS` to a number of days; sessions older than that (based on `updatedAt`) are pruned at startup.
 
 ```bash
-XANGI_SESSION_RETENTION_DAYS=180   # keep half a year
-XANGI_SESSION_RETENTION_DAYS=0     # never prune
+XANGI_SESSION_RETENTION_DAYS=90    # prune sessions older than 90 days at startup
+XANGI_SESSION_RETENTION_DAYS=0     # never prune (same as default)
 ```
+
+Note: conversation transcripts (`logs/sessions/`) and tool trajectory logs (`logs/tool-trajectory/`, managed separately via `TOOL_TRAJECTORY_LOG_RETENTION_DAYS`) are not affected by this setting.
 
 ## Options
 

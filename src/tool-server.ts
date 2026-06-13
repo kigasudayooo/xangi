@@ -9,14 +9,18 @@
  * xangi-cmdを使う子プロセスへ渡す。
  */
 import { createServer, type Server } from 'http';
+import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { join, dirname } from 'path';
 import { discordApi } from './cli/discord-api.js';
 import { scheduleCmd } from './cli/schedule-cmd.js';
 import { systemCmd } from './cli/system-cmd.js';
 import { webHistoryCmd } from './cli/web-history-cmd.js';
 import { isGitHubAppEnabled, generateInstallationToken } from './github-auth.js';
 import { ValidationError } from './errors.js';
+import type { EventTrigger, TriggerRequestBody } from './event-trigger.js';
 
 let server: Server | null = null;
+let eventTrigger: EventTrigger | null = null;
 
 interface ToolRequest {
   command: string;
@@ -29,14 +33,18 @@ interface ToolRequest {
 /**
  * リクエストボディをパース
  */
-async function parseBody(req: import('http').IncomingMessage): Promise<ToolRequest> {
+async function parseJsonBody<T>(req: import('http').IncomingMessage): Promise<T> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
     chunks.push(chunk as Buffer);
   }
   const raw = Buffer.concat(chunks).toString();
   if (!raw) throw new Error('Empty request body');
-  return JSON.parse(raw) as ToolRequest;
+  return JSON.parse(raw) as T;
+}
+
+async function parseBody(req: import('http').IncomingMessage): Promise<ToolRequest> {
+  return parseJsonBody<ToolRequest>(req);
 }
 
 /**
@@ -53,6 +61,21 @@ async function executeCommand(
     return scheduleCmd(command, flags);
   } else if (command.startsWith('system_')) {
     return systemCmd(command, flags);
+  } else if (command === 'trigger') {
+    if (!eventTrigger) {
+      throw new ValidationError('Trigger is not available on this instance');
+    }
+    const body: TriggerRequestBody = {
+      channel: flags.channel ?? context?.channelId,
+      message: flags.message,
+      source: flags.source,
+      platform: flags.platform,
+    };
+    const result = await eventTrigger.handleLocal(body);
+    if (result.status >= 400) {
+      throw new ValidationError(String(result.body.error ?? 'Trigger failed'));
+    }
+    return `✅ トリガーを発火しました (id: ${result.body.triggerId}, source: ${result.body.source})`;
   } else if (command === 'web_history') {
     // 現ペイン解決のために context.channelId を env で渡す
     // (`web-chat:<appSessionId>` 形式)
@@ -74,10 +97,59 @@ async function executeCommand(
   }
 }
 
+/** 前回使用ポートの保存先 (dataDir/tool-server-port) */
+function toolServerPortFile(): string {
+  const workdir = process.env.WORKSPACE_PATH || process.cwd();
+  const dataDir = process.env.DATA_DIR || join(workdir, '.xangi');
+  return join(dataDir, 'tool-server-port');
+}
+
 /**
- * Tool Serverを起動（ポート自動割り当て）
+ * 起動時に使うポートを決める。
+ * 1. XANGI_TOOL_SERVER_PORT 環境変数（固定ポート運用）
+ * 2. 前回起動時に使ったポート（dataDir に保存）
+ * 3. どちらも無ければ 0 = OS 自動割り当て
+ *
+ * 再起動でポートが変わると、resume されたエージェントセッションが
+ * 古い XANGI_TOOL_SERVER を参照して xangi-cmd が接続失敗する
+ * （シェル環境のスナップショットに旧 URL が残るため）。
+ * 前回ポートを再利用することでこの再起動アーティファクトを防ぐ。
  */
-export function startToolServer(): void {
+export function resolvePreferredToolServerPort(env: NodeJS.ProcessEnv = process.env): number {
+  const fromEnv = Number(env.XANGI_TOOL_SERVER_PORT ?? '');
+  if (Number.isInteger(fromEnv) && fromEnv > 0 && fromEnv <= 65535) return fromEnv;
+  // テスト実行時は前回ポートを参照しない（実環境の dataDir を読まない）
+  if (env.VITEST) return 0;
+  try {
+    const saved = Number(readFileSync(toolServerPortFile(), 'utf-8').trim());
+    if (Number.isInteger(saved) && saved > 0 && saved <= 65535) return saved;
+  } catch {
+    // 初回起動・ファイル無しなど → 自動割り当て
+  }
+  return 0;
+}
+
+/** 採用したポートを次回再起動用に保存する（失敗しても致命的でない） */
+function persistToolServerPort(port: number): void {
+  // テスト実行時は実環境の dataDir に書き込まない
+  if (process.env.VITEST) return;
+  try {
+    const file = toolServerPortFile();
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, String(port), 'utf-8');
+  } catch (e) {
+    console.warn('[tool-server] Failed to persist port:', e);
+  }
+}
+
+/**
+ * Tool Serverを起動（前回ポート再利用 → 使用中なら自動割り当てにフォールバック）
+ *
+ * options.eventTrigger を渡すと POST /api/trigger（外部イベントによる
+ * エージェントターン起動）と xangi-cmd trigger が有効になる。
+ */
+export function startToolServer(options?: { eventTrigger?: EventTrigger | null }): void {
+  eventTrigger = options?.eventTrigger ?? null;
   server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
 
@@ -107,6 +179,26 @@ export function startToolServer(): void {
         console.error(`[tool-server] GitHub token generation failed: ${message}`);
         res.writeHead(500);
         res.end(JSON.stringify({ error: message }));
+      }
+      return;
+    }
+
+    // イベントトリガーエンドポイント（外部イベント → エージェントターン起動）
+    if (req.url === '/api/trigger' && req.method === 'POST') {
+      if (!eventTrigger) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ ok: false, error: 'Trigger is not available' }));
+        return;
+      }
+      try {
+        const body = await parseJsonBody<TriggerRequestBody>(req);
+        const result = await eventTrigger.handleHttp(body, req.headers.authorization);
+        res.writeHead(result.status);
+        res.end(JSON.stringify(result.body));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        res.writeHead(400);
+        res.end(JSON.stringify({ ok: false, error: message }));
       }
       return;
     }
@@ -147,15 +239,33 @@ export function startToolServer(): void {
     res.end(JSON.stringify({ error: 'Not found' }));
   });
 
-  // ポート0 = OS自動割り当て（競合なし）
-  server.listen(0, '0.0.0.0', () => {
+  // 前回ポートを優先し、使用中 (EADDRINUSE) なら自動割り当てにフォールバック
+  const preferred = resolvePreferredToolServerPort();
+  let fellBack = false;
+
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if ((err.code === 'EADDRINUSE' || err.code === 'EACCES') && preferred !== 0 && !fellBack) {
+      fellBack = true;
+      console.warn(
+        `[tool-server] Port ${preferred} unavailable (${err.code}), falling back to auto-assign`
+      );
+      server?.listen(0, '0.0.0.0');
+      return;
+    }
+    console.error('[tool-server] Server error:', err);
+  });
+
+  server.on('listening', () => {
     const addr = server!.address();
     const port = typeof addr === 'object' && addr ? addr.port : 0;
     const serverUrl = `http://127.0.0.1:${port}`;
     process.env.XANGI_TOOL_SERVER = serverUrl;
+    persistToolServerPort(port);
 
     console.log(`[tool-server] Listening on http://0.0.0.0:${port}`);
   });
+
+  server.listen(preferred, '0.0.0.0');
 }
 
 /**

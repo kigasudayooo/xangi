@@ -8,14 +8,12 @@ An AI assistant for Discord / Slack / browser / LINE, powered by Claude Code / C
 
 ## Features
 
-- Multi-backend support (Claude Code / Codex / Cursor CLI / Local LLM; Gemini CLI is legacy/API-key use)
-- `/backend` command for dynamic per-channel backend/model/effort switching
-- Local LLM support (Ollama/vLLM, etc., with agent mode / chat mode toggle)
 - Discord / Slack / Web Chat UI / LINE support
-- Docker support
-- Skill system
-- Scheduler (cron / one-shot / startup tasks)
-- Session persistence
+- Claude Code / Codex / Cursor CLI / Local LLM support
+- Per-channel backend / model / effort switching with `/backend`
+- Skills, scheduler, and event triggers
+- Docker, pm2, and auto-restart support
+- Session persistence, timeout extension, and workspace hooks
 
 ## Architecture
 
@@ -79,7 +77,7 @@ npm start
 npm run dev
 ```
 
-The Gemini CLI backend is kept for compatibility and Enterprise / Google Cloud / paid API key use. Requests for Google AI Pro / Ultra / free Gemini Code Assist for individuals stop on 2026-06-18, so new setups should prefer Claude Code / Codex / Cursor CLI / Local LLM.
+Gemini CLI backend is for legacy/API-key use. New setups should prefer Claude Code / Codex / Cursor CLI / Local LLM.
 
 ### 3. Verify
 
@@ -128,12 +126,14 @@ pm2 logs xangi     # View logs
 | `/new` | Start a new session |
 | `/stop` | Stop running task |
 | `/settings` | Show current settings |
+| `/backend` | Per-channel backend / model switching |
 | `xangi-cmd schedule_*` | Scheduler (cron / reminders) |
 | `xangi-cmd discord_*` | Discord operations (history / send / search, etc.) |
+| `xangi-cmd trigger` | Event trigger (start an agent turn when a job finishes) |
 
 Response messages include buttons (Stop / New Session). Set `DISCORD_SHOW_BUTTONS=false` to hide.
 
-See [Usage Guide](docs/usage.md) for details.
+See [Usage Guide](docs/en/usage.md) for details.
 
 ## Running with Docker
 
@@ -150,7 +150,7 @@ docker compose up xangi-max -d --build
 docker compose up xangi-gpu -d --build
 ```
 
-See [Usage Guide: Docker](docs/usage.md#docker実行) for details.
+See [Usage Guide: Docker](docs/en/usage.md#docker-deployment) for details.
 
 ## Environment Variables
 
@@ -163,13 +163,17 @@ See [Usage Guide: Docker](docs/usage.md#docker実行) for details.
 
 For browser-only operation, just set `WEB_CHAT_ENABLED=true` (no Discord token required).
 
-See [Usage Guide](docs/en/usage.md#environment-variables) for all environment variables.
+See [Usage Guide](docs/en/usage.md#environment-variables-reference) for all environment variables.
 
 ## Workspace
 
 Recommended workspace: [ai-assistant-workspace](https://github.com/karaage0703/ai-assistant-workspace)
 
 A starter kit with pre-configured skills (note-taking, diary, transcription, Notion integration, etc.). Combine with xangi to automate daily tasks from chat.
+
+## Related Projects
+
+- [xangi-stackchan](https://github.com/karaage0703/xangi-stackchan) - A resident bridge that makes a Stack-chan (M5Stack) speak xangi's responses with facial expressions and head movement, by subscribing to the [external event stream](docs/en/events.md) (SSE)
 
 ## Book
 
@@ -184,6 +188,8 @@ A book about building AI assistants with xangi.
 - [Slack Setup](docs/en/slack-setup.md) - Slack integration
 - [LINE Setup](docs/en/line-setup.md) - LINE Messaging API integration (incl. Tailscale Funnel for public webhook)
 - [Design Document](docs/en/design.md) - Architecture, design philosophy, data flow
+- [External Event Stream](docs/en/events.md) - Response lifecycle event delivery spec
+- [Inter-instance Chat](docs/en/inter-instance-chat.md) - Message exchange & auto-talk between instances
 
 ## Acknowledgments
 

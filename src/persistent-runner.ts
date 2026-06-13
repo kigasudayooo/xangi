@@ -151,31 +151,49 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
 
     console.log('[persistent-runner] Starting persistent process...');
 
-    this.process = spawn('claude', args, {
+    const proc = spawn('claude', args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.workdir,
       env: buildCliEnv(this.channelId),
     });
+    this.process = proc;
     this.processAlive = true;
 
-    this.process.stdout?.on('data', (data) => this.handleOutput(data.toString()));
-    this.process.stderr?.on('data', (data) => {
+    proc.stdout?.on('data', (data) => this.handleOutput(data.toString()));
+    proc.stderr?.on('data', (data) => {
       console.error('[persistent-runner] stderr:', data.toString());
     });
 
-    this.process.on('close', (code) => {
+    proc.on('close', (code) => {
+      // kill 後に次のプロセスを起動済みの場合、古いプロセスの close が遅れて
+      // 届くことがある。新プロセスの状態 (process / currentItem / buffer) を
+      // 壊さないよう、別プロセスに置き換わっている場合のみ無視する。
+      // this.process === null (cancel/timeout が kill 直後に null 化した) の
+      // 場合はこの close が現行プロセスの死亡通知そのものなので、後始末
+      // (cancelling リセット + キュー再開) を必ず実行する。null まで stale
+      // 扱いすると、キューに並んだ次のリクエストが永久に開始されない
+      if (this.process !== null && this.process !== proc) {
+        console.log(`[persistent-runner] Stale process exited with code ${code} (ignored)`);
+        return;
+      }
+
       console.log(`[persistent-runner] Process exited with code ${code}`);
       const wasShuttingDown = this.shuttingDown;
       this.process = null;
       this.processAlive = false;
       this.buffer = ''; // バッファをクリア
 
-      // シャットダウン中またはキャンセル中なら正常終了
+      // シャットダウン中またはキャンセル中なら正常終了。
+      // ただし currentItem が残っていたら必ず reject する（reject しないと
+      // 呼び出し側の Promise が永久に settle せず、Discord 等のメッセージが
+      // ライブツール履歴のまま固定される。issue #286）
       if (wasShuttingDown) {
+        this.failCurrentItem(new Error(`Process exited during shutdown (code ${code})`));
         return;
       }
       if (this.cancelling) {
         this.cancelling = false;
+        this.failCurrentItem(new Error(`Process exited during cancellation (code ${code})`));
         // キューに次のリクエストがあれば処理
         if (this.queue.length > 0) {
           this.processNext();
@@ -191,10 +209,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       );
 
       // 現在処理中のリクエストがあればエラーで終了
-      if (this.currentItem) {
-        this.currentItem.reject(new Error(`Process exited unexpectedly with code ${code}`));
-        this.currentItem = null;
-      }
+      this.failCurrentItem(new Error(`Process exited unexpectedly with code ${code}`));
 
       // サーキットブレーカーがオープンでなければ再処理
       if (this.queue.length > 0 && this.crashCount < PersistentRunner.MAX_CRASHES) {
@@ -222,18 +237,30 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       }
     });
 
-    this.process.on('error', (err) => {
+    proc.on('error', (err) => {
       console.error('[persistent-runner] Process error:', err);
+      if (this.process !== null && this.process !== proc) return; // 別プロセスに置き換わり済みのエラーは無視
       this.process = null;
       this.processAlive = false;
 
-      if (this.currentItem) {
-        this.currentItem.reject(err);
-        this.currentItem = null;
-      }
+      this.failCurrentItem(err);
     });
 
-    return this.process;
+    return proc;
+  }
+
+  /**
+   * 現在処理中のリクエストをエラーで終了させる（未設定なら no-op）。
+   * close / error / processNext 内の例外など「どの経路でプロセスを失っても
+   * 呼び出し側の Promise を必ず settle させる」ための共通出口。
+   */
+  private failCurrentItem(error: Error): void {
+    if (!this.currentItem) return;
+    const item = this.currentItem;
+    this.currentItem = null;
+    this.fullText = '';
+    item.callbacks?.onError?.(error);
+    item.reject(error);
   }
 
   /**
@@ -389,7 +416,16 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
     this.currentItem = this.queue.shift()!;
     this.fullText = '';
 
-    const proc = this.ensureProcess();
+    // ensureProcess はサーキットブレーカーオープン時に throw する。
+    // processNext は close イベントハンドラ等からも呼ばれるため、throw を
+    // 伝播させると currentItem が reject されないまま宙吊りになる (issue #286)
+    let proc: ChildProcess;
+    try {
+      proc = this.ensureProcess();
+    } catch (err) {
+      this.failCurrentItem(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
 
     // セッション継続のためのオプションを追加
     // runtime context (cwd/repo/container) を毎ターン prompt 先頭に prepend：
@@ -412,7 +448,13 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       logPrompt(this.workdir, reqAppSessionId, this.currentItem.prompt);
     }
 
-    proc.stdin?.write(JSON.stringify(message) + '\n');
+    try {
+      proc.stdin?.write(JSON.stringify(message) + '\n');
+    } catch (err) {
+      // stdin が既に閉じている (プロセス死亡直後など) 場合も Promise を settle させる
+      this.failCurrentItem(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
 
     // タイムアウト設定: タイムアウト時はプロセスをkillして状態をクリーンに
     // timeoutAt / maxTimeoutAt をリソース化し、延長 API から張り替えできるようにする
@@ -644,26 +686,27 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
    * プロセスを終了
    */
   shutdown(): void {
+    // プロセスが無くても queue / currentItem は必ず reject する。
+    // 「process が null のときに何もしない」と、待っている Promise が
+    // 永久に settle しない (issue #286)
+    this.shuttingDown = true;
+
     if (this.process) {
       console.log('[persistent-runner] Shutting down persistent process...');
-      this.shuttingDown = true;
       this.process.stdin?.end();
       this.process.kill();
       this.process = null;
       this.processAlive = false;
       this.buffer = '';
-
-      // キューに残っているリクエストをキャンセル
-      for (const item of this.queue) {
-        item.reject(new Error('Runner is shutting down'));
-      }
-      this.queue = [];
-
-      if (this.currentItem) {
-        this.currentItem.reject(new Error('Runner is shutting down'));
-        this.currentItem = null;
-      }
     }
+
+    // キューに残っているリクエストをキャンセル
+    for (const item of this.queue) {
+      item.reject(new Error('Runner is shutting down'));
+    }
+    this.queue = [];
+
+    this.failCurrentItem(new Error('Runner is shutting down'));
   }
 
   /**
@@ -695,6 +738,15 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
    */
   isAlive(): boolean {
     return this.processAlive;
+  }
+
+  /**
+   * リクエストを処理中（または待機中）か。
+   * runner-manager のアイドル回収が「実行中の長時間ターン」を誤って
+   * シャットダウンしないための判定に使う (issue #286)
+   */
+  isBusy(): boolean {
+    return this.currentItem !== null || this.queue.length > 0;
   }
 
   /**

@@ -10,6 +10,10 @@ import {
 } from 'fs';
 import { dirname, join } from 'path';
 import cron from 'node-cron';
+import { isTransientNetworkError } from './errors.js';
+/** 一時的なネットワークエラー時のリトライ待機時間 (ms)。テストから上書き可能 */
+export const TRANSIENT_RETRY_DELAY_MS = process.env.VITEST ? 50 : 15_000;
+
 /** スケジュール一覧の項目間区切り（splitMessage用） */
 export const SCHEDULE_SEPARATOR = '{{SPLIT}}';
 
@@ -55,6 +59,8 @@ export class Scheduler {
   private lastReloadTime = 0;
   private quiet: boolean;
   private disabled = false;
+  /** 実行中ジョブの ID（再発火ガード用） */
+  private runningJobs = new Set<string>();
   constructor(dataDir?: string, options?: { quiet?: boolean }) {
     this.quiet = options?.quiet ?? false;
     const dir = dataDir || join(process.cwd(), '.xangi');
@@ -81,6 +87,18 @@ export class Scheduler {
    */
   registerAgentRunner(platform: Platform, runner: AgentRunFn): void {
     this.agentRunners.set(platform, runner);
+  }
+  /**
+   * 登録済みのエージェント実行関数を取得（イベントトリガー等の臨時ターン起動用）
+   */
+  getAgentRunner(platform: Platform): AgentRunFn | undefined {
+    return this.agentRunners.get(platform);
+  }
+  /**
+   * 登録済みのメッセージ送信関数を取得
+   */
+  getSender(platform: Platform): SendMessageFn | undefined {
+    return this.senders.get(platform);
   }
   // ─── CRUD ─────────────────────────────────────────────────────────
   /**
@@ -320,6 +338,23 @@ export class Scheduler {
     }
   }
   private async executeJob(schedule: Schedule): Promise<void> {
+    // 再発火ガード: 前回の実行がまだ走っている間に同じスケジュールの
+    // cron が発火した場合はスキップする（長時間ジョブの重複実行・多重投稿防止）
+    if (this.runningJobs.has(schedule.id)) {
+      console.warn(
+        `[scheduler] Skipping ${schedule.id}: previous execution is still running (duplicate fire guard)`
+      );
+      return;
+    }
+    this.runningJobs.add(schedule.id);
+    try {
+      await this.executeJobInner(schedule);
+    } finally {
+      this.runningJobs.delete(schedule.id);
+    }
+  }
+
+  private async executeJobInner(schedule: Schedule): Promise<void> {
     // 常にagentモードで実行
     const agentRunner = this.agentRunners.get(schedule.platform);
     if (!agentRunner) {
@@ -339,6 +374,24 @@ export class Scheduler {
       const result = await agentRunner(schedule.message, schedule.channelId);
       this.log(`[scheduler] Agent completed: ${schedule.id} (${result.length} chars)`);
     } catch (error) {
+      // 一時的なネットワークエラー (DNS 一時失敗・接続タイムアウト等) は
+      // バックオフ後に 1 回だけリトライする。エージェント側のタイムアウトや
+      // 利用上限はリトライしない (isTransientNetworkError で判別)
+      if (isTransientNetworkError(error)) {
+        console.warn(
+          `[scheduler] Transient network error for ${schedule.id}, retrying in ${TRANSIENT_RETRY_DELAY_MS / 1000}s:`,
+          error instanceof Error ? error.message : error
+        );
+        await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS));
+        try {
+          const result = await agentRunner(schedule.message, schedule.channelId);
+          this.log(`[scheduler] Agent completed on retry: ${schedule.id} (${result.length} chars)`);
+          return;
+        } catch (retryError) {
+          console.error(`[scheduler] Retry also failed for ${schedule.id}:`, retryError);
+          return;
+        }
+      }
       console.error(`[scheduler] Failed to execute ${schedule.id}:`, error);
     }
   }

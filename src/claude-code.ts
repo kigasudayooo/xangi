@@ -1,20 +1,13 @@
-import { spawn } from 'child_process';
-import { processManager } from './process-manager.js';
 import type { RunOptions, RunResult, StreamCallbacks } from './agent-runner.js';
 import { mergeTexts, sanitizeSurrogates, prependRuntimeContext } from './agent-runner.js';
 import { stripToolCallArtifacts, finalizeDisplayText } from './tool-call-sanitize.js';
-import { DEFAULT_TIMEOUT_MS } from './constants.js';
 import { buildSystemPrompt } from './base-runner.js';
+import type { BaseRunnerOptions } from './base-runner.js';
 import type { ChatPlatform } from './prompts/index.js';
 import { logPrompt, logResponse } from './transcript-logger.js';
-import { buildCliEnv } from './cli-process.js';
-import { appendJsonlChunk, flushJsonlBuffer } from './jsonl-buffer.js';
+import { CliRunnerBase, type CliStreamParser } from './cli-runner-core.js';
 
-export interface ClaudeCodeOptions {
-  model?: string;
-  timeoutMs?: number;
-  workdir?: string;
-  skipPermissions?: boolean;
+export interface ClaudeCodeOptions extends BaseRunnerOptions {
   platform?: ChatPlatform;
   effort?: string;
 }
@@ -29,29 +22,43 @@ interface ClaudeCodeResponse {
   duration_ms: number;
 }
 
+interface ClaudeStreamEvent {
+  type?: string;
+  message?: { content?: Array<{ type?: string; text?: string }> };
+  session_id?: string;
+  is_error?: boolean;
+  result?: string;
+}
+
 /**
  * Claude Code CLI を実行するランナー
  */
-export class ClaudeCodeRunner {
-  private model?: string;
-  private timeoutMs: number;
-  private workdir?: string;
-  private skipPermissions: boolean;
+export class ClaudeCodeRunner extends CliRunnerBase {
+  protected readonly command = 'claude';
+  protected readonly displayName = 'Claude Code CLI';
+  protected readonly logPrefix = 'claude-code';
+
   private systemPrompt: string;
   private effort?: string;
 
   constructor(options?: ClaudeCodeOptions) {
-    this.model = options?.model;
-    this.timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS; // デフォルト5分
-    this.workdir = options?.workdir;
-    this.skipPermissions = options?.skipPermissions ?? false;
+    super(options);
     this.systemPrompt = buildSystemPrompt(options?.platform);
     this.effort = options?.effort;
   }
 
-  async run(rawPrompt: string, options?: RunOptions): Promise<RunResult> {
-    const prompt = prependRuntimeContext(sanitizeSurrogates(rawPrompt));
-    const args: string[] = ['-p', '--output-format', 'json'];
+  /**
+   * コマンド引数を構築（run/runStream 共通）
+   */
+  private buildArgs(
+    prompt: string,
+    outputFormat: 'json' | 'stream-json',
+    options?: RunOptions
+  ): string[] {
+    const args: string[] = ['-p', '--output-format', outputFormat];
+    if (outputFormat === 'stream-json') {
+      args.push('--verbose');
+    }
 
     const skip = options?.skipPermissions ?? this.skipPermissions;
     if (skip) {
@@ -77,18 +84,34 @@ export class ClaudeCodeRunner {
 
     args.push(prompt);
 
-    const sessionInfo = options?.sessionId
-      ? ` (session: ${options.sessionId.slice(0, 8)}...)`
-      : ' (new)';
-    console.log(`[claude-code] Executing in ${this.workdir || 'default dir'}${sessionInfo}`);
+    return args;
+  }
+
+  async run(rawPrompt: string, options?: RunOptions): Promise<RunResult> {
+    const prompt = prependRuntimeContext(sanitizeSurrogates(rawPrompt));
+    const args = this.buildArgs(prompt, 'json', options);
+
+    this.logExecution('Executing', options);
 
     // トランスクリプトログ: 送信プロンプトを記録
     if (options?.appSessionId && this.workdir) {
       logPrompt(this.workdir, options.appSessionId, prompt);
     }
 
-    const result = await this.execute(args, options?.channelId);
-    const response = this.parseResponse(result);
+    let stdout: string;
+    try {
+      stdout = await this.collectOutput(args, options?.channelId);
+    } catch (error) {
+      if (!options?.sessionId || !this.isStaleResumeError(error)) {
+        throw error;
+      }
+      console.warn(
+        `[claude-code] Resume failed for stale session ${options.sessionId.slice(0, 8)}..., retrying with a new session`
+      );
+      const retryArgs = this.buildArgs(prompt, 'json', { ...options, sessionId: undefined });
+      stdout = await this.collectOutput(retryArgs, options?.channelId);
+    }
+    const response = this.parseResponse(stdout);
 
     // トランスクリプトログ: 応答を記録
     if (options?.appSessionId && this.workdir) {
@@ -105,51 +128,15 @@ export class ClaudeCodeRunner {
     };
   }
 
-  private execute(args: string[], channelId?: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const proc = spawn('claude', args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        cwd: this.workdir,
-        env: buildCliEnv(channelId),
-      });
-
-      // プロセスマネージャーに登録
-      if (channelId) {
-        processManager.register(channelId, proc);
-      }
-
-      let stdout = '';
-      let stderr = '';
-
-      proc.stdout.on('data', (data) => {
-        stdout += data.toString();
-      });
-
-      proc.stderr.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      const timeout = setTimeout(() => {
-        proc.kill();
-        reject(new Error(`Claude Code CLI timed out after ${this.timeoutMs}ms`));
-      }, this.timeoutMs);
-
-      proc.on('close', (code) => {
-        clearTimeout(timeout);
-
-        if (code !== 0) {
-          reject(new Error(`Claude Code CLI exited with code ${code}: ${stderr}`));
-          return;
-        }
-
-        resolve(stdout);
-      });
-
-      proc.on('error', (err) => {
-        clearTimeout(timeout);
-        reject(new Error(`Failed to spawn Claude Code CLI: ${err.message}`));
-      });
-    });
+  /**
+   * 無効な sessionId での `--resume` 失敗か。
+   * Claude Code CLI は存在しないセッションを resume すると
+   * "No conversation found with session ID: ..." を出して非ゼロ終了する。
+   * （プロセス再起動や CLI 側のセッション GC で session が消えた場合に発生）
+   */
+  private isStaleResumeError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /No conversation found/i.test(message);
   }
 
   private parseResponse(output: string): ClaudeCodeResponse {
@@ -178,151 +165,67 @@ export class ClaudeCodeRunner {
     options?: RunOptions
   ): Promise<RunResult> {
     const prompt = prependRuntimeContext(sanitizeSurrogates(rawPrompt));
-    const args: string[] = ['-p', '--output-format', 'stream-json', '--verbose'];
+    const args = this.buildArgs(prompt, 'stream-json', options);
 
-    const skip = options?.skipPermissions ?? this.skipPermissions;
-    if (skip) {
-      args.push('--dangerously-skip-permissions');
+    this.logExecution('Streaming', options);
+
+    try {
+      return await this.executeStreamCore(args, callbacks, {
+        channelId: options?.channelId,
+        notifyOnError: false,
+      });
+    } catch (error) {
+      if (!options?.sessionId || !this.isStaleResumeError(error)) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        callbacks.onError?.(err);
+        throw error;
+      }
+      console.warn(
+        `[claude-code] Resume failed for stale session ${options.sessionId.slice(0, 8)}..., retrying with a new session`
+      );
+      const retryArgs = this.buildArgs(prompt, 'stream-json', { ...options, sessionId: undefined });
+      return this.executeStreamCore(retryArgs, callbacks, { channelId: options?.channelId });
     }
-
-    if (options?.sessionId) {
-      args.push('--resume', options.sessionId);
-    }
-
-    if (this.model) {
-      args.push('--model', this.model);
-    }
-
-    const effort = options?.effort ?? this.effort;
-    if (effort) {
-      args.push('--effort', effort);
-    }
-
-    // チャットプラットフォーム連携のシステムプロンプト + AGENTS.md
-    args.push('--append-system-prompt', this.systemPrompt);
-
-    args.push(prompt);
-
-    const sessionInfo = options?.sessionId
-      ? ` (session: ${options.sessionId.slice(0, 8)}...)`
-      : ' (new)';
-    console.log(`[claude-code] Streaming in ${this.workdir || 'default dir'}${sessionInfo}`);
-
-    return this.executeStream(args, callbacks, options?.channelId);
   }
 
-  private executeStream(
-    args: string[],
-    callbacks: StreamCallbacks,
-    channelId?: string
-  ): Promise<RunResult> {
-    return new Promise((resolve, reject) => {
-      const proc = spawn('claude', args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        cwd: this.workdir,
-        env: buildCliEnv(channelId),
-      });
+  protected createStreamParser(callbacks: StreamCallbacks): CliStreamParser {
+    let fullText = '';
+    let sessionId = '';
 
-      // プロセスマネージャーに登録
-      if (channelId) {
-        processManager.register(channelId, proc);
-      }
+    return {
+      handleEvent: (json, phase) => {
+        const event = json as ClaudeStreamEvent;
 
-      let fullText = '';
-      let sessionId = '';
-      let buffer = '';
-
-      proc.stdout.on('data', (data) => {
-        const parsed = appendJsonlChunk(buffer, data.toString());
-        buffer = parsed.buffer;
-
-        for (const line of parsed.lines) {
-          try {
-            const json = JSON.parse(line);
-            if (json.type === 'assistant' && json.message?.content) {
-              for (const block of json.message.content) {
-                if (block.type === 'text') {
-                  const clean = stripToolCallArtifacts(block.text);
-                  if (clean) {
-                    fullText += clean;
-                    callbacks.onText?.(clean, fullText);
-                  }
+        if (event.type === 'assistant' && event.message?.content) {
+          for (const block of event.message.content) {
+            if (block.type === 'text' && typeof block.text === 'string') {
+              const clean = stripToolCallArtifacts(block.text);
+              if (clean) {
+                fullText += clean;
+                if (phase === 'stream') {
+                  callbacks.onText?.(clean, fullText);
                 }
               }
-            } else if (json.type === 'result') {
-              sessionId = json.session_id;
-              if (json.is_error) {
-                const error = new Error(json.result);
-                callbacks.onError?.(error);
-                reject(error);
-                return;
-              }
-              // ストリーミング中の累積テキストと最終 result をマージ
-              // （ツール呼び出し前のテキストが result から消えるのを防ぐ）
-              if (json.result) {
-                fullText = mergeTexts(fullText, stripToolCallArtifacts(json.result));
-              }
             }
-          } catch {
-            // JSONパースエラーは無視
           }
+          return undefined;
         }
-      });
 
-      proc.stderr.on('data', (data) => {
-        console.error('[claude-code] stderr:', data.toString());
-      });
-
-      const timeout = setTimeout(() => {
-        proc.kill();
-        const error = new Error(`Claude Code CLI timed out after ${this.timeoutMs}ms`);
-        callbacks.onError?.(error);
-        reject(error);
-      }, this.timeoutMs);
-
-      proc.on('close', (code) => {
-        clearTimeout(timeout);
-
-        // 残りのバッファを処理
-        for (const line of flushJsonlBuffer(buffer)) {
-          try {
-            const json = JSON.parse(line);
-            if (json.type === 'assistant' && json.message?.content) {
-              for (const block of json.message.content) {
-                if (block.type === 'text') {
-                  fullText += stripToolCallArtifacts(block.text);
-                }
-              }
-            } else if (json.type === 'result') {
-              sessionId = json.session_id;
-              // ストリーミング中の累積テキストと最終 result をマージ
-              if (json.result) {
-                fullText = mergeTexts(fullText, stripToolCallArtifacts(json.result));
-              }
-            }
-          } catch {
-            // JSONパースエラーは無視
+        if (event.type === 'result') {
+          sessionId = event.session_id ?? sessionId;
+          if (phase === 'stream' && event.is_error) {
+            return new Error(event.result);
+          }
+          // ストリーミング中の累積テキストと最終 result をマージ
+          // （ツール呼び出し前のテキストが result から消えるのを防ぐ）
+          if (event.result) {
+            fullText = mergeTexts(fullText, stripToolCallArtifacts(event.result));
           }
         }
 
-        if (code !== 0) {
-          const error = new Error(`Claude Code CLI exited with code ${code}`);
-          callbacks.onError?.(error);
-          reject(error);
-          return;
-        }
-
-        const result: RunResult = { result: finalizeDisplayText(fullText), sessionId };
-        callbacks.onComplete?.(result);
-        resolve(result);
-      });
-
-      proc.on('error', (err) => {
-        clearTimeout(timeout);
-        const error = new Error(`Failed to spawn Claude Code CLI: ${err.message}`);
-        callbacks.onError?.(error);
-        reject(error);
-      });
-    });
+        return undefined;
+      },
+      finalize: () => ({ result: finalizeDisplayText(fullText), sessionId }),
+    };
   }
 }

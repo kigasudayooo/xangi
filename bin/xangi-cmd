@@ -49,7 +49,10 @@ Web Chat操作:
 
 システム:
   system_restart    再起動
-  system_settings   設定変更"
+  system_settings   設定変更
+
+イベントトリガー:
+  trigger           エージェントターンを起動 (--channel --message [--source] [--platform])"
   exit 0
 fi
 

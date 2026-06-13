@@ -1951,7 +1951,26 @@
           toolsWrapper.className = 'msg-wrapper assistant';
           var toolsDiv = document.createElement('div');
           toolsDiv.className = 'msg thinking';
-          toolsDiv.textContent = 'Thinking...';
+          // 思考中表示: スピナー + ステータス語ローテーション + 経過秒
+          // (Discord/Slack の StreamSession 表示と同じスタイル)
+          var THINKING_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+          var THINKING_VERBS = ['考え中', '思考中', '調査中', '整理中', '組み立て中', '推敲中'];
+          var thinkingStatus = document.createElement('div');
+          thinkingStatus.textContent = THINKING_FRAMES[0] + ' ' + THINKING_VERBS[0] + '… 0s';
+          toolsDiv.appendChild(thinkingStatus);
+          var thinkingTick = 0;
+          var thinkingStartedAt = Date.now();
+          var thinkingTimer = setInterval(function () {
+            if (!toolsDiv.isConnected) {
+              clearInterval(thinkingTimer);
+              return;
+            }
+            thinkingTick++;
+            var frame = THINKING_FRAMES[thinkingTick % THINKING_FRAMES.length];
+            var verb = THINKING_VERBS[Math.floor(thinkingTick / 4) % THINKING_VERBS.length];
+            var sec = Math.floor((Date.now() - thinkingStartedAt) / 1000);
+            thinkingStatus.textContent = frame + ' ' + verb + '… ' + sec + 's';
+          }, 1000);
           toolsWrapper.appendChild(toolsDiv);
           this.messagesEl.appendChild(toolsWrapper);
           // Thinking バブルが入力欄の裏に隠れる問題対策:
@@ -2005,14 +2024,12 @@
                       assistantDiv.textContent = d.fullText + ' ▌';
                       self._autoScroll();
                     } else if (eventType === 'tool') {
-                      if (toolHistory.length === 0) {
-                        toolsDiv.textContent = '';
-                      }
                       toolHistory.push(d.toolName);
                       var toolLine = document.createElement('div');
                       toolLine.className = 'tool-line';
                       toolLine.textContent = '\u{1F527} ' + d.toolName + (d.inputSummary || '');
-                      toolsDiv.appendChild(toolLine);
+                      // ステータス行 (スピナー) は常に最下段に残す
+                      toolsDiv.insertBefore(toolLine, thinkingStatus);
                       self._autoScroll();
                     } else if (eventType === 'done') {
                       if (!assistantWrapper) {
@@ -2110,6 +2127,7 @@
             if (assistantWrapper && assistantWrapper.parentElement) assistantWrapper.remove();
             this.addMessage(err.name === 'AbortError' ? 'Stopped' : 'Connection error', 'error');
           } finally {
+            clearInterval(thinkingTimer);
             this._setProcessing(false);
             this.abortController = null;
             this.inputEl.focus();

@@ -1,27 +1,12 @@
-import { EventEmitter } from 'events';
-import { spawn, ChildProcess } from 'child_process';
-import type {
-  AgentRunner,
-  RunOptions,
-  RunResult,
-  StreamCallbacks,
-  TimeoutState,
-  ExtendTimeoutResult,
-} from './agent-runner.js';
-import { DEFAULT_TIMEOUT_MS } from './constants.js';
+import type { RunOptions, RunResult, StreamCallbacks } from './agent-runner.js';
 import { buildSystemPrompt } from './base-runner.js';
+import type { BaseRunnerOptions } from './base-runner.js';
 import { prependRuntimeContext } from './runtime-context.js';
 import { logPrompt, logResponse } from './transcript-logger.js';
-import { TimeoutController } from './timeout-controller.js';
 import type { ChatPlatform } from './prompts/index.js';
-import { buildCliEnv, clearManagedCliProcess, registerManagedCliProcess } from './cli-process.js';
-import { appendJsonlChunk, flushJsonlBuffer } from './jsonl-buffer.js';
+import { CliRunnerBase, type CliStreamParser } from './cli-runner-core.js';
 
-export interface CodexOptions {
-  model?: string;
-  timeoutMs?: number;
-  workdir?: string;
-  skipPermissions?: boolean;
+export interface CodexOptions extends BaseRunnerOptions {
   platform?: ChatPlatform;
 }
 
@@ -71,29 +56,16 @@ interface CodexEvent {
 /**
  * Codex CLI を実行するランナー（0.98.0 対応）
  */
-export class CodexRunner extends EventEmitter implements AgentRunner {
-  private model?: string;
-  private timeoutMs: number;
-  private workdir?: string;
-  private skipPermissions: boolean;
+export class CodexRunner extends CliRunnerBase {
+  protected readonly command = 'codex';
+  protected readonly displayName = 'Codex CLI';
+  protected readonly logPrefix = 'codex';
+
   private systemPrompt: string;
-  private currentProcess: ChildProcess | null = null;
-  /** チャンネル別タイムアウト管理（UI の +5m / 残り表示 / 自動 kill 連動） */
-  private readonly timeoutController: TimeoutController;
-  /** 同時実行されている子プロセスを channelId で索く（並列セッション対応） */
-  private readonly activeProcesses = new Map<string, ChildProcess>();
 
   constructor(options?: CodexOptions) {
-    super();
-    this.model = options?.model;
-    this.timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.workdir = options?.workdir;
-    this.skipPermissions = options?.skipPermissions ?? false;
+    super(options);
     this.systemPrompt = buildSystemPrompt(options?.platform);
-    this.timeoutController = new TimeoutController({ baseTimeoutMs: this.timeoutMs });
-    for (const evt of ['timeout-started', 'timeout-extended', 'timeout-cleared'] as const) {
-      this.timeoutController.on(evt, (payload) => this.emit(evt, payload));
-    }
   }
 
   /**
@@ -133,6 +105,21 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
     args.push(fullPrompt);
 
     return args;
+  }
+
+  /**
+   * stdout の JSONL を 1 行ずつパースしてコールバックに渡す
+   */
+  private forEachJsonlEvent(output: string, fn: (event: CodexEvent) => void): void {
+    for (const line of output.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        fn(JSON.parse(trimmed) as CodexEvent);
+      } catch {
+        // JSONパースエラーは無視
+      }
+    }
   }
 
   /**
@@ -236,23 +223,6 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
     };
   }
 
-  /**
-   * exit code !== 0 時に投げるエラーメッセージを組み立てる。
-   * Codex の error イベント本文 > stderr > exit code のみ、の優先順位で
-   * できるだけ具体的な理由をユーザーに見せる。
-   */
-  private buildExitError(code: number | null, codexErrorMessage?: string, stderr?: string): Error {
-    const base = `Codex CLI exited with code ${code}`;
-    if (codexErrorMessage?.trim()) {
-      return new Error(`${base}: ${codexErrorMessage.trim()}`);
-    }
-    const trimmedStderr = stderr?.trim();
-    if (trimmedStderr) {
-      return new Error(`${base}: ${trimmedStderr}`);
-    }
-    return new Error(base);
-  }
-
   private isStaleResumeError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
     return message.includes('thread/resume failed') || message.includes('no rollout found');
@@ -262,20 +232,27 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
     const prompt = prependRuntimeContext(rawPrompt);
     const args = this.buildArgs(prompt, options);
 
-    const sessionInfo = options?.sessionId
-      ? ` (session: ${options.sessionId.slice(0, 8)}...)`
-      : ' (new)';
-    console.log(`[codex] Executing in ${this.workdir || 'default dir'}${sessionInfo}`);
+    this.logExecution('Executing', options);
 
     // トランスクリプトログ: 送信プロンプトを記録
     if (options?.appSessionId && this.workdir) {
       logPrompt(this.workdir, options.appSessionId, prompt);
     }
 
+    const collectOpts = {
+      exitErrorDetail: (stdout: string) => {
+        let detail: string | undefined;
+        this.forEachJsonlEvent(stdout, (event) => {
+          const errMsg = this.extractErrorMessage(event);
+          if (errMsg) detail = errMsg;
+        });
+        return detail;
+      },
+    };
+
     let stdout: string;
-    let sessionId: string;
     try {
-      ({ stdout, sessionId } = await this.execute(args, options?.channelId));
+      stdout = await this.collectOutput(args, options?.channelId, collectOpts);
     } catch (error) {
       if (!options?.sessionId || !this.isStaleResumeError(error)) {
         throw error;
@@ -284,8 +261,14 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
         `[codex] Resume failed for stale thread ${options.sessionId.slice(0, 8)}..., retrying with a new session`
       );
       const retryArgs = this.buildArgs(prompt, { ...options, sessionId: undefined });
-      ({ stdout, sessionId } = await this.execute(retryArgs, options?.channelId));
+      stdout = await this.collectOutput(retryArgs, options?.channelId, collectOpts);
     }
+
+    let sessionId = '';
+    this.forEachJsonlEvent(stdout, (event) => {
+      const sid = this.extractSessionId(event);
+      if (sid) sessionId = sid;
+    });
     const result = this.extractResult(stdout);
 
     // トランスクリプトログ: 応答を記録
@@ -296,103 +279,15 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
     return { result, sessionId };
   }
 
-  private execute(
-    args: string[],
-    channelId?: string
-  ): Promise<{ stdout: string; sessionId: string }> {
-    return new Promise((resolve, reject) => {
-      const proc = spawn('codex', args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        cwd: this.workdir,
-        env: buildCliEnv(channelId),
-      });
-      this.currentProcess = proc;
-      registerManagedCliProcess(channelId, proc, this.activeProcesses, this.timeoutController);
-
-      let stdout = '';
-      let stderr = '';
-      let sessionId = '';
-      let codexErrorMessage: string | undefined;
-      let buffer = '';
-
-      proc.stdout.on('data', (data) => {
-        const chunk = data.toString();
-        stdout += chunk;
-
-        const parsed = appendJsonlChunk(buffer, chunk);
-        buffer = parsed.buffer;
-        for (const line of parsed.lines) {
-          try {
-            const json = JSON.parse(line) as CodexEvent;
-            const sid = this.extractSessionId(json);
-            if (sid) sessionId = sid;
-            const errMsg = this.extractErrorMessage(json);
-            if (errMsg) codexErrorMessage = errMsg;
-          } catch {
-            // JSONパースエラーは無視
-          }
-        }
-      });
-
-      proc.stderr.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      proc.on('close', (code) => {
-        this.currentProcess = null;
-        clearManagedCliProcess(
-          channelId,
-          this.activeProcesses,
-          this.timeoutController,
-          code === 0 ? 'completed' : 'error'
-        );
-
-        for (const line of flushJsonlBuffer(buffer)) {
-          try {
-            const json = JSON.parse(line) as CodexEvent;
-            const sid = this.extractSessionId(json);
-            if (sid) sessionId = sid;
-            const errMsg = this.extractErrorMessage(json);
-            if (errMsg) codexErrorMessage = errMsg;
-          } catch {
-            // JSONパースエラーは無視
-          }
-        }
-
-        if (code !== 0) {
-          reject(this.buildExitError(code, codexErrorMessage, stderr));
-          return;
-        }
-
-        resolve({ stdout, sessionId });
-      });
-
-      proc.on('error', (err) => {
-        this.currentProcess = null;
-        clearManagedCliProcess(channelId, this.activeProcesses, this.timeoutController, 'error');
-        reject(new Error(`Failed to spawn Codex CLI: ${err.message}`));
-      });
-    });
-  }
-
   private extractResult(output: string): string {
-    const lines = output.trim().split('\n');
     const messageParts: string[] = [];
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const json = JSON.parse(line) as CodexEvent;
-        const extracted = this.extractText(json);
-        if (extracted) {
-          if (extracted.isComplete) {
-            messageParts.push(extracted.text);
-          }
-        }
-      } catch {
-        // JSONパースエラーは無視
+    this.forEachJsonlEvent(output, (event) => {
+      const extracted = this.extractText(event);
+      if (extracted?.isComplete) {
+        messageParts.push(extracted.text);
       }
-    }
+    });
 
     // 最後の agent_message を使用（複数ターンの場合）
     return messageParts.length > 0 ? messageParts[messageParts.length - 1] : output;
@@ -409,19 +304,28 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
     const prompt = prependRuntimeContext(rawPrompt);
     const args = this.buildArgs(prompt, options);
 
-    const sessionInfo = options?.sessionId
-      ? ` (session: ${options.sessionId.slice(0, 8)}...)`
-      : ' (new)';
-    console.log(`[codex] Streaming in ${this.workdir || 'default dir'}${sessionInfo}`);
+    this.logExecution('Streaming', options);
 
     // トランスクリプトログ: 送信プロンプトを記録
     if (options?.appSessionId && this.workdir) {
       logPrompt(this.workdir, options.appSessionId, prompt);
     }
 
+    const onComplete = (result: RunResult) => {
+      // トランスクリプトログ: 応答を記録
+      if (options?.appSessionId && this.workdir) {
+        logResponse(this.workdir, options.appSessionId, {
+          result: result.result,
+          sessionId: result.sessionId,
+        });
+      }
+    };
+
     try {
-      return await this.executeStream(args, callbacks, options?.channelId, options?.appSessionId, {
+      return await this.executeStreamCore(args, callbacks, {
+        channelId: options?.channelId,
         notifyOnError: false,
+        onComplete,
       });
     } catch (error) {
       if (!options?.sessionId || !this.isStaleResumeError(error)) {
@@ -433,186 +337,61 @@ export class CodexRunner extends EventEmitter implements AgentRunner {
         `[codex] Resume failed for stale thread ${options.sessionId.slice(0, 8)}..., retrying with a new session`
       );
       const retryArgs = this.buildArgs(prompt, { ...options, sessionId: undefined });
-      return this.executeStream(retryArgs, callbacks, options?.channelId, options?.appSessionId);
+      return this.executeStreamCore(retryArgs, callbacks, {
+        channelId: options?.channelId,
+        onComplete,
+      });
     }
   }
 
-  private executeStream(
-    args: string[],
-    callbacks: StreamCallbacks,
-    channelId?: string,
-    appSessionId?: string,
-    opts: { notifyOnError?: boolean } = {}
-  ): Promise<RunResult> {
-    return new Promise((resolve, reject) => {
-      const proc = spawn('codex', args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        cwd: this.workdir,
-        env: buildCliEnv(channelId),
-      });
-      this.currentProcess = proc;
-      registerManagedCliProcess(channelId, proc, this.activeProcesses, this.timeoutController);
+  protected createStreamParser(callbacks: StreamCallbacks): CliStreamParser {
+    let fullText = '';
+    let sessionId = '';
+    let errorMessage: string | undefined;
+    const emittedToolIds = new Set<string>();
 
-      let fullText = '';
-      let sessionId = '';
-      let buffer = '';
-      let stderr = '';
-      let codexErrorMessage: string | undefined;
-      const emittedToolIds = new Set<string>();
+    return {
+      handleEvent: (json, phase) => {
+        const event = json as CodexEvent;
 
-      proc.stdout.on('data', (data) => {
-        const parsed = appendJsonlChunk(buffer, data.toString());
-        buffer = parsed.buffer;
+        // セッションID抽出
+        const sid = this.extractSessionId(event);
+        if (sid) sessionId = sid;
 
-        for (const line of parsed.lines) {
-          try {
-            const json = JSON.parse(line) as CodexEvent;
+        // エラーイベント抽出（利用上限到達などの本当の理由）
+        const errMsg = this.extractErrorMessage(event);
+        if (errMsg) errorMessage = errMsg;
 
-            // セッションID抽出
-            const sid = this.extractSessionId(json);
-            if (sid) sessionId = sid;
-
-            // エラーイベント抽出（利用上限到達などの本当の理由）
-            const errMsg = this.extractErrorMessage(json);
-            if (errMsg) codexErrorMessage = errMsg;
-
-            const toolUse = this.extractToolUse(json);
-            if (toolUse) {
-              const itemId = json.item?.id ?? json.payload?.item?.id;
-              const eventKey = itemId ?? `${toolUse.name}:${JSON.stringify(toolUse.input)}`;
-              if (!emittedToolIds.has(eventKey)) {
-                emittedToolIds.add(eventKey);
-                callbacks.onToolUse?.(toolUse.name, toolUse.input);
-              }
-            }
-
-            // テキスト抽出
-            const extracted = this.extractText(json);
-            if (extracted) {
-              fullText = extracted.text;
-              callbacks.onText?.(extracted.text, fullText);
-            }
-
-            // トークン使用量ログ
-            if (json.type === 'turn.completed' && json.usage) {
-              console.log(
-                `[codex] Usage: input=${json.usage.input_tokens} (cached=${json.usage.cached_input_tokens ?? 0}), output=${json.usage.output_tokens}`
-              );
-            }
-          } catch {
-            // JSONパースエラーは無視
-          }
-        }
-      });
-
-      proc.stderr.on('data', (data) => {
-        const chunk = data.toString();
-        stderr += chunk;
-        console.error('[codex] stderr:', chunk);
-      });
-
-      proc.on('close', (code) => {
-        this.currentProcess = null;
-        clearManagedCliProcess(
-          channelId,
-          this.activeProcesses,
-          this.timeoutController,
-          code === 0 ? 'completed' : 'error'
-        );
-
-        // 残りのバッファを処理
-        for (const line of flushJsonlBuffer(buffer)) {
-          try {
-            const json = JSON.parse(line) as CodexEvent;
-            const sid = this.extractSessionId(json);
-            if (sid) sessionId = sid;
-            const errMsg = this.extractErrorMessage(json);
-            if (errMsg) codexErrorMessage = errMsg;
-            const toolUse = this.extractToolUse(json);
-            if (toolUse) {
-              const itemId = json.item?.id ?? json.payload?.item?.id;
-              const eventKey = itemId ?? `${toolUse.name}:${JSON.stringify(toolUse.input)}`;
-              if (!emittedToolIds.has(eventKey)) {
-                emittedToolIds.add(eventKey);
-                callbacks.onToolUse?.(toolUse.name, toolUse.input);
-              }
-            }
-            const extracted = this.extractText(json);
-            if (extracted) {
-              fullText = extracted.text;
-            }
-          } catch {
-            // JSONパースエラーは無視
+        const toolUse = this.extractToolUse(event);
+        if (toolUse) {
+          const itemId = event.item?.id ?? event.payload?.item?.id;
+          const eventKey = itemId ?? `${toolUse.name}:${JSON.stringify(toolUse.input)}`;
+          if (!emittedToolIds.has(eventKey)) {
+            emittedToolIds.add(eventKey);
+            callbacks.onToolUse?.(toolUse.name, toolUse.input);
           }
         }
 
-        if (code !== 0) {
-          const error = this.buildExitError(code, codexErrorMessage, stderr);
-          if (opts.notifyOnError !== false) {
-            callbacks.onError?.(error);
+        // テキスト抽出
+        const extracted = this.extractText(event);
+        if (extracted) {
+          fullText = extracted.text;
+          if (phase === 'stream') {
+            callbacks.onText?.(extracted.text, fullText);
           }
-          reject(error);
-          return;
         }
 
-        const result: RunResult = { result: fullText, sessionId };
-
-        // トランスクリプトログ: 応答を記録
-        if (appSessionId && this.workdir) {
-          logResponse(this.workdir, appSessionId, { result: fullText, sessionId });
+        // トークン使用量ログ
+        if (phase === 'stream' && event.type === 'turn.completed' && event.usage) {
+          console.log(
+            `[codex] Usage: input=${event.usage.input_tokens} (cached=${event.usage.cached_input_tokens ?? 0}), output=${event.usage.output_tokens}`
+          );
         }
 
-        callbacks.onComplete?.(result);
-        resolve(result);
-      });
-
-      proc.on('error', (err) => {
-        this.currentProcess = null;
-        clearManagedCliProcess(channelId, this.activeProcesses, this.timeoutController, 'error');
-        const error = new Error(`Failed to spawn Codex CLI: ${err.message}`);
-        if (opts.notifyOnError !== false) {
-          callbacks.onError?.(error);
-        }
-        reject(error);
-      });
-    });
-  }
-
-  /**
-   * 現在処理中のリクエストをキャンセル
-   */
-  cancel(channelId?: string): boolean {
-    if (channelId) {
-      const proc = this.activeProcesses.get(channelId);
-      if (proc) {
-        console.log(`[codex] Cancelling request for channel ${channelId}`);
-        proc.kill();
-        this.activeProcesses.delete(channelId);
-        this.timeoutController.clear(channelId, 'error');
-        return true;
-      }
-      return false;
-    }
-    if (!this.currentProcess) {
-      return false;
-    }
-    console.log('[codex] Cancelling current request');
-    this.currentProcess.kill();
-    this.currentProcess = null;
-    return true;
-  }
-
-  hasRunner(channelId: string): boolean {
-    return this.activeProcesses.has(channelId);
-  }
-
-  getTimeoutState(channelId?: string): TimeoutState {
-    if (!channelId) return { active: false };
-    return this.timeoutController.getState(channelId);
-  }
-
-  extendTimeout(channelId: string | undefined, additionalMs?: number): ExtendTimeoutResult {
-    if (!channelId) return { ok: false, reason: 'no_active_request' };
-    return this.timeoutController.extend(channelId, additionalMs);
+        return undefined;
+      },
+      finalize: () => ({ result: fullText, sessionId }),
+      exitErrorDetail: () => errorMessage,
+    };
   }
 }

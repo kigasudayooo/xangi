@@ -115,7 +115,8 @@ export interface RunnerEventPayload {
     | 'streaming_hold_buffer_drop'
     | 'context_prune'
     | 'session_retry'
-    | 'idempotent_cache_store';
+    | 'idempotent_cache_store'
+    | 'stop_hook_block';
   details?: Record<string, unknown>;
 }
 

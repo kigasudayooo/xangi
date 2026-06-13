@@ -7,9 +7,12 @@ import type { Skill } from './skills.js';
 import { formatSkillList } from './skills.js';
 import { downloadFile, buildAttachmentResult, buildPromptWithAttachments } from './file-utils.js';
 import { loadSettings, formatSettings } from './settings.js';
-import { STREAM_UPDATE_INTERVAL_MS, TIMEOUT_EXTEND_ENABLED } from './constants.js';
+import { TIMEOUT_EXTEND_ENABLED } from './constants.js';
 import { threadIdFor, turnIdFor } from './events-emitter.js';
 import { runWithBubbleEvents } from './bubble-events-runner.js';
+import { StreamSession } from './stream-session.js';
+import { registerStreamFinalizer } from './stream-finalizer.js';
+import { formatAgentErrorForUser } from './errors.js';
 import { ensureSession, getActiveSessionId } from './sessions.js';
 import {
   attachPlatformMessageIdToLast,
@@ -886,6 +889,8 @@ async function processMessage(
   };
 
   let messageTs = '';
+  // プロセス終了時に実行中表示を「中断」表示で確定させる finalizer の登録解除関数 (issue #293)
+  let unregisterStreamFinalizer: (() => void) | undefined;
   // appSessionId は xangi 内部 (sessions.json) のセッション ID。
   // transcript-logger / 編集・削除同期で必要。
   const appSessionId = ensureSession(channelId, { platform: 'slack' });
@@ -897,15 +902,47 @@ async function processMessage(
     const useStreaming = config.slack.streaming ?? true;
     const showThinking = config.slack.showThinking ?? true;
 
-    // 最初のメッセージを送信（Stopボタン付き）
     const showButtons = config.slack.showThinking ?? true;
+
+    // ストリーミング表示のプラットフォーム非依存コア (stream-session.ts)。
+    // Slack 固有の描画 (chat.update / blocks / バイト制限での切り詰め) はこの render に集約する
+    const session = new StreamSession({
+      render: async (view) => {
+        if (!messageTs) return;
+        const text =
+          view.phase === 'thinking'
+            ? view.statusLine
+            : sliceByBytes(view.text, SLACK_MAX_TEXT_BYTES - 10) + ' ▌';
+        // 1 秒ごとの chat.update でタイムアウト UI を消さないよう、
+        // 最新の timeout 状態を渡して blocks を再生成する
+        const timeoutInfo = getSlackTimeoutInfoFor(agentRunner, channelId);
+        await client.chat
+          .update({
+            channel: channelId,
+            ts: messageTs,
+            text,
+            ...(showButtons && {
+              blocks: [
+                { type: 'section' as const, text: { type: 'mrkdwn' as const, text } },
+                ...createSlackProcessingBlocks(timeoutInfo),
+              ],
+            }),
+          })
+          .catch((err) => {
+            console.error('[slack] Failed to update message:', err?.message);
+          });
+      },
+    });
+
+    // 最初のメッセージを送信（Stopボタン付き）
+    const initialText = session.view().statusLine;
     const initialResponse = await client.chat.postMessage({
       channel: channelId,
-      text: '🤔 考え中.',
+      text: initialText,
       ...(threadTs && { thread_ts: threadTs }),
       ...(showButtons && {
         blocks: [
-          { type: 'section' as const, text: { type: 'mrkdwn' as const, text: '🤔 考え中.' } },
+          { type: 'section' as const, text: { type: 'mrkdwn' as const, text: initialText } },
           ...createSlackProcessingBlocks(),
         ],
       }),
@@ -924,10 +961,23 @@ async function processMessage(
       slackProcessingMessages.set(channelId, {
         messageTs,
         threadTs,
-        currentText: '🤔 考え中.',
+        currentText: initialText,
         startedAt: Date.now(),
       });
     }
+
+    // プロセス再起動 (SIGTERM) で turn が中断されたとき、ストリーミング表示
+    // (スピナー / 本文 + ▌) を放置せず「中断」表示で確定させる (issue #293)
+    unregisterStreamFinalizer = registerStreamFinalizer(async () => {
+      session.finish();
+      if (!messageTs) return;
+      const note = '⏸ プロセス再起動により中断されました';
+      const lastText = session.lastText;
+      const text = lastText ? `${lastText.trimEnd()}\n\n${note}` : note;
+      await client.chat
+        .update({ channel: channelId, ts: messageTs, text, blocks: [] })
+        .catch(() => {});
+    });
 
     let result: string;
     let newSessionId: string;
@@ -935,118 +985,27 @@ async function processMessage(
 
     if (useStreaming && showThinking) {
       // ストリーミング + 思考表示モード
-      let lastUpdateTime = 0;
-      let pendingUpdate = false;
-      let firstTextReceived = false;
-
-      // テキスト到着前の考え中アニメーション
-      let dotCount = 1;
-      const thinkingInterval = setInterval(() => {
-        if (firstTextReceived) return;
-        dotCount = (dotCount % 3) + 1;
-        const dots = '.'.repeat(dotCount);
-        const thinkingText = `🤔 考え中${dots}`;
-        // 1 秒ごとの chat.update でタイムアウト UI を消さないよう、
-        // 最新の timeout 状態を渡して blocks を再生成する。
-        const timeoutInfo = getSlackTimeoutInfoFor(agentRunner, channelId);
-        client.chat
-          .update({
-            channel: channelId,
-            ts: messageTs,
-            text: thinkingText,
-            ...(showButtons && {
-              blocks: [
-                { type: 'section' as const, text: { type: 'mrkdwn' as const, text: thinkingText } },
-                ...createSlackProcessingBlocks(timeoutInfo),
-              ],
-            }),
-          })
-          .catch(() => {});
-      }, 1000);
-
+      session.start();
       let streamResult: RunResult;
       try {
         streamResult = await runWithBubbleEvents(
           agentRunner,
           prompt,
           eventCtx,
-          {
-            onText: (_chunk, fullText) => {
-              if (!firstTextReceived) {
-                firstTextReceived = true;
-                clearInterval(thinkingInterval);
-              }
-              const now = Date.now();
-              if (now - lastUpdateTime >= STREAM_UPDATE_INTERVAL_MS && !pendingUpdate) {
-                pendingUpdate = true;
-                lastUpdateTime = now;
-                const streamText = sliceByBytes(fullText, SLACK_MAX_TEXT_BYTES - 10) + ' ▌';
-                const streamBytes = new TextEncoder().encode(streamText).length;
-                console.log(
-                  `[slack] stream update: chars=${streamText.length}, bytes=${streamBytes}`
-                );
-                // text のみ送ると Slack 側で blocks が消える挙動になるため、
-                // stream update でも timeout 情報付き blocks を維持する
-                const streamTimeoutInfo = getSlackTimeoutInfoFor(agentRunner, channelId);
-                client.chat
-                  .update({
-                    channel: channelId,
-                    ts: messageTs,
-                    text: streamText,
-                    ...(showButtons && {
-                      blocks: [
-                        {
-                          type: 'section' as const,
-                          text: { type: 'mrkdwn' as const, text: streamText },
-                        },
-                        ...createSlackProcessingBlocks(streamTimeoutInfo),
-                      ],
-                    }),
-                  })
-                  .catch((err) => {
-                    console.error(
-                      `[slack] Failed to update message (bytes=${streamBytes}):`,
-                      err.message
-                    );
-                  })
-                  .finally(() => {
-                    pendingUpdate = false;
-                  });
-              }
-            },
-          },
+          session.callbacks(),
           { skipPermissions, sessionId, channelId, appSessionId }
         );
       } finally {
-        clearInterval(thinkingInterval);
+        session.finish();
       }
       result = streamResult.result;
       newSessionId = streamResult.sessionId;
       structuredAttachments = streamResult.attachments;
     } else {
       // 非ストリーミング or 思考非表示モード
-      // 考え中アニメーション
-      let dotCount = 1;
-      const thinkingInterval = setInterval(() => {
-        dotCount = (dotCount % 3) + 1;
-        const dots = '.'.repeat(dotCount);
-        const thinkingText = `🤔 考え中${dots}`;
-        const timeoutInfo = getSlackTimeoutInfoFor(agentRunner, channelId);
-        client.chat
-          .update({
-            channel: channelId,
-            ts: messageTs,
-            text: thinkingText,
-            ...(showButtons && {
-              blocks: [
-                { type: 'section' as const, text: { type: 'mrkdwn' as const, text: thinkingText } },
-                ...createSlackProcessingBlocks(timeoutInfo),
-              ],
-            }),
-          })
-          .catch(() => {});
-      }, 1000);
-
+      // useStreaming=false の意図（本文の逐次表示をしない）を保つため
+      // callbacks は渡さず、思考中アニメーションだけ更新する
+      session.start();
       try {
         const runResult = await runWithBubbleEvents(
           agentRunner,
@@ -1059,7 +1018,7 @@ async function processMessage(
         newSessionId = runResult.sessionId;
         structuredAttachments = runResult.attachments;
       } finally {
-        clearInterval(thinkingInterval);
+        session.finish();
       }
     }
 
@@ -1148,11 +1107,13 @@ async function processMessage(
       console.error('[slack] Error:', error);
       await client.chat.postMessage({
         channel: channelId,
-        text: `エラーが発生しました: ${errorMsg.slice(0, 200)}`,
+        text: formatAgentErrorForUser(error),
         ...(threadTs && { thread_ts: threadTs }),
       });
     }
   } finally {
+    // 正常完了・エラー処理後は shutdown finalizer の対象から外す
+    unregisterStreamFinalizer?.();
     // 👀 リアクションを削除
     await client.reactions
       .remove({

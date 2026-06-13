@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from 'fs';
 import type { AgentBackend, Config, EffortLevel } from './config.js';
 import { getBackendDisplayName } from './agent-runner.js';
 import { resolveEnvFilePath } from './env-persist.js';
+import { validateChannelOverrides } from './config-validate.js';
 
 /**
  * Local LLM の動作モード
@@ -63,20 +64,22 @@ export class BackendResolver {
     this.allowedBackends = config.agent.allowedBackends;
     this.allowedModels = config.agent.allowedModels;
 
-    // CHANNEL_OVERRIDES 環境変数から初期値を読み込み
+    // CHANNEL_OVERRIDES 環境変数から初期値を読み込み（スキーマ検証付き。
+    // 不正なエントリは警告して除外し、有効なエントリだけ読み込む）
     this.channelOverrides = new Map();
     const envOverrides = process.env.CHANNEL_OVERRIDES;
     if (envOverrides) {
-      try {
-        const parsed = JSON.parse(envOverrides) as Record<string, ChannelOverride>;
-        for (const [channelId, override] of Object.entries(parsed)) {
-          this.channelOverrides.set(channelId, override);
+      const { overrides, issues } = validateChannelOverrides(envOverrides);
+      for (const issue of issues) {
+        console.error(`[backend-resolver] CHANNEL_OVERRIDES ${issue.channelId}: ${issue.message}`);
+      }
+      if (overrides) {
+        for (const [channelId, override] of Object.entries(overrides)) {
+          this.channelOverrides.set(channelId, override as ChannelOverride);
         }
         console.log(
           `[backend-resolver] Loaded ${this.channelOverrides.size} channel override(s) from CHANNEL_OVERRIDES`
         );
-      } catch (e) {
-        console.error('[backend-resolver] Failed to parse CHANNEL_OVERRIDES:', e);
       }
     }
 

@@ -19,15 +19,15 @@ function envPositiveMs(name: string, defaultMs: number): number {
 }
 
 // タイムアウト
-/** 初期タイムアウト (env TIMEOUT_MS、default 5 分) */
-export const DEFAULT_TIMEOUT_MS = envPositiveMs('TIMEOUT_MS', 300_000);
+/** 初期タイムアウト (env TIMEOUT_MS、default 30 分)。AI の 1 ターンが長時間化する傾向に合わせた値 */
+export const DEFAULT_TIMEOUT_MS = envPositiveMs('TIMEOUT_MS', 1_800_000);
 
 /**
- * 動的延長で到達できる絶対上限 (env TIMEOUT_MAX_MS、default 1 時間)。
+ * 動的延長で到達できる絶対上限 (env TIMEOUT_MAX_MS、default 10 時間)。
  * リクエスト開始時刻 + MAX_TIMEOUT_MS が上限 (累積ではなく絶対値)。
- * 数時間動かしっぱなしのタスク用に env で上書き可能。
+ * 延長はボタン操作が必要なので、上限は緩めにして手動延長の自由度を確保する。
  */
-export const MAX_TIMEOUT_MS = envPositiveMs('TIMEOUT_MAX_MS', 60 * 60 * 1000);
+export const MAX_TIMEOUT_MS = envPositiveMs('TIMEOUT_MAX_MS', 10 * 60 * 60 * 1000);
 
 /**
  * 延長機能の有効/無効 (env TIMEOUT_EXTEND_ENABLED、default true)。

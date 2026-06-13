@@ -40,7 +40,7 @@ flowchart LR
 | Layer | Role | Implementation |
 |-------|------|----------------|
 | Chat | User interface | discord.js, @slack/bolt, http (Web Chat), @line/bot-sdk |
-| xangi | AI CLI / Local LLM integration & control | index.ts, agent-runner.ts, dynamic-runner.ts |
+| xangi | AI CLI / Local LLM integration & control | runner-manager.ts, dynamic-runner.ts, agent-runner.ts |
 | Backend Resolution | Per-channel backend resolution | backend-resolver.ts, settings.ts |
 | AI Backend | Actual AI processing | Claude Code, Codex CLI, Cursor CLI, Local LLM (Ollama / vLLM), Gemini CLI legacy |
 | Workspace | Files & skills | skills/, AGENTS.md, local docs |
@@ -49,22 +49,30 @@ flowchart LR
 
 ### Entry Point (index.ts)
 
-The main orchestrator. Integrates the following:
+A thin entry point dedicated to the startup sequence. It is responsible only for the following; the actual implementation of each feature lives in separate modules:
 
-- Discord / Slack / Web Chat / LINE client initialization
-- Message reception and routing
-- AI CLI invocation
-- Scheduler management
-- Command handling (via `xangi-cmd` CLI tool + text parsing)
+- Configuration loading and validation (`config.ts` / `config-validate.ts`)
+- Startup branching for the enabled clients (Discord / Slack / Web Chat / LINE; a Web-only setup does not create a Discord Client)
+- Starting the scheduler and the various HTTP servers (tool-server / events-stream / event-trigger / approval-server, etc.)
+- SIGTERM/SIGINT handling (graceful shutdown, including the finalization pass in `stream-finalizer.ts`)
 
-### Discord Integration (inside index.ts)
+### Discord Integration (src/discord/)
 
-Based on `discord.js` v14. No dedicated file; initialized inline in `index.ts`:
+Based on `discord.js` v14. Split into modules by responsibility:
 
-- Forwards a message to the Runner when it matches mention / DM / `AUTO_REPLY_CHANNELS`
+- `message-handler.ts` — MessageCreate/Update/Delete handling and `processPrompt` (mention / DM / `AUTO_REPLY_CHANNELS` matching → forwarding to the Runner)
+- `slash-commands.ts` — Slash command definitions and interaction handling
+- `scheduler-bridge.ts` — Registers the scheduler's Discord sender and agent-runner functions
+- `ui.ts` — Button rows (Stop / extend / remaining-time display) and processing-message management
+- `tool-history.ts` — Tool history formatting/accumulation (display lines capped via `TOOL_HISTORY_MAX_LINES`)
+- `message-utils.ts` — Discord message link expansion, reply quoting, channel-mention expansion
+
+Behavior:
+
 - Per-channel session isolation (`contextKey = discord:<channelId>`)
 - Threads, attachments, and reactions supported
-- Stop / extend / remaining-time buttons are refreshed every second via `message.edit`
+- Streaming display uses `stream-session.ts` (a core shared with Slack / Web) to unify thinking display and update throttling, and refreshes the button UI at 1-second granularity via `message.edit`
+- On process shutdown (SIGTERM), `stream-finalizer.ts` finalizes in-flight streaming displays into a "⏸ interrupted by process restart" notice (registered on both the message-handler and scheduler-bridge paths)
 
 ### Slack Integration (slack.ts)
 
@@ -212,6 +220,26 @@ AGENTS.md / CHARACTER.md / USER.md and other workspace settings are delegated to
 | gemini-cli.ts | Gemini CLI legacy | Kept for compatibility and Enterprise / Google Cloud / paid API key use. Not recommended for new Pro / Ultra / free individual setups |
 | cursor-cli.ts | Cursor CLI | `cursor-agent` command, JSON/stream-json, tool call display support |
 | local-llm/runner.ts | Local LLM | Direct calls to local LLMs like Ollama, tool execution & streaming support |
+
+#### Shared One-shot CLI Runner Core (cli-runner-core.ts)
+
+The four adapters (claude-code / codex-cli / gemini-cli / cursor-cli) are built on the
+abstract base class `CliRunnerBase`. The base class owns the shared scaffolding, so each
+adapter only implements "command argument building" and "JSONL event interpretation
+(`CliStreamParser`)":
+
+- **Process management**: spawn, registration/cleanup in `processManager` / `activeProcesses`, `cancel` / `hasRunner`
+- **Timeouts**: integration with `TimeoutController` (remaining-time UI / extension). Requests
+  without a channelId are outside the controller's scope, so a fixed fallback timer covers them
+- **JSONL buffering**: assembling lines split across chunks (`jsonl-buffer.ts`) and flushing
+  the trailing buffer after process exit
+- **Exit error construction**: priority "CLI error event body > stderr > exit code only", so
+  real reasons such as usage-limit errors are surfaced instead of swallowed (all adapters)
+- **Centralized error notification**: `callbacks.onError` is invoked only by the base class.
+  The first attempt before a stale-session retry uses `notifyOnError: false` to suppress
+  spurious error notifications
+- **Stale session auto-recovery**: resume failures with an invalidated sessionId are detected
+  and retried once with a fresh session (all runners: claude-code / codex / gemini / cursor)
 
 #### Local LLM Adapter Detailed Design
 
@@ -468,6 +496,18 @@ Anything else returns `{safe: false, reason}`, leading to an `unsafe_tool_in_pse
 - `already_executed`: same signature hit the idempotent cache or loop detection (no re-execution)
 - `unparseable_pseudo_call`: drift detected but parsing failed (malformed args / unknown format)
 
+#### Workspace hooks (Stop hook gate)
+
+While the multi-layer defenses guard the *shape* of tool calls, hooks verify the *consistency between the response content and actual tool execution*. At turn end, an external process (hook) receives the final response text and the list of executed tools; if it returns block, the feedback is injected as a system message and exactly one continuation round runs.
+
+- The contract is compatible with the Stop hooks of Claude Code / Codex CLI (stdin JSON, exit 0 + `{"decision":"block","reason":"..."}` or exit 2 + stderr), so the same hook script can be shared across runtimes
+- As a xangi extension, the payload includes `tools_called` (names of tools actually executed this turn, in order). Since the harness itself knows about tool execution, hooks do not need to parse a transcript
+- Fail-open: any hook-side anomaly (timeout / invalid output / spawn failure / broken config) passes through. The guard never wedges the main response
+- Mode-linked: in tool-disabled mode (chat) the gate itself is skipped. Blocking when the LLM has no means to act on the feedback degrades response quality — the model tends to emit pseudo tool_call text instead (observed on real hardware)
+- One nudge per turn: the continuation round's result is not re-checked. A hook is not an enforcer but a device that inserts one verification before the turn ends
+- Implementation: `src/hooks.ts` (config loading + `StopHookRunner`), `LocalLlmRunner.applyStopHookGate()` (wired into both `run` and `runStream`). Firings are recorded in the tool trajectory as `stop_hook_block` events
+- History consistency: on block, the session history receives `assistant(original)` → `system(feedback)` → `assistant(continuation)` in order, so later turns can trace what happened
+
 #### Observability: tool trajectory
 
 To enable later analysis of when the multi-layer defenses fire, what `tool_search` adopted, and how `drift_rescue` decided safety, `src/tool-trajectory/` writes a separate structured observability log. The existing `transcript-logger` (`logs/sessions/`) is untouched; events are appended as one-line JSON to `logs/tool-trajectory/<appSessionId>.jsonl`.
@@ -517,6 +557,10 @@ Manages periodic execution and reminders:
 - Follows the server's system timezone (`TZ` environment variable)
 - In Docker environments, setting `TZ=Asia/Tokyo` etc. is recommended
 
+**Execution Resilience:**
+- Duplicate-fire guard: if a cron fires while the previous run of the same schedule is still in progress, the new fire is skipped (prevents duplicate runs / duplicate posts for long jobs)
+- Transient network errors (temporary DNS failures, connect timeouts, etc.) are retried once after a backoff. Agent-side timeouts and usage limits are not retried
+
 ### Tool Server (tool-server.ts)
 
 An HTTP API server that allows AI CLIs to safely invoke xangi features (Discord operations, scheduling, system control).
@@ -530,7 +574,7 @@ AI CLI (Claude Code, etc.)
 ```
 
 **Port Management:**
-- Binds to port 0 (OS auto-assigns, no conflicts with multiple instances)
+- The previously used port is saved in dataDir and reused across restarts (keeps stale `XANGI_TOOL_SERVER` references in resumed sessions working). Falls back to OS auto-assign if busy; `XANGI_TOOL_SERVER_PORT` pins a fixed port
 - The started URL is injected into child processes as `XANGI_TOOL_SERVER`
 - `xangi-cmd` connects using `XANGI_TOOL_SERVER`
 - Execution context such as the current channel ID is passed to tool-server via the `context` field of the HTTP request
@@ -539,6 +583,29 @@ AI CLI (Claude Code, etc.)
 - Secrets such as DISCORD_TOKEN remain inside the xangi process only
 - AI CLIs receive only safe environment variables via the whitelist in `safe-env.ts`
 - GitHub App private keys are loaded into memory at startup; token generation is handled via the tool-server's `/github-token` endpoint (only short-lived tokens are accessible)
+
+### Event Trigger (event-trigger.ts)
+
+A mechanism to start an agent turn from an external event (build finished, CI result, new content detected, etc.). Previously there were only two ways to start an agent turn: an incoming platform message and a scheduler fire. This adds a third: external events.
+
+```
+External process (build script / CI / watcher cron)
+  → HTTP POST /api/trigger (Bearer token auth)
+  → EventTrigger (validation, rate limiting)
+  → agentRunner(prompt, channelId) registered on the scheduler
+  → agent turn runs → result posted to the channel
+```
+
+**Design decisions:**
+- Turn execution reuses the scheduler's `agentRunner` path. The per-platform run functions (thinking message, splitting, attachments) are already registered on the scheduler, so the trigger only needs `Scheduler.getAgentRunner(platform)`
+- The HTTP response (`202` + `triggerId`) is fire-and-forget and does not wait for the turn, so callers (build scripts etc.) are never blocked
+- A `⚡ trigger: <source>` label is posted to the channel first, making it visible what woke the agent
+
+**Security:**
+- Explicit opt-in via `TRIGGER_ENABLED` (default: false)
+- HTTP requests require Bearer auth with `XANGI_TRIGGER_TOKEN`. If the token is not configured, all requests are rejected even when enabled (the tool-server binds 0.0.0.0, so unauthenticated acceptance would allow arbitrary prompt injection over the network). Token comparison is constant-time
+- `xangi-cmd trigger` (via `/api/execute`) follows the existing trust boundary of local commands and skips token verification, but still requires the opt-in
+- Abuse protection: per-source rate limiting (`TRIGGER_MIN_INTERVAL_MS`, default 10s, `429` on excess) and a concurrent-run guard (`409` while the same source is running). Message length capped at 4000 chars
 
 ### Approval Flow (approval.ts / approval-server.ts)
 
@@ -804,10 +871,25 @@ bin/
 └── xangi-cmd           # CLI wrapper (shell script, relays to tool-server)
 
 src/
-├── index.ts            # Entry point, Discord integration
+├── index.ts            # Entry point (startup sequence)
+├── stream-session.ts   # Shared streaming display core (thinking display / update throttling; used by Discord/Slack/Web)
+├── stream-finalizer.ts # Registry that finalizes in-flight streaming displays as "interrupted" on process shutdown
+├── message-split.ts    # Text splitting against per-platform length limits
+├── discord/            # Discord integration
+│   ├── ui.ts               # Button rows, timeout UI, processing-message management
+│   ├── tool-history.ts     # Tool history formatting/accumulation (display capped via TOOL_HISTORY_MAX_LINES)
+│   ├── message-utils.ts    # Link expansion, reply quoting, channel-mention expansion
+│   ├── message-handler.ts  # MessageCreate/Update/Delete + processPrompt
+│   ├── slash-commands.ts   # Slash command definitions & interaction handling
+│   └── scheduler-bridge.ts # Scheduler's Discord sender/agent-runner registration
 ├── slack.ts            # Slack integration
+├── line.ts             # LINE Bot integration (webhook + signature verification)
+├── web-chat.ts         # Web Chat UI (HTTP server)
 ├── agent-runner.ts     # AI CLI interface
 ├── base-runner.ts      # System prompt generation
+├── bubble-events-runner.ts # Wraps Runner execution with response lifecycle event emission
+├── runtime-context.ts  # Generates the per-turn injected [runtime] context line (cwd / repo@branch)
+├── cli-runner-core.ts  # Shared one-shot CLI runner base (CliRunnerBase)
 ├── claude-code.ts      # Claude Code adapter (per-request)
 ├── persistent-runner.ts # Claude Code adapter (persistent process)
 ├── codex-cli.ts        # Codex CLI adapter
@@ -815,21 +897,38 @@ src/
 ├── cursor-cli.ts       # Cursor CLI adapter
 ├── cli-process.ts      # Shared process/env/timeout helpers for one-shot CLI runners
 ├── jsonl-buffer.ts     # Shared JSONL stream line splitter
-├── web-chat.ts         # Web Chat UI (HTTP server)
+├── runner-manager.ts   # Multi-channel concurrent processing (RunnerManager)
+├── dynamic-runner.ts   # Dynamic runner manager
+├── backend-resolver.ts # Per-channel backend resolution
+├── hooks.ts            # Workspace hooks (Stop hook external verification gate)
 ├── tool-server.ts      # Tool Server (HTTP API for AI CLIs)
+├── event-trigger.ts    # Event trigger (start a turn externally via POST /api/trigger)
+├── events-emitter.ts   # Event bus for response lifecycle events
+├── events-stream-server.ts # Pull-based SSE delivery (GET /api/events/stream, piggybacks on web-chat)
+├── pet-inbox-server.ts # Accepts text sent from xangi-pets (POST /api/pet/inbox)
+├── even-terminal-server.ts # Even Terminal compatible HTTP API
 ├── approval.ts         # Dangerous command detection (pattern matching)
 ├── approval-server.ts  # Approval server (Discord/Slack interactive approval flow)
 ├── github-auth.ts      # GitHub App authentication (in-memory key management & token generation)
-├── backend-resolver.ts # Per-channel backend resolution
-├── dynamic-runner.ts   # Dynamic runner manager
 ├── safe-env.ts         # Environment variable whitelist
+├── env-persist.ts      # .env path resolution and dynamic write-back (XANGI_ENV_PATH)
+├── errors.ts           # Error classification (client-input errors → HTTP 400, etc.)
+├── restart-note.ts     # Injects a note about process-restart artifacts
+├── session-title.ts    # Session title derivation
+├── tool-call-sanitize.ts # Strips tool-call syntax leaked into display text
+├── access-urls.ts      # Resolves the Web UI access URLs shown at startup
 ├── constants.ts        # Application-wide constants
 ├── schedule-cli.ts     # Scheduler CLI (legacy, migrated to tool-server)
 ├── cli/                # CLI modules (called from tool-server)
 │   ├── discord-api.ts  #   Discord REST API calls
 │   ├── schedule-cmd.ts #   Schedule operations
 │   ├── system-cmd.ts   #   System operations
+│   ├── slack-history-cmd.ts    # Slack history retrieval
+│   ├── web-history-cmd.ts      # Web Chat history retrieval
+│   ├── inter-chat-cmd.ts       # Inter-instance chat operations
+│   ├── terminal-session-cmd.ts # Terminal session operations
 │   └── xangi-cmd.ts    #   Node.js CLI entry point
+├── inter-instance-chat/ # Inter-instance chat (per-instance jsonl / auto-talk / history viewer)
 ├── local-llm/          # Local LLM adapter
 │   ├── runner.ts       #   Main runner (session management, tool execution loop)
 │   ├── llm-client.ts   #   LLM API client (Ollama native + OpenAI compatible)
@@ -838,7 +937,9 @@ src/
 │   ├── xangi-tools.ts  #   xangi-specific tools (function calling version)
 │   ├── image-utils.ts  #   Image processing utilities (multimodal support)
 │   ├── triggers.ts     #   Trigger feature (magic word detection & execution in chat mode)
+│   ├── pseudo-toolcall.ts #  Parses & rescues pseudo tool-call text (rescue allowlist)
 │   └── types.ts        #   Type definitions
+├── tool-trajectory/    # Observation logs of tool execution trajectories (logs/tool-trajectory/*.jsonl)
 ├── prompts/            # Prompt definitions
 │   ├── index.ts                   # Export aggregation
 │   ├── xangi-commands.ts          # Per-platform assembly
@@ -847,6 +948,7 @@ src/
 │   ├── xangi-commands-discord.ts  # Discord-specific (xangi-cmd discord_*)
 │   ├── xangi-commands-slack.ts    # Slack-specific
 │   ├── xangi-commands-web.ts      # Web-specific
+│   ├── xangi-commands-line.ts     # LINE-specific
 │   ├── chat-system-persistent.ts  # System prompt for persistent process
 │   ├── chat-system-resume.ts      # System prompt for session resume
 │   ├── platform-labels.ts         # Platform display name labels
@@ -854,12 +956,12 @@ src/
 ├── scheduler.ts        # Scheduler
 ├── skills.ts           # Skill loader
 ├── config.ts           # Configuration loading
+├── config-validate.ts  # Env validation layer (warn + fallback; XANGI_CONFIG_STRICT aborts startup)
 ├── settings.ts         # Runtime settings
 ├── sessions.ts         # Session management
 ├── file-utils.ts       # File operation utilities
 ├── process-manager.ts  # Process management
-├── runner-manager.ts   # Multi-channel concurrent processing (RunnerManager)
-├── timeout-controller.ts # Shared per-channel timeout state (start/clear/extend)
+├── timeout-controller.ts # Shared per-channel timeout management (start/clear/extend)
 └── transcript-logger.ts # Per-session transcript logging
 ```
 
