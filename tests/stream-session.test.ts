@@ -180,7 +180,7 @@ describe('StreamSession', () => {
 });
 
 import { capToolLines, DEFAULT_TOOL_HISTORY_MAX_LINES } from '../src/stream-session.js';
-import { appendToolHistory } from '../src/discord/tool-history.js';
+import { addToolHistory, appendToolHistory } from '../src/discord/tool-history.js';
 
 describe('capToolLines', () => {
   const original = process.env.TOOL_HISTORY_MAX_LINES;
@@ -249,5 +249,17 @@ describe('capToolLines', () => {
     process.env.TOOL_HISTORY_MAX_LINES = '2';
     const result = appendToolHistory('本文', ['🔧 a', '🔧 b', '🔧 c']);
     expect(result).toBe('… (+1 件省略)\n🔧 b\n🔧 c\n\n本文');
+  });
+});
+
+describe('addToolHistory', () => {
+  it('Bash の内部文脈参照を生コマンドではなく要約表示にする', () => {
+    const history: string[] = [];
+    addToolHistory(history, 'Bash', {
+      command:
+        'cat /home/karaage/borot/AGENTS.md 2>/dev/null; cat /home/karaage/xangi-dev/AGENTS.md',
+    });
+
+    expect(history).toEqual(['🔧 AGENTS参照']);
   });
 });

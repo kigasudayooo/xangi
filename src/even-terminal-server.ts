@@ -39,6 +39,7 @@ const SUPPORTED_BACKENDS = new Set<AgentBackend>([
   'codex',
   'cursor',
   'grok',
+  'antigravity',
   'local-llm',
 ]);
 const SUPPORTED_LOCAL_LLM_MODES = new Set<LocalLlmMode>(['agent', 'lite', 'chat']);

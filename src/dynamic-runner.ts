@@ -134,7 +134,7 @@ export class DynamicRunnerManager extends EventEmitter implements AgentRunner {
   ): AgentRunner {
     const agentConfig: AgentConfig = {
       ...this.config.agent.config,
-      model: resolved.model ?? this.config.agent.config.model,
+      model: resolved.model,
     };
 
     // claude-code persistent モード: effort付きの専用RunnerManagerを作成

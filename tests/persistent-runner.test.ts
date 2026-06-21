@@ -44,9 +44,14 @@ vi.mock('child_process', () => {
 
 describe('PersistentRunner', () => {
   let runner: PersistentRunner;
+  const originalEnv = process.env;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    process.env = { ...originalEnv };
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.CLAUDE_CODE_BARE;
+    delete process.env.CLAUDE_CODE_MAX_BUDGET_USD;
     runner = new PersistentRunner({
       workdir: '/test/workdir',
       skipPermissions: true,
@@ -54,6 +59,7 @@ describe('PersistentRunner', () => {
   });
 
   afterEach(async () => {
+    process.env = originalEnv;
     // shutdown で発生する Promise rejection を無視
     try {
       runner.shutdown();
@@ -213,6 +219,70 @@ describe('PersistentRunner', () => {
 
     await expect(promise).rejects.toThrow('Something went wrong');
     expect(onError).toHaveBeenCalled();
+  });
+
+  it('should include Claude Code error subtype when result text is missing', async () => {
+    const { getMockProcess } = await import('child_process');
+
+    const onError = vi.fn();
+    const promise = runner.runStream('test prompt', { onError });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const mockProcess = getMockProcess();
+
+    mockProcess.stdout.emit(
+      'data',
+      JSON.stringify({
+        type: 'result',
+        subtype: 'error_during_execution',
+        session_id: 'test-session-123',
+        is_error: true,
+      }) + '\n'
+    );
+
+    await expect(promise).rejects.toThrow('Claude Code returned error: error_during_execution');
+    expect(onError).toHaveBeenCalled();
+  });
+
+  it('should emit Claude Code internal tool_use events to stream callbacks', async () => {
+    const { getMockProcess } = await import('child_process');
+
+    const onToolUse = vi.fn();
+    const promise = runner.runStream('test prompt', { onToolUse });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const mockProcess = getMockProcess();
+
+    mockProcess.stdout.emit(
+      'data',
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          content: [
+            {
+              type: 'tool_use',
+              name: 'Bash',
+              input: { command: 'cat /home/karaage/borot/AGENTS.md' },
+            },
+          ],
+        },
+      }) + '\n'
+    );
+
+    mockProcess.stdout.emit(
+      'data',
+      JSON.stringify({
+        type: 'result',
+        result: 'ok',
+        session_id: 'test-session-123',
+        is_error: false,
+      }) + '\n'
+    );
+
+    await expect(promise).resolves.toMatchObject({ result: 'ok' });
+    expect(onToolUse).toHaveBeenCalledWith('Bash', {
+      command: 'cat /home/karaage/borot/AGENTS.md',
+    });
   });
 
   it('should shutdown properly', async () => {
@@ -444,6 +514,64 @@ describe('PersistentRunner', () => {
     const callArgs = (spawn as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
     const spawnOptions = callArgs[2] as { env: Record<string, string | undefined> };
     expect(spawnOptions.env.XANGI_CHANNEL_ID).toBeUndefined();
+  });
+
+  it('should pass ANTHROPIC_API_KEY only to the Claude Code child process when set', async () => {
+    const { spawn } = await import('child_process');
+    (spawn as unknown as { mockClear: () => void }).mockClear();
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-test-key';
+
+    const apiRunner = new PersistentRunner({
+      workdir: '/test/workdir',
+      skipPermissions: true,
+    });
+
+    apiRunner.run('test prompt').catch(() => {
+      // ignore
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const callArgs = (spawn as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+    const spawnOptions = callArgs[2] as { env: Record<string, string | undefined> };
+    expect(spawnOptions.env.ANTHROPIC_API_KEY).toBe('sk-ant-test-key');
+
+    try {
+      apiRunner.shutdown();
+    } catch {
+      // ignore
+    }
+  });
+
+  it('should include Claude Code API mode args when configured', async () => {
+    const { spawn } = await import('child_process');
+    (spawn as unknown as { mockClear: () => void }).mockClear();
+    process.env.CLAUDE_CODE_BARE = 'true';
+    process.env.CLAUDE_CODE_MAX_BUDGET_USD = '0.25';
+
+    const apiRunner = new PersistentRunner({
+      workdir: '/test/workdir',
+      skipPermissions: true,
+    });
+
+    apiRunner.run('test prompt').catch(() => {
+      // ignore
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const callArgs = (spawn as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+    const args = callArgs[1] as string[];
+    expect(args).toContain('--bare');
+    const budgetIndex = args.indexOf('--max-budget-usd');
+    expect(budgetIndex).toBeGreaterThan(-1);
+    expect(args[budgetIndex + 1]).toBe('0.25');
+
+    try {
+      apiRunner.shutdown();
+    } catch {
+      // ignore
+    }
   });
 
   // ─── Timeout extend (Issue #235) ───

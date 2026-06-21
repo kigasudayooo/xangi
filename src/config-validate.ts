@@ -140,7 +140,14 @@ export class EnvValidator {
   }
 }
 
-const VALID_BACKENDS = ['claude-code', 'codex', 'cursor', 'grok', 'local-llm'] as const;
+const VALID_BACKENDS = [
+  'claude-code',
+  'codex',
+  'cursor',
+  'grok',
+  'antigravity',
+  'local-llm',
+] as const;
 const VALID_EFFORTS = ['low', 'medium', 'high', 'max'] as const;
 const VALID_LLM_MODES = ['agent', 'lite', 'chat'] as const;
 

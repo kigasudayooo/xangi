@@ -5,6 +5,7 @@ import { ClaudeCodeRunner } from './claude-code.js';
 import { CodexRunner } from './codex-cli.js';
 import { CursorRunner } from './cursor-cli.js';
 import { GrokRunner } from './grok-cli.js';
+import { AntigravityRunner } from './antigravity-cli.js';
 import { LocalLlmRunner } from './local-llm/runner.js';
 import { RunnerManager } from './runner-manager.js';
 export { prependRuntimeContext, buildRuntimeContextBlock } from './runtime-context.js';
@@ -123,6 +124,8 @@ export function createAgentRunner(
       return new CursorRunner(config);
     case 'grok':
       return new GrokRunner({ ...config, platform: options?.platform });
+    case 'antigravity':
+      return new AntigravityRunner({ ...config, platform: options?.platform });
     case 'local-llm':
       return new LocalLlmRunner({ ...config, platform: options?.platform });
     default:
@@ -172,6 +175,8 @@ export function getBackendDisplayName(backend: AgentBackend): string {
       return 'Cursor';
     case 'grok':
       return 'Grok';
+    case 'antigravity':
+      return 'Antigravity';
     case 'local-llm':
       return 'Local LLM';
     default:

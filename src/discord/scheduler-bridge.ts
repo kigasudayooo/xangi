@@ -8,6 +8,7 @@ import { DISCORD_SAFE_LENGTH } from '../constants.js';
 import { ensureSession, setSession } from '../sessions.js';
 import { formatAgentErrorForUser } from '../errors.js';
 import { registerStreamFinalizer } from '../stream-finalizer.js';
+import { waitBeforeFollowupDiscordSend } from './send-delay.js';
 
 export interface SchedulerBridgeDeps {
   scheduler: Scheduler;
@@ -113,12 +114,14 @@ export function registerDiscordSchedulerBridge(deps: SchedulerBridgeDeps): void 
       const ch = channel as { send: (content: string) => Promise<unknown> };
       // 最初のパートの残りチャンク
       for (let i = 1; i < firstChunks.length; i++) {
+        await waitBeforeFollowupDiscordSend();
         await ch.send(firstChunks[i]);
       }
       // 2つ目以降のパートは新規メッセージとして送信
       for (let p = 1; p < messageParts.length; p++) {
         const chunks = splitMessage(messageParts[p], DISCORD_SAFE_LENGTH);
         for (const chunk of chunks) {
+          await waitBeforeFollowupDiscordSend();
           await ch.send(chunk);
         }
       }

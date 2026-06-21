@@ -36,4 +36,43 @@ describe('DynamicRunnerManager platform routing', () => {
 
     expect((runner as { platform?: string }).platform).toBe('web');
   });
+
+  it('does not leak the default model into a backend-only channel override', () => {
+    const originalOverrides = process.env.CHANNEL_OVERRIDES;
+    process.env.CHANNEL_OVERRIDES = JSON.stringify({
+      'discord-channel': { backend: 'cursor' },
+    });
+
+    try {
+      const config = {
+        ...makeConfig('discord'),
+        agent: {
+          backend: 'grok',
+          config: { model: 'grok-build' },
+          platform: 'discord',
+        },
+      } as Config;
+      const resolver = new BackendResolver(config);
+      const manager = new DynamicRunnerManager(config, resolver);
+      const resolved = resolver.resolve('discord-channel');
+
+      const runner = (
+        manager as unknown as {
+          getRunner(
+            channelId: string,
+            resolved: typeof resolved,
+            platform?: Config['agent']['platform']
+          ): unknown;
+        }
+      ).getRunner('discord-channel', resolved, 'discord');
+
+      expect((runner as { model?: string }).model).toBeUndefined();
+    } finally {
+      if (originalOverrides === undefined) {
+        delete process.env.CHANNEL_OVERRIDES;
+      } else {
+        process.env.CHANNEL_OVERRIDES = originalOverrides;
+      }
+    }
+  });
 });

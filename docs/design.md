@@ -227,11 +227,12 @@ AGENTS.md / CHARACTER.md / USER.md 等のワークスペース設定は、各AI 
 | codex-cli.ts | Codex CLI | OpenAI製、0.98.0対応、cancel対応 |
 | cursor-cli.ts | Cursor CLI | `cursor-agent` コマンド、JSON/stream-json、tool call表示対応 |
 | grok-cli.ts | Grok CLI | xAI `grok` コマンド、json/streaming-json、tool call表示対応 |
+| antigravity-cli.ts | Antigravity CLI | Google `agy` コマンド、headless `-p` 対応、最終応答フォールバック |
 | local-llm/runner.ts | Local LLM | Ollama等のローカルLLMを直接呼び出し、ツール実行・ストリーミング対応 |
 
 #### ワンショット CLI ランナー共通基盤（cli-runner-core.ts）
 
-claude-code / codex-cli / cursor-cli / grok-cli の 4 アダプターは、抽象基底クラス
+claude-code / codex-cli / cursor-cli / grok-cli / antigravity-cli の 5 アダプターは、抽象基底クラス
 `CliRunnerBase` の上に実装されている。基底クラスが以下を一手に引き受け、各アダプターは
 「コマンド引数の構築」と「JSONL イベントの解釈（`CliStreamParser`）」だけを実装する：
 
@@ -731,7 +732,7 @@ AI CLIの実装詳細を隠蔽し、交換可能に：
 
 ```typescript
 // 設定でバックエンドを切り替え
-AGENT_BACKEND=claude-code  # or codex / cursor / grok / local-llm
+AGENT_BACKEND=claude-code  # or codex / cursor / grok / antigravity / local-llm
 ```
 
 将来的に新しいAI CLIが登場しても、アダプターを追加するだけで対応可能。
