@@ -9,6 +9,34 @@ import { ValidationError } from '../errors.js';
 
 const API_BASE = 'https://discord.com/api/v10';
 const MAX_MESSAGE_LENGTH = 2000;
+const MAX_DISCORD_RETRIES = 3;
+
+interface DiscordRateLimitTracker {
+  waitMs: number;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getRetryAfterMs(body: string, res: Response): number {
+  const retryAfterHeader = res.headers.get('retry-after');
+  if (retryAfterHeader) {
+    const seconds = Number(retryAfterHeader);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+  }
+
+  try {
+    const parsed = JSON.parse(body) as { retry_after?: unknown };
+    if (typeof parsed.retry_after === 'number' && parsed.retry_after >= 0) {
+      return Math.ceil(parsed.retry_after * 1000);
+    }
+  } catch {
+    // Body is not JSON; fall through to conservative backoff.
+  }
+
+  return 1000;
+}
 
 function getToken(): string {
   const token = process.env.DISCORD_TOKEN;
@@ -22,25 +50,49 @@ function getBotId(): string | undefined {
   return process.env.DISCORD_BOT_ID;
 }
 
-async function discordFetch(path: string, options?: RequestInit): Promise<unknown> {
+async function discordFetch(
+  path: string,
+  options?: RequestInit,
+  tracker?: DiscordRateLimitTracker
+): Promise<unknown> {
   const token = getToken();
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: {
-      Authorization: `Bot ${token}`,
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
-  });
+  let lastBody = '';
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Discord API error ${res.status}: ${body}`);
+  for (let attempt = 0; attempt <= MAX_DISCORD_RETRIES; attempt++) {
+    const res = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers: {
+        Authorization: `Bot ${token}`,
+        'Content-Type': 'application/json',
+        ...options?.headers,
+      },
+    });
+
+    if (res.status === 429 && attempt < MAX_DISCORD_RETRIES) {
+      lastBody = await res.text().catch(() => '');
+      const waitMs = getRetryAfterMs(lastBody, res);
+      if (tracker) tracker.waitMs += waitMs;
+      await sleep(waitMs);
+      continue;
+    }
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => lastBody);
+      throw new Error(`Discord API error ${res.status}: ${body}`);
+    }
+
+    // 204 No Content
+    if (res.status === 204) return null;
+    return res.json();
   }
 
-  // 204 No Content
-  if (res.status === 204) return null;
-  return res.json();
+  throw new Error(`Discord API error 429: ${lastBody}`);
+}
+
+function withRateLimitNotice(result: string, tracker: DiscordRateLimitTracker): string {
+  if (tracker.waitMs <= 0) return result;
+  const waitedSeconds = (tracker.waitMs / 1000).toFixed(1);
+  return `${result}\n⚠️ Discord rate limit に当たったため、合計 ${waitedSeconds} 秒待機して再試行しました`;
 }
 
 // ─── Discord Message Type ───────────────────────────────────────────
@@ -90,7 +142,8 @@ export function resolveHistoryChannelId(
 
 async function discordHistory(
   flags: Record<string, string>,
-  context?: DiscordCommandContext
+  context: DiscordCommandContext | undefined,
+  tracker: DiscordRateLimitTracker
 ): Promise<string> {
   const channelId = resolveHistoryChannelId(flags, context);
 
@@ -102,7 +155,9 @@ async function discordHistory(
   // offset指定時: まずoffset分のメッセージを取得してスキップ
   if (offset > 0) {
     const skipMessages = (await discordFetch(
-      `/channels/${channelId}/messages?limit=${offset}`
+      `/channels/${channelId}/messages?limit=${offset}`,
+      undefined,
+      tracker
     )) as DiscordMessage[];
     if (skipMessages.length > 0) {
       beforeId = skipMessages[skipMessages.length - 1].id;
@@ -113,7 +168,9 @@ async function discordHistory(
   if (beforeId) query.set('before', beforeId);
 
   const messages = (await discordFetch(
-    `/channels/${channelId}/messages?${query}`
+    `/channels/${channelId}/messages?${query}`,
+    undefined,
+    tracker
   )) as DiscordMessage[];
 
   // 古い順にソート
@@ -138,7 +195,10 @@ async function discordHistory(
   return `📺 チャンネル履歴（${offsetLabel}）:\n${lines.join('\n')}`;
 }
 
-async function discordSend(flags: Record<string, string>): Promise<string> {
+async function discordSend(
+  flags: Record<string, string>,
+  tracker: DiscordRateLimitTracker
+): Promise<string> {
   const channelId = flags['channel'];
   const message = flags['message'];
   if (!channelId) throw new ValidationError('--channel is required');
@@ -151,23 +211,34 @@ async function discordSend(flags: Record<string, string>): Promise<string> {
   }
 
   for (const chunk of chunks) {
-    await discordFetch(`/channels/${channelId}/messages`, {
-      method: 'POST',
-      body: JSON.stringify({
-        content: chunk,
-        allowed_mentions: { parse: [] },
-      }),
-    });
+    await discordFetch(
+      `/channels/${channelId}/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          content: chunk,
+          allowed_mentions: { parse: [] },
+        }),
+      },
+      tracker
+    );
   }
 
   return `✅ メッセージを送信しました (${chunks.length} chunk(s))`;
 }
 
-async function discordChannels(flags: Record<string, string>): Promise<string> {
+async function discordChannels(
+  flags: Record<string, string>,
+  tracker: DiscordRateLimitTracker
+): Promise<string> {
   const guildId = flags['guild'];
   if (!guildId) throw new ValidationError('--guild is required');
 
-  const channels = (await discordFetch(`/guilds/${guildId}/channels`)) as DiscordChannel[];
+  const channels = (await discordFetch(
+    `/guilds/${guildId}/channels`,
+    undefined,
+    tracker
+  )) as DiscordChannel[];
 
   // テキストチャンネルのみ (type 0)
   const textChannels = channels
@@ -178,7 +249,10 @@ async function discordChannels(flags: Record<string, string>): Promise<string> {
   return `📺 チャンネル一覧:\n${textChannels}`;
 }
 
-async function discordSearch(flags: Record<string, string>): Promise<string> {
+async function discordSearch(
+  flags: Record<string, string>,
+  tracker: DiscordRateLimitTracker
+): Promise<string> {
   const channelId = flags['channel'];
   const keyword = flags['keyword'];
   if (!channelId) throw new ValidationError('--channel is required');
@@ -186,7 +260,9 @@ async function discordSearch(flags: Record<string, string>): Promise<string> {
 
   // Discord REST APIにはメッセージ検索がないため、最新100件を取得してフィルタ
   const messages = (await discordFetch(
-    `/channels/${channelId}/messages?limit=100`
+    `/channels/${channelId}/messages?limit=100`,
+    undefined,
+    tracker
   )) as DiscordMessage[];
 
   const matched = messages.filter((m) => m.content.toLowerCase().includes(keyword.toLowerCase()));
@@ -208,7 +284,10 @@ async function discordSearch(flags: Record<string, string>): Promise<string> {
   return `🔍 「${keyword}」の検索結果 (${matched.length}件):\n${results}`;
 }
 
-async function discordEdit(flags: Record<string, string>): Promise<string> {
+async function discordEdit(
+  flags: Record<string, string>,
+  tracker: DiscordRateLimitTracker
+): Promise<string> {
   const channelId = flags['channel'];
   const messageId = flags['message-id'];
   const content = flags['content'];
@@ -220,22 +299,31 @@ async function discordEdit(flags: Record<string, string>): Promise<string> {
   const botId = getBotId();
   if (botId) {
     const msg = (await discordFetch(
-      `/channels/${channelId}/messages/${messageId}`
+      `/channels/${channelId}/messages/${messageId}`,
+      undefined,
+      tracker
     )) as DiscordMessage;
     if (msg.author.id !== botId) {
       return '❌ 自分のメッセージのみ編集できます';
     }
   }
 
-  await discordFetch(`/channels/${channelId}/messages/${messageId}`, {
-    method: 'PATCH',
-    body: JSON.stringify({ content }),
-  });
+  await discordFetch(
+    `/channels/${channelId}/messages/${messageId}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ content }),
+    },
+    tracker
+  );
 
   return '✏️ メッセージを編集しました';
 }
 
-async function discordDelete(flags: Record<string, string>): Promise<string> {
+async function discordDelete(
+  flags: Record<string, string>,
+  tracker: DiscordRateLimitTracker
+): Promise<string> {
   const channelId = flags['channel'];
   const messageId = flags['message-id'];
   if (!channelId) throw new ValidationError('--channel is required');
@@ -245,21 +333,30 @@ async function discordDelete(flags: Record<string, string>): Promise<string> {
   const botId = getBotId();
   if (botId) {
     const msg = (await discordFetch(
-      `/channels/${channelId}/messages/${messageId}`
+      `/channels/${channelId}/messages/${messageId}`,
+      undefined,
+      tracker
     )) as DiscordMessage;
     if (msg.author.id !== botId) {
       return '❌ 自分のメッセージのみ削除できます';
     }
   }
 
-  await discordFetch(`/channels/${channelId}/messages/${messageId}`, {
-    method: 'DELETE',
-  });
+  await discordFetch(
+    `/channels/${channelId}/messages/${messageId}`,
+    {
+      method: 'DELETE',
+    },
+    tracker
+  );
 
   return '🗑️ メッセージを削除しました';
 }
 
-async function mediaSend(flags: Record<string, string>): Promise<string> {
+async function mediaSend(
+  flags: Record<string, string>,
+  tracker: DiscordRateLimitTracker
+): Promise<string> {
   const channelId = flags['channel'];
   const filePath = flags['file'];
   if (!channelId) throw new ValidationError('--channel is required');
@@ -299,21 +396,34 @@ async function mediaSend(flags: Record<string, string>): Promise<string> {
 
   const body = Buffer.concat(parts);
 
-  const res = await fetch(`${API_BASE}/channels/${channelId}/messages`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bot ${token}`,
-      'Content-Type': `multipart/form-data; boundary=${boundary}`,
-    },
-    body,
-  });
+  let lastBody = '';
+  for (let attempt = 0; attempt <= MAX_DISCORD_RETRIES; attempt++) {
+    const res = await fetch(`${API_BASE}/channels/${channelId}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bot ${token}`,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      },
+      body,
+    });
 
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    throw new Error(`Failed to upload file: ${res.status} ${errBody}`);
+    if (res.status === 429 && attempt < MAX_DISCORD_RETRIES) {
+      lastBody = await res.text().catch(() => '');
+      const waitMs = getRetryAfterMs(lastBody, res);
+      if (tracker) tracker.waitMs += waitMs;
+      await sleep(waitMs);
+      continue;
+    }
+
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => lastBody);
+      throw new Error(`Failed to upload file: ${res.status} ${errBody}`);
+    }
+
+    return `📎 ファイルを送信しました: ${fileName}`;
   }
 
-  return `📎 ファイルを送信しました: ${fileName}`;
+  throw new Error(`Failed to upload file: 429 ${lastBody}`);
 }
 
 // ─── Router ─────────────────────────────────────────────────────────
@@ -323,22 +433,32 @@ export async function discordApi(
   flags: Record<string, string>,
   context?: DiscordCommandContext
 ): Promise<string> {
+  const tracker: DiscordRateLimitTracker = { waitMs: 0 };
+  let result: string;
   switch (command) {
     case 'discord_history':
-      return discordHistory(flags, context);
+      result = await discordHistory(flags, context, tracker);
+      break;
     case 'discord_send':
-      return discordSend(flags);
+      result = await discordSend(flags, tracker);
+      break;
     case 'discord_channels':
-      return discordChannels(flags);
+      result = await discordChannels(flags, tracker);
+      break;
     case 'discord_search':
-      return discordSearch(flags);
+      result = await discordSearch(flags, tracker);
+      break;
     case 'discord_edit':
-      return discordEdit(flags);
+      result = await discordEdit(flags, tracker);
+      break;
     case 'discord_delete':
-      return discordDelete(flags);
+      result = await discordDelete(flags, tracker);
+      break;
     case 'media_send':
-      return mediaSend(flags);
+      result = await mediaSend(flags, tracker);
+      break;
     default:
       throw new ValidationError(`Unknown discord command: ${command}`);
   }
+  return withRateLimitNotice(result, tracker);
 }

@@ -352,7 +352,7 @@ Switching always starts a new session (conversation history is not carried over)
 
 ```bash
 # Allowed backends for switching (if unset, all backends are allowed)
-ALLOWED_BACKENDS=claude-code,cursor,grok,local-llm
+ALLOWED_BACKENDS=claude-code,cursor,grok,antigravity,local-llm
 
 # Allowed models for switching (if unset, no restriction)
 ALLOWED_MODELS=nemotron-3-nano,nemotron-3-super,qwen3.5:9b
@@ -511,6 +511,18 @@ docker compose up xangi -d --build
 
 # Claude Code authentication
 docker exec -it xangi claude
+```
+
+To run Claude Code with Anthropic API-key billing, set `ANTHROPIC_API_KEY` in `.env`.
+This value is passed only to the Claude Code child process and is not part of the general safe environment whitelist.
+Set `CLAUDE_CODE_BARE=true` when you want to force API-key auth instead of OAuth/keychain auth.
+Set `CLAUDE_CODE_MAX_BUDGET_USD` to cap API spend for each Claude Code print-mode run.
+
+```env
+AGENT_BACKEND=claude-code
+ANTHROPIC_API_KEY=sk-ant-...
+CLAUDE_CODE_BARE=true
+CLAUDE_CODE_MAX_BUDGET_USD=0.25
 ```
 
 ### Local LLM Backend (Ollama)
@@ -949,7 +961,7 @@ Environment variables passed to the AI agent (CLI spawn / Local LLM exec) are ma
 
 **Allowed variables:** `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `TZ`, `NODE_ENV`, `NODE_PATH`, `WORKSPACE_PATH`, `AGENT_BACKEND`, `AGENT_MODEL`, `SKIP_PERMISSIONS`, `DATA_DIR`, `XANGI_TOOL_SERVER`, `XANGI_CHANNEL_ID`
 
-`CURSOR_API_KEY` and `XAI_API_KEY` are not part of the general whitelist. They are passed only to Cursor CLI and Grok CLI child processes respectively.
+`ANTHROPIC_API_KEY`, `CURSOR_API_KEY`, and `XAI_API_KEY` are not part of the general whitelist. They are passed only to Claude Code, Cursor CLI, and Grok CLI child processes respectively.
 
 **Not passed (examples):** `DISCORD_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `LOCAL_LLM_API_KEY`, `GH_TOKEN`
 
@@ -1000,6 +1012,9 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `ALLOWED_BACKENDS` | Allowed backends for `/backend` switching (comma-separated). If unset, all backends are allowed | all backends |
 | `ALLOWED_MODELS` | Allowed models for `/backend` switching (comma-separated) | - |
 | `CHANNEL_OVERRIDES` | Per-channel backend settings (JSON) | - |
+| `ANTHROPIC_API_KEY` | Anthropic API key passed only to the Claude Code backend | - |
+| `CLAUDE_CODE_BARE` | Pass `--bare` to Claude Code and force API-key auth instead of OAuth/keychain auth | `false` |
+| `CLAUDE_CODE_MAX_BUDGET_USD` | Pass `--max-budget-usd` to Claude Code to cap API spend | - |
 | `CURSOR_API_KEY` | API key passed only to the Cursor CLI backend | - |
 | `CURSOR_FORCE` | Pass `--force` to Cursor CLI unless explicitly set to `false` | `true` |
 | `CURSOR_TRUST_WORKSPACE` | Pass `--trust` to Cursor CLI unless explicitly set to `false` | `true` |
@@ -1103,7 +1118,15 @@ Authentication depends on a local `grok login` session or `XAI_API_KEY`. `XAI_AP
 
 When `SKIP_PERMISSIONS=true` (the default), xangi passes `--always-approve` to avoid tool approval prompts in non-interactive chat runs. This is intended for personal use in trusted workspaces.
 
-Antigravity CLI (`agy`) is not exposed as an xangi backend for now. xangi will not provide `AGENT_BACKEND=antigravity` until an official machine-readable JSON/stream output contract is available.
+### Antigravity CLI (`AGENT_BACKEND=antigravity`)
+
+The Antigravity backend uses Google's `agy` command. Install it with `curl -fsSL https://antigravity.google/cli/install.sh | bash` and complete the first-run `agy` authentication flow.
+
+Non-interactive execution uses `agy -p ...`. xangi passes `--model` when `AGENT_MODEL` is set and `--conversation` when a provider session id is available.
+
+When `SKIP_PERMISSIONS=true` (the default), xangi passes `--dangerously-skip-permissions` to avoid blocking on permission prompts in non-interactive chat operation. Use this only for trusted personal workspaces.
+
+Because Antigravity CLI does not currently expose a stable JSON/stream-json contract, xangi emits the final response once as a streaming fallback. The runner can be extended to incremental display when `agy` adds a machine-readable stream output.
 
 ### Local LLM (when `AGENT_BACKEND=local-llm`)
 

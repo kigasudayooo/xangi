@@ -13,6 +13,7 @@ import { StreamSession } from '../stream-session.js';
 import { registerStreamFinalizer } from '../stream-finalizer.js';
 import { buildCompletionNotification } from './completion-notify.js';
 import { getChannelCompletionNotifyMode, loadSettings } from '../settings.js';
+import { waitBeforeFollowupDiscordSend } from './send-delay.js';
 import {
   getSession,
   setSession,
@@ -36,7 +37,7 @@ import {
   discordProcessingMessages,
   discordToolHistoryByMessageId,
 } from './ui.js';
-import { appendToolHistory, addToolHistory, formatToolInput } from './tool-history.js';
+import { appendToolHistory, addToolHistory } from './tool-history.js';
 import {
   fetchDiscordLinkContent,
   fetchReplyContent,
@@ -118,7 +119,11 @@ export async function processPrompt(
     // Discord 固有の描画 (message.edit / ボタン行 / 文字数制限) はこの render に集約する
     const session = new StreamSession({
       formatToolLine: showLiveToolUse
-        ? (toolName, toolInput) => `🔧 ${toolName}${formatToolInput(toolName, toolInput)}`
+        ? (toolName, toolInput) => {
+            const lines: string[] = [];
+            addToolHistory(lines, toolName, toolInput);
+            return lines[0] ?? null;
+          }
         : undefined,
       render: async (view) => {
         if (!replyMessage) return;
@@ -288,12 +293,14 @@ export async function processPrompt(
       };
       // 最初のパートの残りチャンク
       for (let i = 1; i < firstChunks.length; i++) {
+        await waitBeforeFollowupDiscordSend();
         await channel.send(firstChunks[i]);
       }
       // 2つ目以降のパートは新規メッセージとして送信
       for (let p = 1; p < messageParts.length; p++) {
         const chunks = splitMessage(messageParts[p], DISCORD_SAFE_LENGTH);
         for (const chunk of chunks) {
+          await waitBeforeFollowupDiscordSend();
           await channel.send(chunk);
         }
       }

@@ -40,11 +40,15 @@ export class ClaudeCodeRunner extends CliRunnerBase {
 
   private systemPrompt: string;
   private effort?: string;
+  private bare: boolean;
+  private maxBudgetUsd?: string;
 
   constructor(options?: ClaudeCodeOptions) {
     super(options);
     this.systemPrompt = buildSystemPrompt(options?.platform);
     this.effort = options?.effort;
+    this.bare = process.env.CLAUDE_CODE_BARE === 'true';
+    this.maxBudgetUsd = process.env.CLAUDE_CODE_MAX_BUDGET_USD?.trim() || undefined;
   }
 
   /**
@@ -58,6 +62,14 @@ export class ClaudeCodeRunner extends CliRunnerBase {
     const args: string[] = ['-p', '--output-format', outputFormat];
     if (outputFormat === 'stream-json') {
       args.push('--verbose');
+    }
+
+    if (this.bare) {
+      args.push('--bare');
+    }
+
+    if (this.maxBudgetUsd) {
+      args.push('--max-budget-usd', this.maxBudgetUsd);
     }
 
     const skip = options?.skipPermissions ?? this.skipPermissions;
@@ -85,6 +97,14 @@ export class ClaudeCodeRunner extends CliRunnerBase {
     args.push(prompt);
 
     return args;
+  }
+
+  protected buildEnv(channelId?: string): NodeJS.ProcessEnv {
+    const env = super.buildEnv(channelId);
+    if (process.env.ANTHROPIC_API_KEY) {
+      env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+    }
+    return env;
   }
 
   async run(rawPrompt: string, options?: RunOptions): Promise<RunResult> {

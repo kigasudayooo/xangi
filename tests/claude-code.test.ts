@@ -39,11 +39,18 @@ vi.mock('fs', async () => {
 });
 
 describe('ClaudeCodeRunner args', () => {
+  const originalEnv = process.env;
+
   beforeEach(() => {
     vi.clearAllMocks();
+    process.env = { ...originalEnv };
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.CLAUDE_CODE_BARE;
+    delete process.env.CLAUDE_CODE_MAX_BUDGET_USD;
   });
 
   afterEach(() => {
+    process.env = originalEnv;
     vi.clearAllMocks();
   });
 
@@ -65,7 +72,7 @@ describe('ClaudeCodeRunner args', () => {
     const callArgs = spawnMock.mock.calls[0];
     const command = callArgs[0] as string;
     const args = callArgs[1] as string[];
-    const spawnOptions = callArgs[2] as { cwd?: string };
+    const spawnOptions = callArgs[2] as { cwd?: string; env: NodeJS.ProcessEnv };
 
     // プロセスを終了させてクリーンアップ
     const mockProcess = (getMockProcess as () => any)();
@@ -128,6 +135,32 @@ describe('ClaudeCodeRunner args', () => {
     const modelIndex = args.indexOf('--model');
     expect(modelIndex).toBeGreaterThan(-1);
     expect(args[modelIndex + 1]).toBe('claude-sonnet-4-5-20250929');
+  });
+
+  it('passes ANTHROPIC_API_KEY only to the Claude Code child process when set', async () => {
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-test-key';
+    const runner = new ClaudeCodeRunner({});
+    const { spawnOptions } = await getSpawnArgs(runner, 'hello');
+
+    expect(spawnOptions.env.ANTHROPIC_API_KEY).toBe('sk-ant-test-key');
+  });
+
+  it('should include --bare when CLAUDE_CODE_BARE=true', async () => {
+    process.env.CLAUDE_CODE_BARE = 'true';
+    const runner = new ClaudeCodeRunner({});
+    const { args } = await getSpawnArgs(runner, 'hello');
+
+    expect(args).toContain('--bare');
+  });
+
+  it('should include --max-budget-usd when CLAUDE_CODE_MAX_BUDGET_USD is set', async () => {
+    process.env.CLAUDE_CODE_MAX_BUDGET_USD = '0.25';
+    const runner = new ClaudeCodeRunner({});
+    const { args } = await getSpawnArgs(runner, 'hello');
+
+    const budgetIndex = args.indexOf('--max-budget-usd');
+    expect(budgetIndex).toBeGreaterThan(-1);
+    expect(args[budgetIndex + 1]).toBe('0.25');
   });
 
   it('should include --append-system-prompt', async () => {

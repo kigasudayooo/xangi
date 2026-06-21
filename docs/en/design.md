@@ -218,11 +218,12 @@ AGENTS.md / CHARACTER.md / USER.md and other workspace settings are delegated to
 | codex-cli.ts | Codex CLI | Made by OpenAI, 0.98.0 compatible, cancel support |
 | cursor-cli.ts | Cursor CLI | `cursor-agent` command, JSON/stream-json, tool call display support |
 | grok-cli.ts | Grok CLI | xAI `grok` command, json/streaming-json, tool call display support |
+| antigravity-cli.ts | Antigravity CLI | Google `agy` command, headless `-p`, final-response streaming fallback |
 | local-llm/runner.ts | Local LLM | Direct calls to local LLMs like Ollama, tool execution & streaming support |
 
 #### Shared One-shot CLI Runner Core (cli-runner-core.ts)
 
-The four adapters (claude-code / codex-cli / cursor-cli / grok-cli) are built on the
+The five adapters (claude-code / codex-cli / cursor-cli / grok-cli / antigravity-cli) are built on the
 abstract base class `CliRunnerBase`. The base class owns the shared scaffolding, so each
 adapter only implements "command argument building" and "JSONL event interpretation
 (`CliStreamParser`)":
@@ -723,7 +724,7 @@ Hides AI CLI implementation details and makes them interchangeable:
 
 ```typescript
 // Switch backends via configuration
-AGENT_BACKEND=claude-code  // or codex / cursor / grok / local-llm
+AGENT_BACKEND=claude-code  // or codex / cursor / grok / antigravity / local-llm
 ```
 
 When new AI CLIs emerge in the future, support can be added simply by creating a new adapter.

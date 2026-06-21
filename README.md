@@ -67,6 +67,7 @@ DISCORD_ALLOWED_USER=123456789012345678
 # Codex CLI:   npm install -g @openai/codex
 # Cursor CLI:  curl https://cursor.com/install -fsS | bash
 # Grok CLI:    curl -fsSL https://x.ai/cli/install.sh | bash
+# Antigravity CLI: curl -fsSL https://antigravity.google/cli/install.sh | bash
 # Local LLM:   Ollama (https://ollama.com) をインストール
 
 npm install

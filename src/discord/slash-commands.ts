@@ -39,6 +39,7 @@ import {
   type ScheduleType,
 } from '../scheduler.js';
 import { discordToolHistoryByMessageId } from './ui.js';
+import { waitBeforeFollowupDiscordSend } from './send-delay.js';
 
 /** スキル一覧を保持する可変参照。`/skills` での再読込を呼び出し元と共有する */
 export interface SkillsRef {
@@ -52,6 +53,7 @@ const BACKEND_CHOICE_LABELS: Record<AgentBackend, string> = {
   codex: 'Codex',
   cursor: 'Cursor',
   grok: 'Grok',
+  antigravity: 'Antigravity',
   'local-llm': 'Local LLM',
 };
 
@@ -343,6 +345,7 @@ async function handleSkillCommand(
     const chunks = splitMessage(result, DISCORD_SAFE_LENGTH);
     await interaction.editReply(chunks[0] || '✅');
     for (let i = 1; i < chunks.length; i++) {
+      await waitBeforeFollowupDiscordSend();
       await interaction.followUp(chunks[i]);
     }
   } catch (error) {
@@ -778,7 +781,9 @@ export function createInteractionHandler(
                 ? process.env.AGENT_MODEL || 'Cursor (デフォルト)'
                 : backendValue === 'grok'
                   ? process.env.AGENT_MODEL || 'Grok (デフォルト)'
-                  : '(デフォルト)');
+                  : backendValue === 'antigravity'
+                    ? process.env.AGENT_MODEL || 'Antigravity (デフォルト)'
+                    : '(デフォルト)');
         const lines = [
           `🔄 モデルを切り替えました。新しいセッションを開始します。`,
           `- バックエンド: **${display}**`,
@@ -917,6 +922,7 @@ export function createInteractionHandler(
             send: (content: string) => Promise<unknown>;
           };
           for (let i = 1; i < chunks.length; i++) {
+            await waitBeforeFollowupDiscordSend();
             await channel.send(chunks[i]);
           }
         }

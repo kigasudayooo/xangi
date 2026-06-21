@@ -68,6 +68,8 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
   private channelId?: string; // トランスクリプトログ用
   private appSessionId?: string; // xangi側のセッションID
   private effort?: string; // Claude Code の --effort オプション
+  private bare: boolean;
+  private maxBudgetUsd?: string;
 
   constructor(options?: {
     model?: string;
@@ -87,6 +89,8 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
     this.systemPrompt = buildPersistentSystemPrompt(options?.platform);
     this.channelId = options?.channelId;
     this.effort = options?.effort;
+    this.bare = process.env.CLAUDE_CODE_BARE === 'true';
+    this.maxBudgetUsd = process.env.CLAUDE_CODE_MAX_BUDGET_USD?.trim() || undefined;
   }
 
   /**
@@ -128,6 +132,14 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       '--verbose',
     ];
 
+    if (this.bare) {
+      args.push('--bare');
+    }
+
+    if (this.maxBudgetUsd) {
+      args.push('--max-budget-usd', this.maxBudgetUsd);
+    }
+
     if (this.skipPermissions) {
       args.push('--dangerously-skip-permissions');
     }
@@ -154,7 +166,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
     const proc = spawn('claude', args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.workdir,
-      env: buildCliEnv(this.channelId),
+      env: this.buildEnv(),
     });
     this.process = proc;
     this.processAlive = true;
@@ -249,6 +261,14 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
     return proc;
   }
 
+  private buildEnv(): NodeJS.ProcessEnv {
+    const env = buildCliEnv(this.channelId);
+    if (process.env.ANTHROPIC_API_KEY) {
+      env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+    }
+    return env;
+  }
+
   /**
    * 現在処理中のリクエストをエラーで終了させる（未設定なら no-op）。
    * close / error / processNext 内の例外など「どの経路でプロセスを失っても
@@ -286,6 +306,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
    */
   private handleJsonMessage(json: {
     type: string;
+    subtype?: string;
     session_id?: string;
     message?: {
       content?: Array<{
@@ -296,6 +317,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       }>;
     };
     result?: string;
+    error?: string;
     is_error?: boolean;
   }): void {
     if (json.type === 'system' && json.session_id) {
@@ -332,7 +354,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       const resultAppSessionId = this.currentItem?.options?.appSessionId || this.appSessionId;
       if (resultAppSessionId && this.workdir) {
         if (json.is_error) {
-          logError(this.workdir, resultAppSessionId, json.result || 'Unknown error');
+          logError(this.workdir, resultAppSessionId, this.formatClaudeError(json));
         } else {
           logResponse(this.workdir, resultAppSessionId, json as Record<string, unknown>);
         }
@@ -376,7 +398,7 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
           return;
         }
 
-        const error = new Error(json.result || 'Unknown error');
+        const error = new Error(this.formatClaudeError(json));
         this.currentItem?.callbacks?.onError?.(error);
         this.currentItem?.reject(error);
       } else {
@@ -403,6 +425,14 @@ export class PersistentRunner extends EventEmitter implements AgentRunner {
       // 次のリクエストを処理
       this.processNext();
     }
+  }
+
+  private formatClaudeError(json: { result?: string; error?: string; subtype?: string }): string {
+    const detail = json.result || json.error;
+    if (detail?.trim()) return detail.trim();
+    return json.subtype
+      ? `Claude Code returned error: ${json.subtype}`
+      : 'Claude Code returned error';
   }
 
   /**

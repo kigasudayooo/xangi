@@ -3,7 +3,14 @@ import { DEFAULT_TIMEOUT_MS } from './constants.js';
 import type { ChatPlatform } from './prompts/index.js';
 import { EnvValidator } from './config-validate.js';
 
-export const ALL_AGENT_BACKENDS = ['claude-code', 'codex', 'cursor', 'grok', 'local-llm'] as const;
+export const ALL_AGENT_BACKENDS = [
+  'claude-code',
+  'codex',
+  'cursor',
+  'grok',
+  'antigravity',
+  'local-llm',
+] as const;
 export type AgentBackend = (typeof ALL_AGENT_BACKENDS)[number];
 export type DiscordCompletionNotifyMode = 'off' | 'message' | 'mention';
 
@@ -192,10 +199,11 @@ export function loadConfig(): Config {
     backend !== 'codex' &&
     backend !== 'cursor' &&
     backend !== 'grok' &&
+    backend !== 'antigravity' &&
     backend !== 'local-llm'
   ) {
     throw new Error(
-      `Invalid AGENT_BACKEND: ${backend}. Must be 'claude-code', 'codex', 'cursor', 'grok', or 'local-llm'`
+      `Invalid AGENT_BACKEND: ${backend}. Must be 'claude-code', 'codex', 'cursor', 'grok', 'antigravity', or 'local-llm'`
     );
   }
 
