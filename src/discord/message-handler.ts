@@ -24,6 +24,7 @@ import {
   updateSessionTitle,
 } from '../sessions.js';
 import { stripPromptMetadata } from '../session-title.js';
+import { deriveThreadTitle } from './thread-title.js';
 import {
   attachPlatformMessageIdToLast,
   findEntryByPlatformMessageId,
@@ -148,7 +149,10 @@ export async function processPrompt(
 
     // スレッド返信モード: 発言ごとにスレッドを作成し、以降の投稿先をそのスレッドにする。
     // すでにスレッド内の発言 / DM など startThread 不可の場合は通常どおりチャンネルへ返信する。
-    let newThread: { send: (options: unknown) => Promise<Message> } | null = null;
+    // スレッド名は投稿本文から決定的に生成する（AI バックエンド非依存）。
+    let newThread: {
+      send: (options: unknown) => Promise<Message>;
+    } | null = null;
     if (config.discord.replyInThread) {
       const ch = message.channel as unknown as { isThread?: () => boolean };
       const alreadyThread = typeof ch.isThread === 'function' && ch.isThread();
@@ -156,13 +160,14 @@ export async function processPrompt(
         typeof (message as unknown as { startThread?: unknown }).startThread === 'function';
       if (!alreadyThread && canStartThread) {
         try {
-          const threadName =
-            (stripPromptMetadata(message.content).trim() || 'xangi').slice(0, 80) || 'xangi';
+          const threadName = deriveThreadTitle(message.content);
           newThread = (await (
             message as unknown as {
               startThread: (opts: { name: string }) => Promise<unknown>;
             }
-          ).startThread({ name: threadName })) as { send: (options: unknown) => Promise<Message> };
+          ).startThread({ name: threadName })) as {
+            send: (options: unknown) => Promise<Message>;
+          };
         } catch (err) {
           console.warn(
             '[xangi] Failed to start thread, falling back to channel:',
@@ -321,6 +326,7 @@ export async function processPrompt(
       content: firstChunks[0] || '✅',
       ...(showButtons && { components: [createCompletedButtons({ showTools: showToolsButton })] }),
     });
+
     if ('send' in outputChannel) {
       const channel = outputChannel as unknown as {
         send: (content: string) => Promise<unknown>;
