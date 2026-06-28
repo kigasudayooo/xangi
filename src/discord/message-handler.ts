@@ -585,8 +585,18 @@ export function registerDiscordMessageHandlers(deps: MessageHandlerDeps): void {
 
     const isMentioned = message.mentions.has(client.user!);
     const isDM = !message.guild;
+    // スレッドは親チャンネルとは別IDを持つため、autoreply 設定はそのままでは継承されない。
+    // スレッド内のメッセージは親チャンネル (parentId) の autoreply 状態も見て継承する。
+    const threadCh = message.channel as unknown as {
+      isThread?: () => boolean;
+      parentId?: string | null;
+    };
+    const parentChannelId =
+      typeof threadCh.isThread === 'function' && threadCh.isThread() ? threadCh.parentId : null;
     const isAutoReplyChannel =
-      config.discord.autoReplyChannels?.includes(message.channel.id) ?? false;
+      (config.discord.autoReplyChannels?.includes(message.channel.id) ?? false) ||
+      (parentChannelId != null &&
+        (config.discord.autoReplyChannels?.includes(parentChannelId) ?? false));
 
     if (!isMentioned && !isDM && !isAutoReplyChannel) return;
 
