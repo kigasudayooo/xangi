@@ -5,10 +5,11 @@ const LABELS: Record<string, string> = {
   slack: 'チャットプラットフォーム（Slack）',
   web: 'Webブラウザ',
   line: 'チャットプラットフォーム（LINE）',
+  telegram: 'チャットプラットフォーム（Telegram）',
 };
 
 export function getPlatformLabel(platform?: ChatPlatform): string {
   return platform
     ? LABELS[platform] || 'チャットプラットフォーム'
-    : 'チャットプラットフォーム（Discord/Slack）';
+    : 'チャットプラットフォーム（Discord/Slack/Telegram）';
 }

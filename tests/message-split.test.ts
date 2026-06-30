@@ -55,4 +55,22 @@ describe('splitMessage', () => {
     const chunks = splitMessage(exact, MAX);
     expect(chunks).toEqual([exact]);
   });
+
+  it('絵文字をサロゲートペアの途中で分断せず、UTF-16上限内に収める', () => {
+    const text = '😀'.repeat(2000);
+    const chunks = splitMessage(text, MAX);
+
+    expect(chunks.join('')).toBe(text);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(MAX);
+      expect(chunk.charCodeAt(0)).not.toBeGreaterThanOrEqual(0xdc00);
+      const last = chunk.charCodeAt(chunk.length - 1);
+      expect(last < 0xd800 || last > 0xdbff).toBe(true);
+    }
+  });
+
+  it('サロゲートペアを保持できない maxLength は拒否する', () => {
+    expect(() => splitMessage('😀', 1)).toThrow(RangeError);
+    expect(() => splitMessage('abc', 0)).toThrow(RangeError);
+  });
 });

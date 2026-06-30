@@ -14,6 +14,7 @@ import { join } from 'path';
 import { config as dotenvConfig } from 'dotenv';
 import { startWebChat } from './web-chat.js';
 import { startLineBot } from './line.js';
+import { formatTelegramError, startTelegramBot } from './telegram.js';
 import { getEventsConfig } from './events-emitter.js';
 import { startInterInstanceChat, getInterChatConfig } from './inter-instance-chat/index.js';
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
@@ -69,6 +70,7 @@ async function main() {
   const discordAllowed = config.discord.allowedUsers || [];
   const slackAllowed = config.slack.allowedUsers || [];
   const lineAllowed = config.line.allowedUsers || [];
+  const telegramAllowed = config.telegram.allowedUsers || [];
 
   if (config.discord.enabled && discordAllowed.length === 0) {
     console.error('[xangi] Error: DISCORD_ALLOWED_USER must be set (use "*" to allow everyone)');
@@ -80,6 +82,10 @@ async function main() {
   }
   if (config.line.enabled && lineAllowed.length === 0) {
     console.error('[xangi] Error: LINE_ALLOWED_USER must be set (use "*" to allow everyone)');
+    process.exit(1);
+  }
+  if (config.telegram.enabled && telegramAllowed.length === 0) {
+    console.error('[xangi] Error: TELEGRAM_ALLOWED_USER must be set (use "*" to allow everyone)');
     process.exit(1);
   }
 
@@ -99,6 +105,11 @@ async function main() {
     console.log('[xangi] LINE: All users are allowed');
   } else if (lineAllowed.length > 0) {
     console.log(`[xangi] LINE: Allowed users: ${lineAllowed.join(', ')}`);
+  }
+  if (telegramAllowed.includes('*')) {
+    console.log('[xangi] Telegram: All users are allowed');
+  } else if (telegramAllowed.length > 0) {
+    console.log(`[xangi] Telegram: Allowed users: ${telegramAllowed.join(', ')}`);
   }
 
   // バックエンドリゾルバー & 動的ランナーマネージャーを作成
@@ -169,6 +180,18 @@ async function main() {
       idleResetEnabled: config.line.idleResetEnabled,
       idleResetHours: config.line.idleResetHours,
       resetTextPatterns: config.line.resetTextPatterns,
+    });
+  }
+
+  // Telegram Bot 起動。接続待ちはバックグラウンドで再試行し、他媒体の起動を妨げない。
+  // startTelegramBot は最初の await より前に scheduler sender/runner を登録する。
+  if (config.telegram.enabled) {
+    void startTelegramBot({
+      config,
+      agentRunner,
+      scheduler,
+    }).catch((err) => {
+      console.error(`[xangi] Failed to start Telegram bot: ${formatTelegramError(err)}`);
     });
   }
 
@@ -324,9 +347,15 @@ async function main() {
   }
 
   const webChatEnabled = process.env.WEB_CHAT_ENABLED === 'true';
-  if (!config.discord.enabled && !config.slack.enabled && !webChatEnabled && !config.line.enabled) {
+  if (
+    !config.discord.enabled &&
+    !config.slack.enabled &&
+    !webChatEnabled &&
+    !config.line.enabled &&
+    !config.telegram.enabled
+  ) {
     console.error(
-      '[xangi] No chat platform enabled. Set DISCORD_TOKEN, SLACK_BOT_TOKEN/SLACK_APP_TOKEN, WEB_CHAT_ENABLED=true, or LINE_CHANNEL_ACCESS_TOKEN+LINE_CHANNEL_SECRET'
+      '[xangi] No chat platform enabled. Set DISCORD_TOKEN, SLACK_BOT_TOKEN/SLACK_APP_TOKEN, WEB_CHAT_ENABLED=true, LINE_CHANNEL_ACCESS_TOKEN+LINE_CHANNEL_SECRET, or TELEGRAM_BOT_TOKEN'
     );
     process.exit(1);
   }

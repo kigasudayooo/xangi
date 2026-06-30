@@ -17,6 +17,7 @@ import {
   createWebSession,
   setProviderSessionId,
   listAllSessions,
+  hasSessionGoneIdle,
   WEB_CHAT_CONTEXT_PREFIX,
 } from '../src/sessions.js';
 
@@ -422,5 +423,23 @@ describe('sessions', () => {
         if (prev !== undefined) process.env.XANGI_SESSION_RETENTION_DAYS = prev;
       }
     });
+  });
+});
+
+describe('hasSessionGoneIdle', () => {
+  const now = Date.parse('2026-05-23T12:00:00.000Z');
+  const fourHoursMs = 4 * 3600 * 1000;
+
+  it('returns true at or beyond the idle threshold', () => {
+    expect(
+      hasSessionGoneIdle(new Date(now - fourHoursMs).toISOString(), fourHoursMs, now)
+    ).toBe(true);
+  });
+
+  it('returns false before the threshold or for invalid inputs', () => {
+    expect(hasSessionGoneIdle(new Date(now - 1000).toISOString(), fourHoursMs, now)).toBe(false);
+    expect(hasSessionGoneIdle(undefined, fourHoursMs, now)).toBe(false);
+    expect(hasSessionGoneIdle('not-a-date', fourHoursMs, now)).toBe(false);
+    expect(hasSessionGoneIdle(new Date(0).toISOString(), 0, now)).toBe(false);
   });
 });

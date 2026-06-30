@@ -488,3 +488,17 @@ export function clearSessions(): void {
   data = { activeByContext: {}, sessions: {} };
   sessionsPath = null;
 }
+
+/**
+ * セッションがアイドル状態（一定時間経過）になったか判定する
+ */
+export function hasSessionGoneIdle(
+  lastActivityIso: string | undefined,
+  idleMs: number,
+  now: number = Date.now()
+): boolean {
+  if (!lastActivityIso || idleMs <= 0) return false;
+  const last = Date.parse(lastActivityIso);
+  if (!Number.isFinite(last)) return false;
+  return now - last >= idleMs;
+}

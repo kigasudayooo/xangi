@@ -11,6 +11,10 @@
  * 送信に失敗し、メッセージが更新されず「無反応」に見える事象が起きる。
  */
 export function splitMessage(text: string, maxLength: number, separator: string = '\n'): string[] {
+  if (!Number.isInteger(maxLength) || maxLength < 2) {
+    throw new RangeError('maxLength must be an integer greater than or equal to 2');
+  }
+
   const chunks: string[] = [];
   const blocks = text.split(separator);
   let current = '';
@@ -24,19 +28,29 @@ export function splitMessage(text: string, maxLength: number, separator: string 
         current = '';
         for (const line of lines) {
           if (line.length > maxLength) {
-            // 改行の無い超長行は maxLength 単位で文字数強制スライスする
+            // 改行の無い超長行を UTF-16 上限内で安全に分割する。
+            // high surrogate (0xD800-0xDBFF) の直後で切ると文字化けするため、
+            // 末尾が high surrogate のときは1つ前の境界を使う。
             if (current) {
               chunks.push(current.trim());
               current = '';
             }
-            for (let i = 0; i < line.length; i += maxLength) {
-              const piece = line.slice(i, i + maxLength);
-              if (i + maxLength < line.length) {
-                chunks.push(piece);
-              } else {
+            let offset = 0;
+            while (offset < line.length) {
+              let end = offset + maxLength;
+              if (end >= line.length) {
                 // 末尾の半端は current に残し、後続ブロックと結合可能にする
-                current = piece;
+                current = line.slice(offset);
+                break;
               }
+              // 境界が high surrogate の直後でサロゲートペアを分断しないよう調整
+              if ((line.charCodeAt(end - 1) & 0xfc00) === 0xd800) {
+                if (end - 1 > offset) {
+                  end--; // 安全に1つ前で切れる
+                }
+              }
+              chunks.push(line.slice(offset, end));
+              offset = end;
             }
           } else if (current.length + line.length + 1 > maxLength) {
             if (current) chunks.push(current.trim());

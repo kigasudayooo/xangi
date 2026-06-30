@@ -7,8 +7,9 @@ import { XANGI_COMMANDS_DISCORD } from './xangi-commands-discord.js';
 import { XANGI_COMMANDS_SLACK } from './xangi-commands-slack.js';
 import { XANGI_COMMANDS_WEB } from './xangi-commands-web.js';
 import { XANGI_COMMANDS_LINE } from './xangi-commands-line.js';
+import { XANGI_COMMANDS_TELEGRAM } from './xangi-commands-telegram.js';
 
-export type ChatPlatform = 'discord' | 'slack' | 'web' | 'line';
+export type ChatPlatform = 'discord' | 'slack' | 'web' | 'line' | 'telegram';
 
 /**
  * プラットフォームに応じたXANGI_COMMANDSを構築
@@ -31,6 +32,10 @@ export function buildXangiCommands(platform?: ChatPlatform): string {
     // LINE は Markdown 非対応 + ファイル送信非対応のため、Discord/Slack 用の
     // チャット PF 共通 (MEDIA: / xangi-cmd 系) は注入しない。LINE 専用ルールだけ。
     parts.push(XANGI_COMMANDS_LINE);
+  } else if (platform === 'telegram') {
+    // Telegram も Markdown はエスケープされるためプレーンテキストを基本とし、
+    // Telegram 専用ルールだけを注入する。
+    parts.push(XANGI_COMMANDS_TELEGRAM);
   } else {
     if (process.env.TRIGGER_ENABLED === 'true') {
       parts.push(XANGI_COMMANDS_TRIGGER);
@@ -61,4 +66,5 @@ export {
   XANGI_COMMANDS_SLACK,
   XANGI_COMMANDS_WEB,
   XANGI_COMMANDS_LINE,
+  XANGI_COMMANDS_TELEGRAM,
 };

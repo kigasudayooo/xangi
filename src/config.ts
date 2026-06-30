@@ -134,6 +134,27 @@ export interface Config {
      */
     resetTextPatterns?: string[];
   };
+  telegram: {
+    enabled: boolean;
+    botToken?: string;
+    allowedUsers?: string[];
+    allowedBots?: string[];
+    allowedChats?: string[];
+    autoReplyChats?: string[];
+    mode?: 'polling' | 'webhook';
+    webhookPort?: number;
+    webhookPath?: string;
+    webhookSecretToken?: string;
+    webhookUrl?: string;
+    streaming?: boolean;
+    showThinking?: boolean;
+    allowedBotsMaxConsecutive?: number;
+    replyToMentionInGroup?: boolean;
+    idleResetEnabled?: boolean;
+    idleResetHours?: number;
+    resetTextPatterns?: string[];
+    forceIpv4?: boolean;
+  };
   agent: {
     backend: AgentBackend;
     config: AgentConfig;
@@ -162,12 +183,14 @@ export function loadConfig(): Config {
   const lineChannelAccessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN;
   const lineChannelSecret = process.env.LINE_CHANNEL_SECRET;
   const lineEnabled = !!lineChannelAccessToken && !!lineChannelSecret;
+  const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
+  const telegramEnabled = !!telegramBotToken;
 
-  // 少なくともどれかが有効である必要がある（WebChat / LINE 単独運用も可）
+  // 少なくともどれかが有効である必要がある（WebChat / LINE / Telegram 単独運用も可）
   const webChatEnabled = process.env.WEB_CHAT_ENABLED === 'true';
-  if (!discordToken && !slackBotToken && !webChatEnabled && !lineEnabled) {
+  if (!discordToken && !slackBotToken && !webChatEnabled && !lineEnabled && !telegramBotToken) {
     throw new Error(
-      'DISCORD_TOKEN, SLACK_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN+LINE_CHANNEL_SECRET, or WEB_CHAT_ENABLED=true environment variable is required'
+      'DISCORD_TOKEN, SLACK_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN+LINE_CHANNEL_SECRET, TELEGRAM_BOT_TOKEN, or WEB_CHAT_ENABLED=true environment variable is required'
     );
   }
 
@@ -188,6 +211,13 @@ export function loadConfig(): Config {
     : [];
   const lineAllowedUsers = lineAllowedUser
     ? lineAllowedUser
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  const telegramAllowedUser = process.env.TELEGRAM_ALLOWED_USER;
+  const telegramAllowedUsers = telegramAllowedUser
+    ? telegramAllowedUser
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean)
@@ -218,6 +248,7 @@ export function loadConfig(): Config {
     discordEnabled && 'discord',
     slackEnabled && 'slack',
     lineEnabled && 'line',
+    telegramEnabled && 'telegram',
   ].filter(Boolean) as ChatPlatform[];
   if (enabledPlatforms.length === 1) {
     platform = enabledPlatforms[0];
@@ -341,6 +372,43 @@ export function loadConfig(): Config {
             .map((s) => s.trim())
             .filter(Boolean)
         : undefined, // line.ts 側で default パターンに fallback
+    },
+    telegram: {
+      enabled: telegramEnabled,
+      botToken: telegramBotToken,
+      allowedUsers: telegramAllowedUsers,
+      allowedBots: process.env.TELEGRAM_ALLOWED_BOTS
+        ? process.env.TELEGRAM_ALLOWED_BOTS.split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [],
+      allowedChats: process.env.TELEGRAM_ALLOWED_CHATS
+        ? process.env.TELEGRAM_ALLOWED_CHATS.split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [],
+      autoReplyChats: process.env.TELEGRAM_AUTO_REPLY_CHATS
+        ? process.env.TELEGRAM_AUTO_REPLY_CHATS.split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [],
+      mode: v.enumOf('TELEGRAM_MODE', ['polling', 'webhook'] as const, 'polling'),
+      webhookPort: v.int('TELEGRAM_WEBHOOK_PORT', 8766, { min: 1, max: 65535 }),
+      webhookPath: process.env.TELEGRAM_WEBHOOK_PATH || '/telegram/webhook',
+      webhookSecretToken: process.env.TELEGRAM_WEBHOOK_SECRET_TOKEN,
+      webhookUrl: process.env.TELEGRAM_WEBHOOK_URL,
+      streaming: process.env.TELEGRAM_STREAMING !== 'false',
+      showThinking: process.env.TELEGRAM_SHOW_THINKING !== 'false',
+      allowedBotsMaxConsecutive: v.int('TELEGRAM_ALLOWED_BOTS_MAX_CONSECUTIVE', 3),
+      replyToMentionInGroup: process.env.TELEGRAM_REPLY_TO_MENTION_IN_GROUP !== 'false',
+      idleResetEnabled: process.env.TELEGRAM_IDLE_RESET_ENABLED !== 'false',
+      idleResetHours: v.float('TELEGRAM_IDLE_RESET_HOURS', 4, { min: 0 }),
+      forceIpv4: process.env.TELEGRAM_FORCE_IPV4 === 'true',
+      resetTextPatterns: process.env.TELEGRAM_RESET_TEXT_PATTERNS
+        ? process.env.TELEGRAM_RESET_TEXT_PATTERNS.split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : ['/reset', '/new', '/clear'],
     },
     agent: {
       backend,

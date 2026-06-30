@@ -50,7 +50,7 @@ flowchart LR
 A thin entry point dedicated to the startup sequence. It is responsible only for the following; the actual implementation of each feature lives in separate modules:
 
 - Configuration loading and validation (`config.ts` / `config-validate.ts`)
-- Startup branching for the enabled clients (Discord / Slack / Web Chat / LINE; a Web-only setup does not create a Discord Client)
+- Startup branching for the enabled clients (Discord / Slack / Web Chat / LINE / Telegram; a Web-only setup does not create a Discord Client)
 - Starting the scheduler and the various HTTP servers (tool-server / events-stream / event-trigger / approval-server, etc.)
 - SIGTERM/SIGINT handling (graceful shutdown, including the finalization pass in `stream-finalizer.ts`)
 
@@ -125,6 +125,20 @@ LINE has no explicit conversation boundary UI like Slack's threads or Discord's 
 Both features can be disabled independently (`LINE_IDLE_RESET_ENABLED=false`, `LINE_RESET_TEXT_PATTERNS=`). Combined with Rich Menu button bindings ("Start over" → sends `リセット` → reset-command detection path), this gives a clean integrated experience.
 
 The public endpoint is provided externally (Tailscale Funnel / Cloudflare Tunnel). See [`docs/en/line-setup.md`](line-setup.md).
+
+### Telegram Bot Integration (telegram.ts)
+
+Supports messaging via Telegram Bot API. Design:
+
+- Uses `grammy` library. Supports both webhook and long polling startup modes (long polling is the default).
+- Monitors text messages (`message:text`) and processes only DMs and authorized group chats.
+- Performs allowlist validation for authorized user IDs (`TELEGRAM_ALLOWED_USER`) and authorized bot IDs (`TELEGRAM_ALLOWED_BOTS`).
+- For group chats, begins responses on bot mention, reply to bot, or message detection in `TELEGRAM_AUTO_REPLY_CHATS`.
+- Strips the `@xangi_bot` mention automatically before passing text to the Runner.
+- Implements an infinite reply loop guard (`TELEGRAM_ALLOWED_BOTS_MAX_CONSECUTIVE`) that caps consecutive replies to the same bot.
+- Updates the thinking/streaming process inline using `editMessageText` at a 1-second interval powered by `StreamSession`.
+- Caps individual messages to Telegram's 4096-character limit and splits longer text using `splitMessage`.
+- Handles session reset commands (`/reset`, `/new`, `/clear`), run cancellations (`/stop`), and simple help guidance (`/help`).
 
 ### Agent Runner (agent-runner.ts)
 
@@ -882,6 +896,7 @@ src/
 │   └── scheduler-bridge.ts # Scheduler's Discord sender/agent-runner registration
 ├── slack.ts            # Slack integration
 ├── line.ts             # LINE Bot integration (webhook + signature verification)
+├── telegram.ts         # Telegram Bot integration (polling / webhook + monitoring rules)
 ├── web-chat.ts         # Web Chat UI (HTTP server)
 ├── agent-runner.ts     # AI CLI interface
 ├── base-runner.ts      # System prompt generation
@@ -947,6 +962,7 @@ src/
 │   ├── xangi-commands-slack.ts    # Slack-specific
 │   ├── xangi-commands-web.ts      # Web-specific
 │   ├── xangi-commands-line.ts     # LINE-specific
+│   ├── xangi-commands-telegram.ts # Telegram-specific
 │   ├── chat-system-persistent.ts  # System prompt for persistent process
 │   ├── chat-system-resume.ts      # System prompt for session resume
 │   ├── platform-labels.ts         # Platform display name labels
