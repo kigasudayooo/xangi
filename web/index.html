@@ -1191,7 +1191,13 @@
         <button id="menu-btn" onclick="toggleSidebar()">&#9776;</button>
         <h1>xangi</h1>
         <span class="spacer"></span>
-        <a class="tool-link" href="/inter-chat" title="inter-instance-chat 履歴ビューア">
+        <a
+          class="tool-link"
+          href="/inter-chat"
+          target="_blank"
+          rel="noopener"
+          title="inter-instance-chat 履歴ビューア (別タブで開く)"
+        >
           🔁 inter-chat
         </a>
         <a class="tool-link" href="/monitor" title="セッション監視">
@@ -2572,6 +2578,11 @@
         var pane = paneManager.activePane;
         if (!pane) {
           pane = paneManager.add({});
+        } else if (pane.sending) {
+          // アクティブペインが送信中なら中断せず新しいペインで開く
+          // (上限到達で add() が null を返した場合は何もせず諦める)
+          pane = paneManager.add({});
+          if (!pane) return;
         }
         await pane.newSession();
       }
