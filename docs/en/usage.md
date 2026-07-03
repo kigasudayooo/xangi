@@ -214,6 +214,7 @@ The AI performs Discord / Slack operations via the `xangi-cmd` CLI tool. Because
 | `xangi-cmd discord_search --channel <ID> --keyword "text"` | Search messages |
 | `xangi-cmd discord_edit --channel <ID> --message-id <ID> --content "text"` | Edit a message |
 | `xangi-cmd discord_delete --channel <ID> --message-id <ID>` | Delete a message |
+| `xangi-cmd discord_thread_leave --user <ID> [--channel <ID>]` | Remove a user from a thread = drop it from that user's sidebar (defaults to the current thread when `--channel` is omitted) |
 | `xangi-cmd media_send --channel <ID> --file /path/to/file` | Send a file |
 | `xangi-cmd slack_send --channel <id> --message "text" [--thread-ts <ts>]` | Send a Slack message |
 | `xangi-cmd slack_channels [--types public_channel,private_channel] [--limit N]` | List Slack channels |
@@ -251,6 +252,10 @@ If `--channel` is omitted while running inside xangi, the current channel ID is 
 # Edit and delete messages
 xangi-cmd discord_edit --channel 1234567890 --message-id 111222333 --content "updated content"
 xangi-cmd discord_delete --channel 1234567890 --message-id 111222333
+
+# Remove a user from a thread = drop it from that user's sidebar (omit --channel to target the current thread)
+xangi-cmd discord_thread_leave --user 111222333
+xangi-cmd discord_thread_leave --user 111222333 --channel 1234567890
 xangi-cmd slack_edit --channel C01234567 --message-ts 1719876543.000100 --content "updated content"
 xangi-cmd slack_delete --channel C01234567 --message-ts 1719876543.000100
 ```
@@ -989,6 +994,7 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `DISCORD_TOKEN` | Discord Bot Token | **Required** |
 | `DISCORD_ALLOWED_USER` | Allowed user ID (comma-separated for multiple, `*` to allow all) | **Required** |
 | `AUTO_REPLY_CHANNELS` | Channel IDs to respond without mention (comma-separated) | - |
+| `DISCORD_REPLY_IN_THREAD` | Post replies into a per-message thread instead of the channel | `false` |
 | `DISCORD_STREAMING` | Streaming output | `true` |
 | `DISCORD_SHOW_THINKING` | Show thinking process | `true` |
 | `DISCORD_SHOW_BUTTONS` | Show Stop/New Session buttons | `true` |
