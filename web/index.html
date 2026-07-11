@@ -526,6 +526,9 @@
         cursor: pointer;
         opacity: 0;
         transition: opacity 0.15s;
+        /* 手動でメッセージ本文をドラッグ選択したときに 'Copy' が
+           選択範囲に含まれないようにする（opacity:0 でも選択対象になるため）。 */
+        user-select: none;
       }
       .msg.assistant pre:hover .code-copy-btn {
         opacity: 1;
@@ -1793,7 +1796,15 @@
           copyBtn.title = 'コピー';
           copyBtn.addEventListener('click', function (ev) {
             ev.stopPropagation();
+            // 各コードブロック内のコピー ボタン (.code-copy-btn) は contentDiv の
+            // 子要素なので、そのまま innerText を読むとボタン文字列
+            // ('Copy'/'Copied'/'Failed') が混入する（opacity:0 でも innerText には
+            // 含まれる）。読み取りの間だけ display:none にして除外する。
+            // clone せず display:none にすることで innerText の改行整形を維持する。
+            var codeBtns = contentDiv.querySelectorAll('.code-copy-btn');
+            codeBtns.forEach(function (n) { n.style.display = 'none'; });
             var txt = contentDiv.innerText || contentDiv.textContent || '';
+            codeBtns.forEach(function (n) { n.style.display = ''; });
             copyText(txt).then(function () {
               copyBtn.textContent = 'Copied';
               setTimeout(function () {
