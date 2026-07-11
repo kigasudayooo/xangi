@@ -352,6 +352,12 @@
       .pane.active .pane-header {
         box-shadow: inset 0 2px 0 var(--primary);
       }
+      /* アクティブペインのタイトル枠の背景をアクセント色に */
+      .pane.active .pane-title:not(.empty),
+      .pane.active .pane-title:not(.empty):hover {
+        background: var(--focus-ring);
+        color: var(--ink);
+      }
       .pane-title {
         flex: 1;
         font-size: 13px;
