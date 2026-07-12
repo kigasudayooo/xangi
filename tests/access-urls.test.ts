@@ -90,9 +90,7 @@ describe('resolveAccessUrls', () => {
   });
 
   it('壊れた IP 文字列は無視する', async () => {
-    setExecFileResponses([
-      { args: ['ip', '-4'], result: { stdout: 'garbage\nnot-an-ip\n' } },
-    ]);
+    setExecFileResponses([{ args: ['ip', '-4'], result: { stdout: 'garbage\nnot-an-ip\n' } }]);
     const { resolveAccessUrls } = await loadModule();
     const urls = await resolveAccessUrls(18889);
     expect(urls).toEqual(['http://localhost:18889']);
@@ -133,6 +131,54 @@ describe('resolveAccessUrls', () => {
       'http://100.86.210.85:18889',
     ]);
   });
+
+  it('host が特定 IP なら probe せず、その host の URL のみ返す', async () => {
+    // 特定 IP に bind した場合、localhost や別 IF の URL は到達できないので出さない。
+    // probe（execFile）も呼ばれないこと（無駄・誤誘導の防止）を確認する。
+    setExecFileResponses([
+      { args: ['ip', '-4'], result: { stdout: '100.86.210.85\n' } },
+      {
+        args: ['status', '--self', '--json'],
+        result: { stdout: JSON.stringify({ Self: { HostName: 'spark-edbc' } }) },
+      },
+    ]);
+    mockExecFile.mockClear();
+    const { resolveAccessUrls } = await loadModule();
+    expect(await resolveAccessUrls(18889, '192.168.1.10')).toEqual(['http://192.168.1.10:18889']);
+    expect(await resolveAccessUrls(18889, '100.86.210.85')).toEqual(['http://100.86.210.85:18889']);
+    expect(mockExecFile).not.toHaveBeenCalled();
+  });
+
+  it('host が特定 IPv6 なら角括弧で囲んだ URL を返す', async () => {
+    const { resolveAccessUrls } = await loadModule();
+    expect(await resolveAccessUrls(18889, 'fd00::1')).toEqual(['http://[fd00::1]:18889']);
+  });
+});
+
+describe('classifyBindHost', () => {
+  it('loopback / wildcard / specific を分類する', async () => {
+    const { classifyBindHost } = await loadModule();
+    for (const h of ['127.0.0.1', 'localhost', '::1', ' LOCALHOST ']) {
+      expect(classifyBindHost(h)).toBe('loopback');
+    }
+    for (const h of ['0.0.0.0', '::', undefined, '', '  ']) {
+      expect(classifyBindHost(h)).toBe('wildcard');
+    }
+    for (const h of ['192.168.1.10', '100.86.210.85', 'fd00::1']) {
+      expect(classifyBindHost(h)).toBe('specific');
+    }
+  });
+});
+
+describe('primaryAccessUrl', () => {
+  it('specific は bind した host、それ以外は localhost を返す', async () => {
+    const { primaryAccessUrl } = await loadModule();
+    expect(primaryAccessUrl(18889)).toBe('http://localhost:18889');
+    expect(primaryAccessUrl(18889, '0.0.0.0')).toBe('http://localhost:18889');
+    expect(primaryAccessUrl(18889, '127.0.0.1')).toBe('http://localhost:18889');
+    expect(primaryAccessUrl(18889, '192.168.1.10')).toBe('http://192.168.1.10:18889');
+    expect(primaryAccessUrl(18889, 'fd00::1')).toBe('http://[fd00::1]:18889');
+  });
 });
 
 describe('isLoopbackHost', () => {
@@ -150,10 +196,7 @@ describe('isLoopbackHost', () => {
 describe('formatAccessUrls', () => {
   it('label と URL リストを整形する', async () => {
     const { formatAccessUrls } = await loadModule();
-    const out = formatAccessUrls('web-chat', [
-      'http://localhost:18889',
-      'http://spark-edbc:18889',
-    ]);
+    const out = formatAccessUrls('web-chat', ['http://localhost:18889', 'http://spark-edbc:18889']);
     expect(out).toBe(
       ['[web-chat] Access URLs:', '  - http://localhost:18889', '  - http://spark-edbc:18889'].join(
         '\n'

@@ -37,7 +37,7 @@ import { deriveTitleFromFirstMessage, stripPromptMetadata } from './session-titl
 import { handleInterChatRequest } from './inter-instance-chat/web-server.js';
 import { flowFromHostPlatform, getInterChatConfig } from './inter-instance-chat/index.js';
 import { setupAutoTalk } from './inter-instance-chat/auto-talk.js';
-import { resolveAccessUrls, formatAccessUrls } from './access-urls.js';
+import { resolveAccessUrls, formatAccessUrls, primaryAccessUrl } from './access-urls.js';
 import { handleEventsStreamRequest } from './events-stream-server.js';
 import { handlePetInboxRequest, isInboxPath } from './pet-inbox-server.js';
 import { handleEvenTerminalRequest } from './even-terminal-server.js';
@@ -1075,10 +1075,11 @@ export function startWebChat(options: WebChatOptions): void {
   });
 
   server.listen(port, host, () => {
-    console.log(`[web-chat] Chat UI: http://localhost:${port}`);
+    // 冒頭行も実際に到達できる URL に合わせる（specific IP bind なら localhost は誤誘導）。
+    console.log(`[web-chat] Chat UI: ${primaryAccessUrl(port, host)}`);
     // Tailscale が動いてれば LAN/Tailnet 経由のアクセス URL も出す（best-effort）。
-    // host を loopback に絞っている場合は LAN/Tailscale 経由では到達できないので、
-    // 誤誘導にならないよう localhost のみ表示する。
+    // host を loopback / 特定 IP に絞っている場合は到達できない経路を出さないよう、
+    // resolveAccessUrls 側で表示範囲を host 種別に合わせる。
     resolveAccessUrls(port, host)
       .then((urls) => {
         console.log(formatAccessUrls('web-chat', urls));
