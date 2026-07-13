@@ -37,7 +37,7 @@ import { deriveTitleFromFirstMessage, stripPromptMetadata } from './session-titl
 import { handleInterChatRequest } from './inter-instance-chat/web-server.js';
 import { flowFromHostPlatform, getInterChatConfig } from './inter-instance-chat/index.js';
 import { setupAutoTalk } from './inter-instance-chat/auto-talk.js';
-import { resolveAccessUrls, formatAccessUrls } from './access-urls.js';
+import { resolveAccessUrls, formatAccessUrls, primaryAccessUrl } from './access-urls.js';
 import { handleEventsStreamRequest } from './events-stream-server.js';
 import { handlePetInboxRequest, isInboxPath } from './pet-inbox-server.js';
 import { handleEvenTerminalRequest } from './even-terminal-server.js';
@@ -78,11 +78,13 @@ const busySessions = new Set<string>();
 interface WebChatOptions {
   agentRunner: AgentRunner;
   port?: number;
+  host?: string;
 }
 
 export function startWebChat(options: WebChatOptions): void {
   const { agentRunner } = options;
   const port = options.port || parseInt(process.env.WEB_CHAT_PORT || String(DEFAULT_PORT), 10);
+  const host = options.host || process.env.WEB_CHAT_HOST || '0.0.0.0';
   const workdir = process.env.WORKSPACE_PATH || process.cwd();
 
   // WEB_CHAT_UPLOAD_ACCEPT: 未設定なら全許可。設定時は HTML <input accept> にそのまま渡しつつ、
@@ -1072,10 +1074,13 @@ export function startWebChat(options: WebChatOptions): void {
     res.end('Not found');
   });
 
-  server.listen(port, '0.0.0.0', () => {
-    console.log(`[web-chat] Chat UI: http://localhost:${port}`);
-    // Tailscale が動いてれば LAN/Tailnet 経由のアクセス URL も出す（best-effort）
-    resolveAccessUrls(port)
+  server.listen(port, host, () => {
+    // 冒頭行も実際に到達できる URL に合わせる（specific IP bind なら localhost は誤誘導）。
+    console.log(`[web-chat] Chat UI: ${primaryAccessUrl(port, host)}`);
+    // Tailscale が動いてれば LAN/Tailnet 経由のアクセス URL も出す（best-effort）。
+    // host を loopback / 特定 IP に絞っている場合は到達できない経路を出さないよう、
+    // resolveAccessUrls 側で表示範囲を host 種別に合わせる。
+    resolveAccessUrls(port, host)
       .then((urls) => {
         console.log(formatAccessUrls('web-chat', urls));
         // pull 型 events SSE の URL も併せて出す。consumer (pet 等) はこれに繋ぐ。
