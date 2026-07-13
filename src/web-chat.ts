@@ -34,6 +34,7 @@ import { getActivity } from './activity-store.js';
 import { TIMEOUT_EXTEND_ENABLED } from './constants.js';
 import { runWithBubbleEvents } from './bubble-events-runner.js';
 import { deriveTitleFromFirstMessage, stripPromptMetadata } from './session-title.js';
+import { isSchedulerRunId } from './scheduler-run.js';
 import { handleInterChatRequest } from './inter-instance-chat/web-server.js';
 import { flowFromHostPlatform, getInterChatConfig } from './inter-instance-chat/index.js';
 import { setupAutoTalk } from './inter-instance-chat/auto-talk.js';
@@ -41,6 +42,16 @@ import { resolveAccessUrls, formatAccessUrls, primaryAccessUrl } from './access-
 import { handleEventsStreamRequest } from './events-stream-server.js';
 import { handlePetInboxRequest, isInboxPath } from './pet-inbox-server.js';
 import { handleEvenTerminalRequest } from './even-terminal-server.js';
+import { TurnLatencyRecorder } from './turn-latency.js';
+import { buildPrefetchedHistoryBlock } from './prefetched-history.js';
+import {
+  appendReplySuggestionInstruction,
+  fallbackReplySuggestions,
+  sanitizeReplySuggestionOutput,
+  stripReplySuggestionMarkup,
+} from './reply-suggestions.js';
+import type { Config } from './config.js';
+import { loadReplySuggestionsEnabled } from './settings.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -75,14 +86,25 @@ const pendingHistoryInjections = new Set<string>();
 /** 同一 appSessionId への並行送信を抑止するためのビジー集合 */
 const busySessions = new Set<string>();
 
+function hasInternalPromptMetadata(text: string): boolean {
+  return /\[runtime\]|<prefetched-history\b|(?:<|\[)system-context(?:>|\])|<xangi_reply/.test(text);
+}
+
 interface WebChatOptions {
   agentRunner: AgentRunner;
   port?: number;
+  historyPrefetch?: Config['historyPrefetch'];
+  replySuggestions?: Config['web'];
   host?: string;
 }
 
 export function startWebChat(options: WebChatOptions): void {
   const { agentRunner } = options;
+  const historyPrefetch = options.historyPrefetch ?? { enabled: false, count: 10 };
+  const replySuggestions = options.replySuggestions ?? {
+    replySuggestions: false,
+    replySuggestionCount: 3,
+  };
   const port = options.port || parseInt(process.env.WEB_CHAT_PORT || String(DEFAULT_PORT), 10);
   const host = options.host || process.env.WEB_CHAT_HOST || '0.0.0.0';
   const workdir = process.env.WORKSPACE_PATH || process.cwd();
@@ -252,13 +274,26 @@ export function startWebChat(options: WebChatOptions): void {
         const timeoutState =
           isActive && s.contextKey ? agentRunner.getTimeoutState?.(s.contextKey) : undefined;
         const threadId = isCurrentSession ? sessionThreadId(s) : null;
+        const storedTitle = s.title || '';
+        const title =
+          (storedTitle && !hasInternalPromptMetadata(storedTitle) ? storedTitle : '') ||
+          deriveTitleFromFirstMessage(workdir, s.id) ||
+          s.contextKey;
+        const activity = threadId ? getActivity(threadId) : undefined;
+        const transcriptPath = join(workdir, 'logs', 'sessions', `${s.id}.jsonl`);
+        const transcriptUpdatedAt = existsSync(transcriptPath)
+          ? statSync(transcriptPath).mtime.toISOString()
+          : undefined;
+        const updatedAt = activity?.updatedAt
+          ? new Date(activity.updatedAt).toISOString()
+          : transcriptUpdatedAt || s.updatedAt;
         return {
           id: s.id,
-          title: s.title || deriveTitleFromFirstMessage(workdir, s.id) || s.contextKey,
+          title,
           platform: s.platform,
           contextKey: s.contextKey,
           createdAt: s.createdAt,
-          updatedAt: s.updatedAt,
+          updatedAt,
           messageCount: s.messageCount,
           isActive,
           autoTalk: s.autoTalk === true,
@@ -266,7 +301,7 @@ export function startWebChat(options: WebChatOptions): void {
           timeoutAt: timeoutState?.active ? timeoutState.timeoutAt : undefined,
           maxTimeoutAt: timeoutState?.active ? timeoutState.maxTimeoutAt : undefined,
           timeoutMs: timeoutState?.active ? timeoutState.timeoutMs : undefined,
-          activity: threadId ? getActivity(threadId) : undefined,
+          activity,
         };
       });
       const managedIds = new Set(managed.map((s) => s.id));
@@ -280,6 +315,7 @@ export function startWebChat(options: WebChatOptions): void {
           if (!file.endsWith('.jsonl')) continue;
           const id = file.replace('.jsonl', '');
           if (managedIds.has(id)) continue;
+          if (isSchedulerRunId(id)) continue;
           const filePath = join(sessionsDir, file);
           const stat = statSync(filePath);
           const title = deriveTitleFromFirstMessage(workdir, id);
@@ -303,8 +339,9 @@ export function startWebChat(options: WebChatOptions): void {
         }
       }
 
-      unmanaged.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      const sessions = [...managed, ...unmanaged];
+      const sessions = [...managed, ...unmanaged].sort((a, b) =>
+        b.updatedAt.localeCompare(a.updatedAt)
+      );
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
@@ -333,10 +370,25 @@ export function startWebChat(options: WebChatOptions): void {
       const messages = readSessionMessages(workdir, appSessionId).map((m) => {
         const isObj = typeof m.content === 'object' && m.content !== null;
         const obj = isObj ? (m.content as Record<string, unknown>) : {};
+        const rawContent = isObj ? (obj.result ?? JSON.stringify(m.content)) : m.content;
+        const assistantReplyData =
+          m.role === 'assistant'
+            ? sanitizeReplySuggestionOutput(
+                String(rawContent),
+                loadReplySuggestionsEnabled(replySuggestions.replySuggestions),
+                replySuggestions.replySuggestionCount
+              )
+            : undefined;
+        const displayContent =
+          m.role === 'user'
+            ? stripPromptMetadata(String(rawContent))
+            : m.role === 'assistant'
+              ? assistantReplyData?.text || stripReplySuggestionMarkup(String(rawContent))
+              : rawContent;
         return {
           id: m.id,
           role: m.role,
-          content: isObj ? (obj.result ?? JSON.stringify(m.content)) : m.content,
+          content: displayContent,
           createdAt: m.createdAt,
           edited: m.edited,
           editedAt: m.editedAt,
@@ -347,6 +399,7 @@ export function startWebChat(options: WebChatOptions): void {
                 total_cost_usd: obj.total_cost_usd,
               }
             : undefined,
+          replySuggestions: assistantReplyData?.suggestions ?? [],
         };
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -354,7 +407,8 @@ export function startWebChat(options: WebChatOptions): void {
         JSON.stringify({
           id: appSessionId,
           title:
-            entry?.title ||
+            (entry?.title && !hasInternalPromptMetadata(entry.title) ? entry.title : '') ||
+            deriveTitleFromFirstMessage(workdir, appSessionId) ||
             messages
               .find((m) => m.role === 'user')
               ?.content?.toString()
@@ -836,6 +890,7 @@ export function startWebChat(options: WebChatOptions): void {
     // POST /api/chat — メッセージ送信（SSE）
     // body: { appSessionId?: string, message: string }
     if (url === '/api/chat' && req.method === 'POST') {
+      const requestReceivedAt = Date.now();
       try {
         const body = await readBody(req);
         const message = (body.message || '').toString();
@@ -885,28 +940,41 @@ export function startWebChat(options: WebChatOptions): void {
           ensureSession(ctxKey, { platform: 'web' });
           const sessionId = getSession(ctxKey);
 
-          // 履歴注入（resume 直後の初回送信）
+          // provider セッションが無い初回は直近履歴を先読みする。
+          // 新規 Web セッションは空履歴ブロックを入れ、初期確認目的の
+          // web_history 二重実行を避ける。
           let historyContext = '';
-          if (pendingHistoryInjections.has(appSessionId)) {
+          const hasExplicitResumeHistory = pendingHistoryInjections.has(appSessionId);
+          const shouldPrefetchFirstTurn = historyPrefetch.enabled && !sessionId;
+          if (hasExplicitResumeHistory || shouldPrefetchFirstTurn) {
             const pastMessages = readSessionMessages(workdir, appSessionId);
-            const recent = pastMessages.slice(-10);
-            if (recent.length > 0) {
-              const lines = recent
-                .map((m) => {
-                  const content =
-                    typeof m.content === 'object'
-                      ? ((m.content as Record<string, unknown>).result as string) || ''
-                      : String(m.content);
-                  const cleaned = stripPromptMetadata(content);
-                  return `${m.role === 'user' ? 'ユーザー' : 'AI'}: ${cleaned.slice(0, 200)}`;
-                })
-                .join('\n');
-              historyContext = `\n[以下はこのセッションの直近の会話履歴です。この文脈を踏まえて返答してください]\n${lines}\n[履歴ここまで]\n\n`;
-            }
+            const recent = pastMessages.slice(-historyPrefetch.count);
+            const entries = recent.map((m, index) => {
+              const content =
+                typeof m.content === 'object'
+                  ? ((m.content as Record<string, unknown>).result as string) || ''
+                  : String(m.content);
+              return {
+                timestamp: new Date(m.createdAt),
+                id: m.id || `web-history-${index}`,
+                author: m.role === 'user' ? 'ユーザー' : 'AI',
+                content: stripPromptMetadata(content),
+              };
+            });
+            historyContext = `${buildPrefetchedHistoryBlock('Web', entries)}\n\n`;
             pendingHistoryInjections.delete(appSessionId);
           }
 
-          const prompt = `[プラットフォーム: Web]\n${historyContext}${message}`;
+          let prompt = `[プラットフォーム: Web]\n${historyContext}${message}`;
+          const replySuggestionsEnabled = loadReplySuggestionsEnabled(
+            replySuggestions.replySuggestions
+          );
+          if (replySuggestionsEnabled) {
+            prompt = appendReplySuggestionInstruction(
+              prompt,
+              replySuggestions.replySuggestionCount
+            );
+          }
 
           console.log(`[web-chat] Message (session ${appSessionId}): ${message.slice(0, 100)}`);
 
@@ -924,6 +992,14 @@ export function startWebChat(options: WebChatOptions): void {
             platform: 'web' as const,
             userText: message,
           };
+          const latency = new TurnLatencyRecorder({
+            platform: 'web',
+            turnId,
+            threadId,
+            firstTurn: !sessionId,
+            receivedAt: requestReceivedAt,
+            workdir,
+          });
 
           res.writeHead(200, {
             'Content-Type': 'text/event-stream',
@@ -931,6 +1007,7 @@ export function startWebChat(options: WebChatOptions): void {
             Connection: 'keep-alive',
             'Access-Control-Allow-Origin': '*',
           });
+          latency.markInitialReply();
 
           const sendSSE = (event: string, data: unknown) => {
             res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -985,15 +1062,19 @@ export function startWebChat(options: WebChatOptions): void {
           }
 
           try {
+            latency.markAgentStart();
             const result = await runWithBubbleEvents(
               agentRunner,
               prompt,
               eventCtx,
               {
+                onBackendReady: () => latency.markBackendReady(),
                 onText: (_chunk, fullText) => {
-                  sendSSE('text', { fullText });
+                  latency.markText();
+                  sendSSE('text', { fullText: stripReplySuggestionMarkup(fullText) });
                 },
                 onToolUse: (toolName, toolInput) => {
+                  latency.markActivity();
                   const inputSummary =
                     Object.keys(toolInput).length > 0
                       ? ` ${JSON.stringify(toolInput).slice(0, 100)}`
@@ -1001,6 +1082,7 @@ export function startWebChat(options: WebChatOptions): void {
                   sendSSE('tool', { toolName, inputSummary });
                 },
                 onComplete: (completedResult) => {
+                  latency.markAgentComplete();
                   setProviderSessionId(appSessionId, completedResult.sessionId);
                   setSession(ctxKey, completedResult.sessionId);
                   incrementMessageCount(appSessionId);
@@ -1011,7 +1093,7 @@ export function startWebChat(options: WebChatOptions): void {
                   }
 
                   // INTER_INSTANCE_CHAT_ENABLED=true なら agent 応答も自分の jsonl に流す
-                  flowFromHostPlatform(completedResult.result, 'agent');
+                  flowFromHostPlatform(stripReplySuggestionMarkup(completedResult.result), 'agent');
                 },
                 onError: (error) => {
                   sendSSE('error', { message: error.message });
@@ -1038,16 +1120,30 @@ export function startWebChat(options: WebChatOptions): void {
               total_cost_usd: usageObj.total_cost_usd,
             };
 
+            const extracted = sanitizeReplySuggestionOutput(
+              result.result,
+              replySuggestionsEnabled,
+              replySuggestions.replySuggestionCount
+            );
+            if (replySuggestionsEnabled && extracted.suggestions.length === 0) {
+              extracted.suggestions = fallbackReplySuggestions(
+                replySuggestions.replySuggestionCount
+              );
+            }
             sendSSE('done', {
-              response: result.result,
+              response: extracted.text,
+              replySuggestions: extracted.suggestions,
               sessionId: appSessionId,
               usage,
               userMessageId: lastUser?.id,
               assistantMessageId: lastAssistant?.id,
             });
+            latency.finish('complete');
           } catch (err) {
+            latency.markAgentComplete();
             const errorMsg = err instanceof Error ? err.message : String(err);
             sendSSE('error', { message: errorMsg });
+            latency.finish(errorMsg === 'Request cancelled by user' ? 'cancelled' : 'error');
           } finally {
             // timeout listener を必ず解除 (res.end 前のリーク防止)
             if (runnerEmitter) {

@@ -41,13 +41,16 @@ Discord アカウントでログイン。
    - ✅ `bot`
    - ✅ `applications.commands`（スラッシュコマンド用）
 3. **BOT PERMISSIONS** で選択：
-   - ✅ Send Messages
-   - ✅ Send Messages in Threads
-   - ✅ Read Message History
-   - ✅ Add Reactions
-   - ✅ Use Slash Commands
+   - ✅ メッセージを送る（Send Messages）
+   - ✅ Threadsでメッセージを送る（Send Messages in Threads）
+   - ✅ スレッドを管理（Manage Threads。`Leave` ボタンで押下者を退出させる場合は必須）
+   - ✅ メッセージ履歴を読む（Read Message History）
+   - ✅ リアクションを付ける（Add Reactions）
+   - ✅ スラッシュコマンドを使用（Use Slash Commands）
 4. 生成された URL をコピー
 5. ブラウザで URL を開き、Bot を招待するサーバーを選択
+
+既にBotを招待済みのサーバーで権限を追加した場合は、生成したURLで再認可するか、サーバー設定のBotロール／対象チャンネル権限に直接反映する。URL Generatorでチェックしただけでは、既存Botの権限は更新されない。
 
 ## 6. 環境変数を設定
 
@@ -114,6 +117,10 @@ Discord サーバーで `/new` や `/skills` を試す、または Bot をメン
 ### 「Discord token not configured」エラー
 
 `.env` の `DISCORD_TOKEN` が空になっている。トークンを設定する。
+
+### `Leave` ボタンで退出できない
+
+Botのロールまたは対象チャンネルで「スレッドの管理」権限を有効にする。権限がない場合、Discord APIは `Missing Access` または `Missing Permissions` を返す。
 
 ## セキュリティ注意事項
 

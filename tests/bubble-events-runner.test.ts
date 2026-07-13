@@ -163,8 +163,20 @@ describe('runWithBubbleEvents', () => {
     const logged = readFileSync(logPath, 'utf-8')
       .trim()
       .split('\n')
-      .map((line) => JSON.parse(line) as { state: string; summary: string });
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            state: string;
+            summary: string;
+            toolName?: string;
+            toolInputPreview?: string;
+          }
+      );
     expect(logged.map((e) => e.state)).toEqual(['thinking', 'tool', 'complete']);
+    expect(logged[1]).toMatchObject({
+      toolName: 'Bash',
+      toolInputPreview: '{"command":"npm test"}',
+    });
     expect(logged.at(-1)?.summary).toContain('完了');
   });
 

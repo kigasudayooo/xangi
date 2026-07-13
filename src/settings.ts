@@ -3,6 +3,7 @@ import { join, dirname } from 'path';
 import type { DiscordCompletionNotifyMode } from './config.js';
 
 export interface Settings {
+  replySuggestionsEnabled?: boolean;
   discordAutoReplyChannels?: Record<string, boolean>;
   discordCompletionNotifyChannels?: Record<string, DiscordCompletionNotifyMode>;
   discordThreadModeChannels?: Record<string, boolean>;
@@ -95,6 +96,9 @@ export function loadSettings(): Settings {
       parsed.discordThreadModeChannels
     );
     cachedSettings = {
+      ...(typeof parsed.replySuggestionsEnabled === 'boolean' && {
+        replySuggestionsEnabled: parsed.replySuggestionsEnabled,
+      }),
       ...(discordAutoReplyChannels && { discordAutoReplyChannels }),
       ...(discordCompletionNotifyChannels && { discordCompletionNotifyChannels }),
       ...(discordThreadModeChannels && { discordThreadModeChannels }),
@@ -137,11 +141,25 @@ export function formatSettings(settings: Settings): string {
   const threadModeChannels = Object.keys(settings.discordThreadModeChannels ?? {}).length;
   const lines = [
     '⚙️ **現在の設定**',
+    `- 回答候補の全体設定: ${settings.replySuggestionsEnabled === undefined ? '起動時設定' : settings.replySuggestionsEnabled ? 'ON' : 'OFF'}`,
     `- Discordメンションなし応答チャンネル設定: ${autoReplyChannels}件`,
     `- Discord完了通知チャンネル設定: ${completionNotifyChannels}件`,
     `- Discordスレッドモードチャンネル設定: ${threadModeChannels}件`,
   ];
   return lines.join('\n');
+}
+
+export function getReplySuggestionsEnabled(settings: Settings, defaultEnabled: boolean): boolean {
+  return settings.replySuggestionsEnabled ?? defaultEnabled;
+}
+
+/** 起動初期化前の単体利用では、従来どおり起動時設定へフォールバックする。 */
+export function loadReplySuggestionsEnabled(defaultEnabled: boolean): boolean {
+  try {
+    return getReplySuggestionsEnabled(loadSettings(), defaultEnabled);
+  } catch {
+    return defaultEnabled;
+  }
 }
 
 export function getChannelAutoReply(

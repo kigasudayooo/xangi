@@ -349,10 +349,16 @@ export class CodexRunner extends CliRunnerBase {
     let sessionId = '';
     let errorMessage: string | undefined;
     const emittedToolIds = new Set<string>();
+    let backendReady = false;
 
     return {
       handleEvent: (json, phase) => {
         const event = json as CodexEvent;
+
+        if (!backendReady && event.type === 'thread.started') {
+          backendReady = true;
+          callbacks.onBackendReady?.();
+        }
 
         // セッションID抽出
         const sid = this.extractSessionId(event);

@@ -5,9 +5,10 @@ import type { Scheduler } from '../scheduler.js';
 import { buildAttachmentResult } from '../file-utils.js';
 import { splitMessage } from '../message-split.js';
 import { DISCORD_SAFE_LENGTH } from '../constants.js';
-import { ensureSession, setSession } from '../sessions.js';
 import { formatAgentErrorForUser } from '../errors.js';
 import { registerStreamFinalizer } from '../stream-finalizer.js';
+import { runWithBubbleEvents } from '../bubble-events-runner.js';
+import { createSchedulerRunId } from '../scheduler-run.js';
 import { waitBeforeFollowupDiscordSend } from './send-delay.js';
 import { createProcessingButtons, discordProcessingMessages } from './ui.js';
 
@@ -76,25 +77,27 @@ export function registerDiscordSchedulerBridge(deps: SchedulerBridgeDeps): void 
       // - Local LLM 経路: appSessionId を cron 発火ごとに unique 化して
       //   transcript jsonl からの restore を回避する（jsonl resume が
       //   cron 文脈で stateful 化してしまう構造バグの修正）。
-      //   ensureSession(scope=scheduler) は setSession 整合性のため維持。
-      const schedAppSessionId = ensureSession(channelId, {
-        platform: 'discord',
-        scope: 'scheduler',
-      });
-      const freshAppSessionId = `${schedAppSessionId}-${Date.now()}`;
-      const {
-        result,
-        sessionId: newSessionId,
-        attachments,
-      } = await agentRunner.run(agentPrompt, {
-        skipPermissions: config.agent.config.skipPermissions ?? false,
-        sessionId: undefined,
-        channelId,
-        appSessionId: freshAppSessionId,
-      });
-
-      // スケジューラーのセッションは scheduler スコープで保存
-      setSession(channelId, newSessionId, 'scheduler');
+      // - 通常セッションの activeByContext / updatedAt は触らない。
+      const freshAppSessionId = createSchedulerRunId('discord');
+      const eventCtx = {
+        threadId: `discord-schedule:${channelId}`,
+        turnId: `discord-schedule:${freshAppSessionId}`,
+        threadLabel: 'scheduled task',
+        platform: 'discord' as const,
+        userText: prompt,
+      };
+      const { result, attachments } = await runWithBubbleEvents(
+        agentRunner,
+        agentPrompt,
+        eventCtx,
+        {},
+        {
+          skipPermissions: config.agent.config.skipPermissions ?? false,
+          sessionId: undefined,
+          channelId,
+          appSessionId: freshAppSessionId,
+        }
+      );
 
       // 結果を送信（テキスト由来 + 構造化 attachments を合算・重複排除）
       const { filePaths, displayText } = buildAttachmentResult(result, attachments);

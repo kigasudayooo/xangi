@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { buildSlashCommands } from '../src/discord/slash-commands.js';
+import {
+  buildSlashCommands,
+  formatThreadLeaveError,
+  removeUserFromDiscordThread,
+} from '../src/discord/slash-commands.js';
 import type { Config } from '../src/config.js';
 import type { Skill } from '../src/skills.js';
 
@@ -25,6 +29,37 @@ function isInCodeBlock(lines: string[], targetIndex: number): boolean {
 }
 
 describe('Discord Commands', () => {
+  describe('removeUserFromDiscordThread', () => {
+    it('removes the clicking user from a thread', async () => {
+      const remove = vi.fn().mockResolvedValue(undefined);
+      const channel = { isThread: () => true, members: { remove } };
+
+      await expect(removeUserFromDiscordThread(channel as never, 'user-123')).resolves.toBe(true);
+      expect(remove).toHaveBeenCalledWith('user-123');
+    });
+
+    it('does not remove users from a normal channel', async () => {
+      const remove = vi.fn();
+      const channel = { isThread: () => false, members: { remove } };
+
+      await expect(removeUserFromDiscordThread(channel as never, 'user-123')).resolves.toBe(false);
+      expect(remove).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('formatThreadLeaveError', () => {
+    it('explains the required Discord permission for access errors', () => {
+      expect(formatThreadLeaveError({ code: 50001 })).toContain('スレッドの管理');
+      expect(formatThreadLeaveError({ code: 50013 })).toContain('スレッドの管理');
+    });
+
+    it('uses a generic message for other errors', () => {
+      expect(formatThreadLeaveError(new Error('network'))).toBe(
+        '❌ スレッドから退出できませんでした'
+      );
+    });
+  });
+
   describe('annotateChannelMentions', () => {
     it('should add channel ID annotation', () => {
       const input = '<#1234567890> に投稿して';
@@ -190,6 +225,28 @@ describe('Discord Commands', () => {
       expect(names).toContain('notify');
       expect(names).toContain('skill');
       expect(names.filter((name) => name.startsWith('skill-')).length).toBeLessThan(120);
+    });
+  });
+
+  describe('/replysuggestions command registration', () => {
+    it('registers the global on/off/show/default choices', () => {
+      const config = {
+        agent: { allowedBackends: ['claude-code'] },
+        discord: {},
+        slack: {},
+        web: { replySuggestions: true, replySuggestionCount: 3 },
+      } as Config;
+
+      const commands = buildSlashCommands(config, []);
+      const command = commands.find((cmd) => cmd.name === 'replysuggestions') as any;
+      const modeOption = command.options.find((opt: any) => opt.name === 'mode');
+
+      expect(modeOption.choices.map((choice: any) => choice.value)).toEqual([
+        'show',
+        'on',
+        'off',
+        'default',
+      ]);
     });
   });
 

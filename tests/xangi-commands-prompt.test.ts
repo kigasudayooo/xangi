@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { buildXangiCommands, XANGI_COMMANDS_TRIGGER } from '../src/prompts/xangi-commands.js';
+import {
+  buildXangiCommands,
+  XANGI_COMMANDS_COMMON,
+  XANGI_COMMANDS_TRIGGER,
+} from '../src/prompts/xangi-commands.js';
 
 const TRIGGER_HEADING = '## イベントトリガー（完了時に自分を起こす）';
 
@@ -39,15 +43,19 @@ describe('buildXangiCommands trigger section', () => {
     expect(buildXangiCommands('slack')).toContain(TRIGGER_HEADING);
   });
 
-  it('discord にはセッション再開時の履歴取得指示を注入する', () => {
+  it('discord には初回履歴取得指示を注入しない', () => {
     const prompt = buildXangiCommands('discord');
-    expect(prompt).toContain('## セッション再開時の文脈把握（重要）');
-    expect(prompt).toContain('xangi-cmd discord_history --count 10');
+    expect(prompt).not.toContain('## セッション再開時の文脈把握（重要）');
+    expect(prompt).not.toContain('<prefetched-history');
+    expect(prompt).toContain('xangi-cmd discord_history --count <件数>');
   });
 
   it('slack には Discord 履歴取得コマンドを注入しない', () => {
     const prompt = buildXangiCommands('slack');
     expect(prompt).not.toContain('xangi-cmd discord_history --count 10');
+    expect(prompt).not.toContain('## セッション再開時の文脈把握（重要）');
+    expect(prompt).not.toContain('<prefetched-history');
+    expect(prompt).toContain('xangi-cmd slack_history --count <件数>');
     expect(prompt).toContain('SlackチャンネルIDはDiscord snowflakeではありません');
     expect(prompt).toContain('xangi-cmd slack_send');
     expect(prompt).toContain('xangi-cmd slack_channels');
@@ -55,6 +63,13 @@ describe('buildXangiCommands trigger section', () => {
     expect(prompt).toContain('xangi-cmd slack_edit');
     expect(prompt).toContain('xangi-cmd slack_delete');
     expect(prompt).toContain('message-ts');
+  });
+
+  it('web には履歴取得指示を注入しない', () => {
+    const prompt = buildXangiCommands('web');
+    expect(prompt).not.toContain('## セッション再開時の文脈把握（重要）');
+    expect(prompt).not.toContain('<prefetched-history');
+    expect(prompt).not.toContain('web_history');
   });
 
   it('slack の schedule_add 例には --platform slack を含める', () => {
@@ -89,9 +104,39 @@ describe('buildXangiCommands trigger section', () => {
     expect(buildXangiCommands('line')).not.toContain(TRIGGER_HEADING);
   });
 
-  it('セクション本文に失敗時も発火させる `;` 区切りの案内がある', () => {
-    expect(XANGI_COMMANDS_TRIGGER).toContain('`;` にする');
+  it('環境固有の永続実行を前提に、失敗時も完了情報を残す', () => {
+    expect(XANGI_COMMANDS_TRIGGER).toContain('成功時だけでなく失敗時にもtriggerへ到達');
+    expect(XANGI_COMMANDS_TRIGGER).toContain('終了状態とログを保存');
+    expect(XANGI_COMMANDS_TRIGGER).toContain('ワークスペースの指示に従う');
     expect(XANGI_COMMANDS_TRIGGER).toContain('--source');
+    expect(XANGI_COMMANDS_TRIGGER).not.toMatch(/setsid|nohup|\/tmp\/|\`\`\`bash/);
+  });
+});
+
+describe('buildXangiCommands background process safety', () => {
+  it('環境に依存せず、ターン後の存続確認と完了記録を要求する', () => {
+    expect(XANGI_COMMANDS_COMMON).toContain('ターン終了後も存続する方法');
+    expect(XANGI_COMMANDS_COMMON).toContain('ワークスペースの指示に従う');
+    expect(XANGI_COMMANDS_COMMON).toContain('ログと終了状態を保存');
+    expect(XANGI_COMMANDS_COMMON).not.toMatch(/Claude|Codex|setsid|nohup|\/tmp\/|SID\/PGID/);
+  });
+
+  it.each(['discord', 'slack', 'web', 'line', 'telegram'] as const)(
+    '%s で自己再起動を遅延委譲せずsystem_restartへ誘導する',
+    (platform) => {
+      const prompt = buildXangiCommands(platform);
+
+      expect(prompt).toContain('現在のxangi自身');
+      expect(prompt).toContain('`xangi-cmd system_restart`をこのターンから直接呼び');
+      expect(prompt).toContain('遅延・子プロセス・スケジューラへ委譲しない');
+      expect(prompt).toContain('受付を完了とみなさず');
+      expect(prompt.match(/## 自己再起動/g)).toHaveLength(1);
+    }
+  );
+
+  it('自己再起動ルールも環境固有のプロセス操作を含まない', () => {
+    expect(XANGI_COMMANDS_COMMON).toContain('## 自己再起動');
+    expect(XANGI_COMMANDS_COMMON).not.toMatch(/Claude|Codex|setsid|nohup|\/tmp\/|SID\/PGID/);
   });
 });
 

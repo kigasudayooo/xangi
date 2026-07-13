@@ -56,6 +56,7 @@ const activeTtlMs = 60 * 60 * 1000;
 const terminalTtlMs = 60 * 1000;
 const maxPreviewChars = 120;
 const maxHistoryChars = 420;
+const maxToolInputChars = 2000;
 const maxUserChars = 80;
 const maxToolLines = 3;
 const maxHistoryEvents = 12;
@@ -110,7 +111,8 @@ function appendActivityLog(
   record: ActivityRecord,
   state: ActivityState,
   summary: string,
-  at: number
+  at: number,
+  details: { toolName?: string; toolInputPreview?: string } = {}
 ): void {
   try {
     const workdir = process.env.WORKSPACE_PATH || process.cwd();
@@ -127,6 +129,7 @@ function appendActivityLog(
         threadLabel: record.threadLabel,
         platform: record.platform,
         active: record.active,
+        ...details,
       }) + '\n'
     );
   } catch (err) {
@@ -143,7 +146,12 @@ function pushHistory(
   state: ActivityState,
   summary: string,
   at: number,
-  options: { coalesceSameState?: boolean; persist?: boolean } = {}
+  options: {
+    coalesceSameState?: boolean;
+    persist?: boolean;
+    toolName?: string;
+    toolInputPreview?: string;
+  } = {}
 ): void {
   const last = record.history.at(-1);
   if (options.coalesceSameState && last && last.state === state) {
@@ -153,7 +161,12 @@ function pushHistory(
   }
   if (last && last.state === state && last.summary === summary) return;
   record.history = [...record.history, { state, summary, at }].slice(-maxHistoryEvents);
-  if (options.persist !== false) appendActivityLog(record, state, summary, at);
+  if (options.persist !== false) {
+    appendActivityLog(record, state, summary, at, {
+      toolName: options.toolName,
+      toolInputPreview: options.toolInputPreview,
+    });
+  }
 }
 
 function getExisting(ctx: ActivityContext): ActivityRecord {
@@ -232,7 +245,10 @@ export function updateActivityTool(
   record.toolLines = [...record.toolLines.filter((x) => x !== line), line].slice(-maxToolLines);
   record.updatedAt = t;
   record.active = true;
-  pushHistory(record, record.state, record.summary, t);
+  pushHistory(record, record.state, record.summary, t, {
+    toolName,
+    toolInputPreview: truncate(maskSensitive(JSON.stringify(toolInput)), maxToolInputChars),
+  });
 }
 
 export function completeActivity(ctx: ActivityContext, resultText?: string): void {

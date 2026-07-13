@@ -155,7 +155,8 @@ xangi-prod service restart
 | `xangi-cmd discord_*`      | Discord operations (history / send / search, etc.)      |
 | `xangi-cmd trigger`        | Event trigger (start an agent turn when a job finishes) |
 
-Response messages include buttons (Stop / New Session). Set `DISCORD_SHOW_BUTTONS=false` to hide.
+Response messages include buttons (Stop / New Session). Discord, Slack, and Web Chat keep reply suggestions collapsed and continue the same session when one is selected. Discord and Slack reveal suggestions only to the user who opens them. In Discord threads, completed responses also show a `Leave` button that removes the user who clicked it from the thread (the bot requires the Manage Threads permission). Use Discord's `/replysuggestions mode:on|off|show|default` command to switch suggestions globally. OFF does not add the generation instruction to AI prompts, so it consumes no extra suggestion tokens. Environment variables define per-platform startup defaults.
+On the first provider turn, xangi prefetches recent Discord, Slack, or Web history. Set `HISTORY_PREFETCH_ENABLED=false` to disable it and `HISTORY_PREFETCH_COUNT` to change the number of messages.
 
 See [Usage Guide](docs/en/usage.md) for details.
 

@@ -6,13 +6,23 @@
  */
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { stripReplySuggestionMarkup } from './reply-suggestions.js';
 
 const PROMPT_METADATA_PATTERNS: RegExp[] = [
+  /^\[runtime\][^\n]*\n?\n?/,
   /^\[プラットフォーム: [^\]]*\]\n?/,
   /^\[チャンネル: [^\]]*\]\n?/,
+  /^\[スレッド: [^\]]*\]\n?/,
   /^\[発言者: [^\]]*\]\n?/,
   /^\[現在時刻: [^\]]*\]\n?/,
 ];
+
+const PREFETCHED_HISTORY_BLOCK = /<prefetched-history\b[^>]*>[\s\S]*?<\/prefetched-history>\s*/g;
+const PLATFORM_SYSTEM_CONTEXT_BLOCK = /<system-context\b[^>]*>[\s\S]*?<\/system-context>\s*/g;
+const PREFETCH_FOLLOWUP =
+  /初期文脈確認だけを目的に history コマンドを再実行しないでください。さらに古い履歴や追加件数が必要な場合だけ実行してください。\s*/g;
+const REPLY_SUGGESTION_CONTEXT =
+  /\s*\[system-context\]\s*通常の回答に続けて、ユーザーが次に送りそうな短い返信候補を\d+件生成してください。[\s\S]*?<\/xangi_reply_suggestions>\s*$/;
 
 /**
  * プロンプト先頭のメタデータ行を順に剥がして本文だけ返す。
@@ -20,11 +30,19 @@ const PROMPT_METADATA_PATTERNS: RegExp[] = [
  * 並ぶ前提で、未指定の行はスキップして OK。
  */
 export function stripPromptMetadata(text: string): string {
-  let s = text;
-  for (const re of PROMPT_METADATA_PATTERNS) {
-    s = s.replace(re, '');
+  let s = text
+    .replace(PLATFORM_SYSTEM_CONTEXT_BLOCK, '')
+    .replace(PREFETCHED_HISTORY_BLOCK, '')
+    .replace(PREFETCH_FOLLOWUP, '')
+    .replace(REPLY_SUGGESTION_CONTEXT, '');
+  let changed = true;
+  while (changed) {
+    const before = s;
+    for (const re of PROMPT_METADATA_PATTERNS) s = s.replace(re, '');
+    s = s.trimStart();
+    changed = s !== before;
   }
-  return s.trim();
+  return stripReplySuggestionMarkup(s).trim();
 }
 
 /**

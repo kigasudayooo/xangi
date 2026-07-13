@@ -24,7 +24,10 @@ import {
   createInteractionHandler,
   type SkillsRef,
 } from './discord/slash-commands.js';
-import { registerDiscordMessageHandlers } from './discord/message-handler.js';
+import {
+  processReplySuggestion,
+  registerDiscordMessageHandlers,
+} from './discord/message-handler.js';
 import { finalizeActiveStreams } from './stream-finalizer.js';
 import { registerDiscordSchedulerBridge } from './discord/scheduler-bridge.js';
 import { runShutdownCleanup } from './shutdown.js';
@@ -163,7 +166,11 @@ async function main() {
 
   // WebチャットUI起動
   if (process.env.WEB_CHAT_ENABLED === 'true') {
-    startWebChat({ agentRunner });
+    startWebChat({
+      agentRunner,
+      historyPrefetch: config.historyPrefetch,
+      replySuggestions: config.web,
+    });
   }
 
   // LINE Bot 起動 (Tailscale Funnel 等で外部公開して webhook を受ける想定)
@@ -316,7 +323,16 @@ async function main() {
     // スラッシュコマンド・ボタン・オートコンプリート処理
     client.on(
       Events.InteractionCreate,
-      createInteractionHandler({ config, resolver, agentRunner, scheduler, workdir, skillsRef })
+      createInteractionHandler({
+        config,
+        resolver,
+        agentRunner,
+        scheduler,
+        workdir,
+        skillsRef,
+        onReplySuggestion: (interaction, suggestion) =>
+          processReplySuggestion(interaction, agentRunner, config, suggestion),
+      })
     );
 
     // Discord APIエラーでプロセスが落ちないようにハンドリング

@@ -8,6 +8,8 @@ import type { Config } from '../src/config.js';
 import { clearSessions, initSessions } from '../src/sessions.js';
 import {
   _resetSlackStateForTest,
+  createSlackCompletedBlocks,
+  createSlackReplySuggestionBlocks,
   buildSlackCompletionNotification,
   processMessage,
   resolveSlackDeleteReactionTarget,
@@ -15,6 +17,53 @@ import {
   shouldReplyInSlackThread,
   slackConversationKey,
 } from '../src/slack.js';
+
+describe('Slack reply suggestion UI', () => {
+  it('keeps reply suggestions collapsed behind one completed-message button', () => {
+    const blocks = createSlackCompletedBlocks({
+      showTools: true,
+      showReplySuggestions: true,
+      replySuggestionPayload: {
+        messageKey: 'C1:1.2',
+        suggestions: ['a', 'b', 'c'],
+        threadTs: THREAD_TS,
+      },
+    });
+    const actionIds = blocks.flatMap((block) =>
+      block.type === 'actions' ? block.elements.map((element) => element.action_id) : []
+    );
+    expect(actionIds).toEqual(['xangi_new', 'xangi_tools', 'xangi_reply_suggestions']);
+    const suggestionButton = blocks
+      .flatMap((block) => (block.type === 'actions' ? block.elements : []))
+      .find((element) => element.action_id === 'xangi_reply_suggestions');
+    expect(JSON.parse(suggestionButton?.value ?? '{}')).toEqual({
+      messageKey: 'C1:1.2',
+      suggestions: ['a', 'b', 'c'],
+      threadTs: THREAD_TS,
+    });
+  });
+
+  it('uses unique action IDs for the ephemeral number buttons', () => {
+    const blocks = createSlackReplySuggestionBlocks('C1:1.2', ['a', 'b', 'c'], THREAD_TS);
+    const actionIds = blocks.flatMap((block) =>
+      block.type === 'actions' ? block.elements.map((element) => element.action_id) : []
+    );
+    expect(actionIds).toEqual([
+      'xangi_reply_suggestion_0',
+      'xangi_reply_suggestion_1',
+      'xangi_reply_suggestion_2',
+    ]);
+    expect(new Set(actionIds).size).toBe(actionIds.length);
+    const values = blocks.flatMap((block) =>
+      block.type === 'actions' ? block.elements.map((element) => JSON.parse(element.value)) : []
+    );
+    expect(values).toEqual([
+      { messageKey: 'C1:1.2', index: 0, threadTs: THREAD_TS },
+      { messageKey: 'C1:1.2', index: 1, threadTs: THREAD_TS },
+      { messageKey: 'C1:1.2', index: 2, threadTs: THREAD_TS },
+    ]);
+  });
+});
 
 const AUTO_REPLY_CHANNEL = 'C_AUTO_REPLY';
 const OTHER_CHANNEL = 'C_OTHER_CHANNEL';
@@ -91,7 +140,10 @@ describe('shouldReplyInSlackThread', () => {
 describe('shouldProcessSlackMessage', () => {
   it('processes DMs', () => {
     expect(
-      shouldProcessSlackMessage({ autoReplyChannels: [] }, { channel: DM_CHANNEL, channelType: 'im' })
+      shouldProcessSlackMessage(
+        { autoReplyChannels: [] },
+        { channel: DM_CHANNEL, channelType: 'im' }
+      )
     ).toBe(true);
   });
 
@@ -397,6 +449,7 @@ describe('processMessage', () => {
         appSessionId: expect.any(String),
       })
     );
+    expect(runStream.mock.calls[0]?.[0]).toContain('<xangi_reply_suggestions>');
     const lastUpdate = update.mock.calls.at(-1)?.[0] as {
       text?: string;
       blocks?: Array<{ type?: string; elements?: Array<{ action_id?: string }> }>;
@@ -408,6 +461,64 @@ describe('processMessage', () => {
         block.elements?.some((element) => element.action_id === 'xangi_tools')
       )
     ).toBe(true);
+    expect(
+      lastUpdate.blocks?.some((block) =>
+        block.elements?.some((element) => element.action_id === 'xangi_reply_suggestions')
+      )
+    ).toBe(true);
+    expect(lastUpdate.text).not.toContain('返信候補');
+  });
+
+  it('uses the same byte limit for completed Block Kit text and message splitting', async () => {
+    const result = 'あ'.repeat(2000); // 6000 UTF-8 bytes
+    const postMessage = vi.fn().mockResolvedValue({ ts: '1783402634.549099' });
+    const update = vi.fn().mockResolvedValue({});
+    const client = {
+      chat: { postMessage, update },
+      conversations: { info: vi.fn().mockResolvedValue({ channel: { name: 'dev' } }) },
+      reactions: { remove: vi.fn().mockResolvedValue({}) },
+    } as unknown as WebClient;
+    const runStream = vi.fn().mockImplementation(async (_prompt, callbacks) => {
+      callbacks.onText?.(result, result);
+      callbacks.onComplete?.({ result, sessionId: 'provider-1' });
+      return { result, sessionId: 'provider-1' };
+    });
+    const agentRunner = {
+      runStream,
+      getTimeoutState: vi.fn().mockReturnValue(undefined),
+    } as unknown as AgentRunner;
+    const config = {
+      agent: { config: { skipPermissions: false, workdir: tempDir } },
+      slack: { streaming: true, showThinking: true },
+    } as Config;
+    const runKey = slackConversationKey(AUTO_REPLY_CHANNEL, THREAD_TS);
+
+    await processMessage(
+      AUTO_REPLY_CHANNEL,
+      runKey,
+      THREAD_TS,
+      '長文テスト',
+      '1783402632.322829',
+      client,
+      agentRunner,
+      config
+    );
+
+    const completedUpdate = update.mock.calls.at(-1)?.[0] as {
+      text: string;
+      blocks: Array<{ type: string; text?: { text: string } }>;
+    };
+    const completedBlockText = completedUpdate.blocks.find((block) => block.type === 'section')
+      ?.text?.text;
+    expect(new TextEncoder().encode(completedUpdate.text)).toHaveLength(3000);
+    expect(completedBlockText).toBe(completedUpdate.text);
+
+    const continuationPayload = postMessage.mock.calls
+      .map(([payload]) => payload as { text?: string; thread_ts?: string })
+      .find((payload) => payload.text === 'あ'.repeat(1000));
+    expect(continuationPayload).toEqual(
+      expect.objectContaining({ thread_ts: THREAD_TS, text: 'あ'.repeat(1000) })
+    );
   });
 
   it('skips a second run while the same conversationKey is busy', async () => {

@@ -234,6 +234,7 @@ Manages the system prompts that xangi injects into AI CLIs:
   - Automatic platform detection: If only Discord is active, only Discord-specific commands are injected (saves tokens)
 - **Platform identification** — Each message is annotated with `[Platform: Discord]` or `[Platform: Slack]`. The AI uses the appropriate commands accordingly
 - **Tool-use display** — Discord tool-use history is controlled by `DISCORD_TOOL_HISTORY_MODE=button|inline|off`. The default is `button`: completed messages do not include the history inline, and a `Tools` button shows it only to the user who clicked it via an ephemeral response. Slack uses the same `Tools` button pattern and does not inline tool history in the completed message. `DISCORD_SHOW_TOOL_BUTTON=false` hides the Tools button for Discord even in `button` mode. `inline` keeps the previous top-of-message display, and `off` disables tool history display. For compatibility, `DISCORD_SHOW_TOOL_USE=false` maps to `off` and `true` maps to `inline`. While a turn is running, xangi shows raw commands unless `DISCORD_SHOW_LIVE_TOOL_USE=false`. After completion it normalizes internal context tools into short labels such as `workspace-RAG検索`; Bash/exec final history strips wrappers such as `/bin/bash -lc` and shows a shorter command summary. Live Bash/exec tool argument display is capped at 200 characters and can be configured with `XANGI_TOOL_DISPLAY_MAX`.
+- **Reply suggestions** — Discord, Slack, and Web Chat generate suggestions in a dedicated JSON block within the same AI response and remove that block before display. Discord and Slack expose one public `返信候補` button and reveal choices ephemerally to the requesting user. Web Chat uses a collapsed control below the response. Selecting a choice continues the same session. Discord's `/replysuggestions` command persists a global override in `settings.json`; every platform checks it immediately before processing a message. OFF skips suggestion prompt injection. Session titles and transcript views also remove history-prefetch and suggestion-generation metadata.
 
 AGENTS.md / CHARACTER.md / USER.md and other workspace settings are delegated to each AI CLI's auto-loading feature:
 
@@ -733,14 +734,21 @@ skills/
    ↓
 5. Attach channel info and sender info
    ↓
-6. Forward to AI CLI (processPrompt)
+6. Prefetch recent history only for the first provider turn
+   - Discord: channel / thread history
+   - Slack: conversations.history / conversations.replies
+   - Web: session JSONL
    ↓
-7. Response processing
+7. Forward to AI CLI (processPrompt)
+   ↓
+8. Response processing
    - Streaming display
    - File attachment extraction (MEDIA: pattern)
    ↓
-8. Reply to user
+9. Reply to user
 ```
+
+Prefetched history is wrapped as quoted data so instructions inside it are not treated as system instructions. `HISTORY_PREFETCH_ENABLED` and `HISTORY_PREFETCH_COUNT` are shared across all three platforms. Per-stage latency is recorded in `logs/turn-latency/<platform>.jsonl`.
 
 ### Schedule Execution Flow
 

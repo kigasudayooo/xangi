@@ -11,6 +11,7 @@ import {
   getChannelAutoReply,
   getChannelCompletionNotifyMode,
   getChannelThreadMode,
+  getReplySuggestionsEnabled,
 } from '../src/settings.js';
 
 describe('settings', () => {
@@ -43,6 +44,16 @@ describe('settings', () => {
 
       const settings = loadSettings();
       expect(settings.discordAutoReplyChannels).toEqual({ '123': true });
+    });
+
+    it('should load a global reply suggestion override', () => {
+      const filePath = join(tempDir, 'settings.json');
+      const { writeFileSync } = require('fs');
+      writeFileSync(filePath, JSON.stringify({ replySuggestionsEnabled: false }));
+
+      const settings = loadSettings();
+      expect(settings.replySuggestionsEnabled).toBe(false);
+      expect(getReplySuggestionsEnabled(settings, true)).toBe(false);
     });
 
     it('should load valid Discord completion notification channel settings', () => {

@@ -243,6 +243,7 @@ xangiがAI CLIに注入するシステムプロンプトを管理：
 - **注入タイミング**: 全 backend の `run()` / `runStream()` 入口で `prependRuntimeContext()`。常駐プロセス（`persistent-runner.ts`）は `--append-system-prompt` が起動時固定なので user message 本文に注入する
 - **無効化**: `XANGI_RUNTIME_CONTEXT_ENABLED=false`（既定 true）で注入をオフにできる。雑談中心のインスタンスや、cwd ブレが事故に繋がらない用途で
 - **ツール呼び出し表示**: Discord のツール履歴表示は `DISCORD_TOOL_HISTORY_MODE=button|inline|off` で制御する。既定は `button` で、完了後の通常メッセージには履歴を混ぜず、`Tools` ボタン押下時に押した本人だけへ ephemeral で表示する。Slack も同じ `Tools` ボタン方式を使い、完了後の本文へツール履歴を直出ししない。`DISCORD_SHOW_TOOL_BUTTON=false` なら Discord の `button` モードでも `Tools` ボタンを出さない。`inline` は従来どおり本文上部に表示、`off` は完全非表示。互換設定として `DISCORD_SHOW_TOOL_USE=false` は `off`、`true` は `inline` として扱う。実行中は `DISCORD_SHOW_LIVE_TOOL_USE=false` で無効化しない限り、実コマンドが分かる raw 表示を出す。完了後は `workspace-RAG検索` などの短い履歴ラベルへ正規化し、Bash/exec は `/bin/bash -lc` などの wrapper を落として短縮表示する。実行中の Bash/exec ツール呼び出しの引数表示の最大長は 200 文字で、env `XANGI_TOOL_DISPLAY_MAX` で変更可。
+- **返信候補**: Discord / Slack / Web Chat の通常会話では、同じAI応答の末尾に専用JSONブロックで返信候補を生成させ、表示前にブロックを除去する。Discord / Slackは通常メッセージに `返信候補` ボタンだけを置き、押した本人への ephemeral 応答で候補を表示する。Web Chatは回答下の折りたたみUIで表示する。選択文は同じセッションへユーザー入力として渡す。Discordの `/replysuggestions` は `settings.json` の全体overrideを更新し、各プラットフォームはメッセージ処理直前に参照する。OFF時は候補生成指示をプロンプトへ追加しない。タイトル・transcript表示では履歴先読みや候補生成の内部メタデータも除去する。
 
 AGENTS.md / CHARACTER.md / USER.md 等のワークスペース設定は、各AI CLIの自動読み込み機能に委譲：
 
@@ -741,14 +742,21 @@ skills/
    ↓
 5. チャンネル情報・発言者情報を付与
    ↓
-6. AI CLIに転送（processPrompt）
+6. providerセッションの初回だけ直近履歴を先読み
+   - Discord: channel / thread history
+   - Slack: conversations.history / conversations.replies
+   - Web: session JSONL
    ↓
-7. レスポンス処理
+7. AI CLIに転送（processPrompt）
+   ↓
+8. レスポンス処理
    - ストリーミング表示
    - ファイル添付抽出（MEDIA:パターン）
    ↓
-8. ユーザーに返信
+9. ユーザーに返信
 ```
+
+先読み結果は引用データ境界でpromptに含め、履歴内の命令文をsystem指示として扱わない。`HISTORY_PREFETCH_ENABLED` と `HISTORY_PREFETCH_COUNT` は3プラットフォーム共通。区間別レイテンシは `logs/turn-latency/<platform>.jsonl` に記録する。
 
 ### スケジュール実行フロー
 

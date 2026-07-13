@@ -45,6 +45,7 @@ On the same Bot page, configure **Privileged Gateway Intents**:
 3. Under **BOT PERMISSIONS**, select:
    - Send Messages
    - Send Messages in Threads
+   - Manage Threads (required when using the `Leave` button to remove the user who clicked it)
    - Read Message History
    - Add Reactions
    - Use Slash Commands
@@ -116,6 +117,10 @@ Try `/new` or `/skills` in your Discord server, or mention the bot:
 ### "Discord token not configured" Error
 
 The `DISCORD_TOKEN` in `.env` is empty. Set the token.
+
+### The `Leave` button does not remove the user
+
+Enable Manage Threads for the bot role or the target channel. Without it, the Discord API returns `Missing Access` or `Missing Permissions`.
 
 ## Security Notes
 

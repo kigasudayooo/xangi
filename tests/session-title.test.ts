@@ -2,10 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import {
-  stripPromptMetadata,
-  deriveTitleFromFirstMessage,
-} from '../src/session-title.js';
+import { stripPromptMetadata, deriveTitleFromFirstMessage } from '../src/session-title.js';
 
 describe('stripPromptMetadata', () => {
   it('Discord 形式のメタデータ4行をすべて剥がす', () => {
@@ -19,8 +16,7 @@ describe('stripPromptMetadata', () => {
   });
 
   it('Slack 形式（プラットフォーム + チャンネルのみ）も剥がせる', () => {
-    const input =
-      '[プラットフォーム: Slack]\n' + '[チャンネル: C12345]\n' + 'メッセージ本体';
+    const input = '[プラットフォーム: Slack]\n' + '[チャンネル: C12345]\n' + 'メッセージ本体';
     expect(stripPromptMetadata(input)).toBe('メッセージ本体');
   });
 
@@ -35,6 +31,33 @@ describe('stripPromptMetadata', () => {
 
   it('空文字なら空文字を返す', () => {
     expect(stripPromptMetadata('')).toBe('');
+  });
+
+  it('履歴先読みと返信候補の内部コンテキストを剥がす', () => {
+    const input = `[runtime] cwd=/tmp repo=test
+
+[プラットフォーム: Web]
+<prefetched-history platform="Web">
+xangiが初期文脈確認用の直近履歴を先読み済みです。
+</prefetched-history>
+初期文脈確認だけを目的に history コマンドを再実行しないでください。さらに古い履歴や追加件数が必要な場合だけ実行してください。
+
+本当の質問です
+
+[system-context]
+通常の回答に続けて、ユーザーが次に送りそうな短い返信候補を3件生成してください。出力の末尾に次の形式を厳密に付け、通常の回答本文では候補に言及しないでください。候補はユーザー視点の自然な日本語にしてください。
+<xangi_reply_suggestions>["候補1","候補2","候補3"]</xangi_reply_suggestions>`;
+    expect(stripPromptMetadata(input)).toBe('本当の質問です');
+  });
+
+  it('チャットプラットフォームのsystem-contextブロックを剥がす', () => {
+    const input = `<system-context>
+あなたはチャットプラットフォーム（Discord）経由で会話しています。
+</system-context>
+[プラットフォーム: Discord]
+[発言者: からあげ]
+表示したい発言`;
+    expect(stripPromptMetadata(input)).toBe('表示したい発言');
   });
 });
 
@@ -81,9 +104,7 @@ describe('deriveTitleFromFirstMessage', () => {
   });
 
   it('1 行目が user でなければ空文字', () => {
-    writeLog('sess3', [
-      { id: 'm1', role: 'system', content: 'system note', createdAt: '' },
-    ]);
+    writeLog('sess3', [{ id: 'm1', role: 'system', content: 'system note', createdAt: '' }]);
     expect(deriveTitleFromFirstMessage(workdir, 'sess3')).toBe('');
   });
 

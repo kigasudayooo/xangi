@@ -156,7 +156,8 @@ xangi-prod service restart
 | `xangi-cmd discord_*`      | Discord操作（履歴取得・メッセージ送信・検索等）          |
 | `xangi-cmd trigger`        | イベントトリガー（処理完了時にエージェントターンを起動） |
 
-応答メッセージにはボタン（Stop / New Session）が表示されます。`DISCORD_SHOW_BUTTONS=false` で非表示。
+応答メッセージにはボタン（Stop / New Session）が表示されます。Discord / Slack / Web Chatでは返信候補を折りたたんで表示し、選択すると同じセッションへ送信します。Discord / Slackは押した本人だけに候補を表示します。Discordスレッド内では、完了後に押した本人を退出させる `Leave` ボタンも表示します（Botに「スレッドの管理」権限が必要）。返信候補はDiscordの `/replysuggestions mode:on|off|show|default` で全体切替でき、OFF時は候補生成指示をAIへ送らないため追加トークンを消費しません。プラットフォーム別の起動時設定には環境変数を使います。
+初回ターンではDiscord / Slack / Webの直近履歴を自動的に先読みします。`HISTORY_PREFETCH_ENABLED=false` で無効化、`HISTORY_PREFETCH_COUNT` で件数を変更できます。
 
 詳細は [使い方ガイド](docs/usage.md) を参照してください。
 

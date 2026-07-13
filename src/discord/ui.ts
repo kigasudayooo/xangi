@@ -53,6 +53,23 @@ export function createProcessingButtons(timeout?: {
 export type DiscordProcessingEntry = { message: Message; intervalId?: NodeJS.Timeout };
 export const discordProcessingMessages = new Map<string, DiscordProcessingEntry>();
 export const discordToolHistoryByMessageId = new Map<string, string[]>();
+export const discordReplySuggestionsByMessageId = new Map<string, string[]>();
+
+export function createReplySuggestionButtons(
+  sourceMessageId: string,
+  count: number
+): ActionRowBuilder<ButtonBuilder> {
+  const row = new ActionRowBuilder<ButtonBuilder>();
+  for (let index = 0; index < Math.min(count, 5); index++) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`xangi_reply_suggestion_${sourceMessageId}_${index}`)
+        .setLabel(String(index + 1))
+        .setStyle(ButtonStyle.Primary)
+    );
+  }
+  return row;
+}
 
 /** チャンネルの現在のタイムアウト状態から Discord UI 用に整形 */
 export function getDiscordTimeoutInfoFor(
@@ -71,6 +88,8 @@ export function getDiscordTimeoutInfoFor(
 /** 完了後に表示するボタン群 */
 export function createCompletedButtons(options?: {
   showTools?: boolean;
+  showLeave?: boolean;
+  showReplySuggestions?: boolean;
 }): ActionRowBuilder<ButtonBuilder> {
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId('xangi_new').setLabel('New').setStyle(ButtonStyle.Secondary)
@@ -80,6 +99,22 @@ export function createCompletedButtons(options?: {
       new ButtonBuilder()
         .setCustomId('xangi_tools')
         .setLabel('Tools')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  if (options?.showLeave) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('xangi_thread_leave')
+        .setLabel('Leave')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  if (options?.showReplySuggestions) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('xangi_reply_suggestions')
+        .setLabel('返信候補')
         .setStyle(ButtonStyle.Secondary)
     );
   }

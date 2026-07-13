@@ -43,6 +43,57 @@ describe('config', () => {
     expect(config.discord.allowedUsers).toContain('123456789');
   });
 
+  it('disables Discord reply suggestions by default and supports overrides', async () => {
+    process.env.DISCORD_TOKEN = 'test-discord-token';
+    delete process.env.DISCORD_REPLY_SUGGESTIONS;
+    delete process.env.DISCORD_REPLY_SUGGESTIONS_COUNT;
+
+    const { loadConfig } = await import('../src/config.js');
+    const defaults = loadConfig();
+    expect(defaults.discord.replySuggestions).toBe(false);
+    expect(defaults.discord.replySuggestionCount).toBe(3);
+
+    process.env.DISCORD_REPLY_SUGGESTIONS = 'true';
+    process.env.DISCORD_REPLY_SUGGESTIONS_COUNT = '5';
+    const overridden = loadConfig();
+    expect(overridden.discord.replySuggestions).toBe(true);
+    expect(overridden.discord.replySuggestionCount).toBe(5);
+  });
+
+  it('disables Slack reply suggestions by default and supports overrides', async () => {
+    process.env.WEB_CHAT_ENABLED = 'true';
+    delete process.env.SLACK_REPLY_SUGGESTIONS;
+    delete process.env.SLACK_REPLY_SUGGESTIONS_COUNT;
+
+    const { loadConfig } = await import('../src/config.js');
+    const defaults = loadConfig();
+    expect(defaults.slack.replySuggestions).toBe(false);
+    expect(defaults.slack.replySuggestionCount).toBe(3);
+
+    process.env.SLACK_REPLY_SUGGESTIONS = 'true';
+    process.env.SLACK_REPLY_SUGGESTIONS_COUNT = '5';
+    const overridden = loadConfig();
+    expect(overridden.slack.replySuggestions).toBe(true);
+    expect(overridden.slack.replySuggestionCount).toBe(5);
+  });
+
+  it('disables Web reply suggestions by default and supports overrides', async () => {
+    process.env.WEB_CHAT_ENABLED = 'true';
+    delete process.env.WEB_REPLY_SUGGESTIONS;
+    delete process.env.WEB_REPLY_SUGGESTIONS_COUNT;
+
+    const { loadConfig } = await import('../src/config.js');
+    const defaults = loadConfig();
+    expect(defaults.web.replySuggestions).toBe(false);
+    expect(defaults.web.replySuggestionCount).toBe(3);
+
+    process.env.WEB_REPLY_SUGGESTIONS = 'true';
+    process.env.WEB_REPLY_SUGGESTIONS_COUNT = '5';
+    const overridden = loadConfig();
+    expect(overridden.web.replySuggestions).toBe(true);
+    expect(overridden.web.replySuggestionCount).toBe(5);
+  });
+
   it('should default Discord completion notifications to message after 10 seconds', async () => {
     process.env.DISCORD_TOKEN = 'test-discord-token';
     delete process.env.DISCORD_COMPLETION_NOTIFY;
@@ -441,5 +492,27 @@ describe('config', () => {
     const config = loadConfig();
 
     expect(config.slack.deleteReactions).toEqual(['wastebasket', 'x', 'xangi_delete']);
+  });
+
+  it('should enable first-turn history prefetch with 10 messages by default', async () => {
+    process.env.DISCORD_TOKEN = 'test-token';
+    delete process.env.HISTORY_PREFETCH_ENABLED;
+    delete process.env.HISTORY_PREFETCH_COUNT;
+
+    const { loadConfig } = await import('../src/config.js');
+    const config = loadConfig();
+
+    expect(config.historyPrefetch).toEqual({ enabled: true, count: 10 });
+  });
+
+  it('should configure or disable first-turn history prefetch', async () => {
+    process.env.DISCORD_TOKEN = 'test-token';
+    process.env.HISTORY_PREFETCH_ENABLED = 'false';
+    process.env.HISTORY_PREFETCH_COUNT = '25';
+
+    const { loadConfig } = await import('../src/config.js');
+    const config = loadConfig();
+
+    expect(config.historyPrefetch).toEqual({ enabled: false, count: 25 });
   });
 });

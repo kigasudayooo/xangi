@@ -63,6 +63,7 @@ export async function runWithBubbleEvents(
     return await runner.runStream(
       prompt,
       {
+        onBackendReady: () => callbacks.onBackendReady?.(),
         onText: (chunk, fullText) => {
           updateActivityText(ctx, fullText);
           events.messageDelta({ ...eventBase, chunk, fullText });

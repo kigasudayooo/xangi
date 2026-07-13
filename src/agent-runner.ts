@@ -65,6 +65,8 @@ export interface ExtendTimeoutResult {
 }
 
 export interface StreamCallbacks {
+  /** バックエンドがリクエストを受理し、セッション開始イベントを返した時 */
+  onBackendReady?: () => void;
   onText?: (text: string, fullText: string) => void;
   onToolUse?: (toolName: string, toolInput: Record<string, unknown>) => void;
   onComplete?: (result: RunResult) => void;

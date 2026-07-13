@@ -85,8 +85,11 @@ Buttons are displayed on response messages.
   - `延長` (Extend) — **doubles the remaining time** (adds residual to the deadline, capped at `TIMEOUT_MAX_MS`)
   - `⏱ MM:SS` — remaining time badge (click does nothing, turns red under 30s)
 - **After completion**: `New` button — equivalent to `/new`. Resets the session
+- **After completion in a Discord thread**: `Leave` button — removes the user who clicked it from the thread, removing the thread from that user's sidebar. The bot requires the Discord Manage Threads permission
 
 Set `DISCORD_SHOW_BUTTONS=false` to hide buttons.
+
+Reply suggestions are disabled by default. When enabled, Discord and Slack completed messages show only one `返信候補` button. Opening it reveals suggestions and number buttons only to that user; selecting one continues the same session. Web Chat provides the same collapsed control below each response. Discord's `/replysuggestions mode:on|off|show|default` switches the feature globally. OFF skips prompt injection, so no extra suggestion tokens or generation latency are incurred. Set the platform-specific `*_REPLY_SUGGESTIONS=true` variables to enable the feature at startup, and use `*_REPLY_SUGGESTIONS_COUNT` to change the default count of 3.
 
 ### Dynamic Timeout Extension
 
@@ -381,7 +384,7 @@ Local scripts can also fire a trigger via `xangi-cmd` (no token needed; `TRIGGER
 xangi-cmd trigger --channel <channel ID> --message "Build finished. Report the result." --source build
 ```
 
-When `TRIGGER_ENABLED=true`, this usage is also injected into the agent's own system prompt (XANGI_COMMANDS), so the agent can proactively use the "fire a trigger to wake itself when done" pattern for long-running `nohup` jobs.
+When `TRIGGER_ENABLED=true`, this usage is also injected into the agent's own system prompt (XANGI_COMMANDS). The common prompt requires long-running work to survive the end of the current tool execution or turn, verifies that it started and remains alive, and persists its log and exit status. Each workspace defines the concrete launch and verification method because it depends on the operating system and execution backend. The completion or failure handler can fire a trigger to start a new turn.
 
 ### Abuse protection
 
@@ -537,6 +540,8 @@ The above response is sent as two separate messages to Discord.
 `./bin/xangi service start|stop|restart|status` is the high-level command that controls the supervisor outside xangi. In PM2 deployments, it targets the process named by `XANGI_PROCESS_NAME` in that clone's `.env`.
 
 `/restart` and `xangi-cmd system_restart` are low-level operations that ask the running xangi process to gracefully shut down. The external supervisor, such as Docker, pm2, or systemd, is responsible for starting xangi again.
+
+To restart the xangi instance handling the current conversation, call `xangi-cmd system_restart` directly instead of delegating a delayed restart to a child process or scheduler. A successful response means that the restart request was accepted; confirm completion from the new process status, start time, and startup log. To operate a different clone, run that clone's `./bin/xangi service restart` directly and wait for completion.
 
 Self restart permission is configured by the administrator in `.env` with `XANGI_SELF_LIFECYCLE`. It is not a runtime setting that the AI changes. Shutdown cannot be guaranteed from inside xangi itself, so stopping xangi is handled by the external lifecycle manager such as Docker, pm2, or systemd.
 
@@ -1082,6 +1087,23 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 
 ## Environment Variables Reference
 
+### First-turn history prefetch (Discord / Slack / Web)
+
+| Variable                     | Description                                                        | Default |
+| ---------------------------- | ------------------------------------------------------------------ | ------- |
+| `HISTORY_PREFETCH_ENABLED`   | Prefetch recent history before the first provider turn             | `true`  |
+| `HISTORY_PREFETCH_COUNT`     | Number of messages to prefetch (`1` to `100`)                       | `10`    |
+
+Prefetch runs only when no provider session ID exists. Continuing turns use the provider session's existing context. When disabled, xangi does not inject first-turn history.
+
+- Discord channel: the latest messages before the current message
+- New Discord thread: zero prior messages; the current message is the thread starter
+- Existing Discord thread: recent thread messages plus the separately injected parent-channel starter
+- Slack channel: recent messages from `conversations.history`
+- New Slack thread: zero prior messages
+- Existing Slack thread: the root and recent replies from `conversations.replies`, excluding the current message
+- Web Chat: recent messages from the current pane's session JSONL; a new pane has zero prior messages
+
 ### Discord
 
 | Variable                             | Description                                                                                                        | Default      |
@@ -1092,6 +1114,8 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | `DISCORD_STREAMING`                  | Streaming output                                                                                                   | `true`       |
 | `DISCORD_SHOW_THINKING`              | Show thinking process                                                                                              | `true`       |
 | `DISCORD_SHOW_BUTTONS`               | Show Stop/New Session buttons                                                                                      | `true`       |
+| `DISCORD_REPLY_SUGGESTIONS`          | Show a user-only `返信候補` button for reply suggestions                                                           | `false`      |
+| `DISCORD_REPLY_SUGGESTIONS_COUNT`    | Number of reply suggestions (1-5)                                                                                  | `3`          |
 | `DISCORD_TOOL_HISTORY_MODE`          | Tool-use history display (`button` / `inline` / `off`)                                                             | `button`     |
 | `DISCORD_SHOW_TOOL_BUTTON`           | Show the Tools button in `button` mode                                                                             | `true`       |
 | `DISCORD_SHOW_LIVE_TOOL_USE`         | Show raw tool history while running                                                                                | `true`       |
@@ -1159,6 +1183,8 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 | Variable                   | Description                                                                                                                                                                                           | Default             |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
 | `WEB_CHAT_ENABLED`         | Enable Web Chat UI. `true` exposes `http://localhost:<WEB_CHAT_PORT>`                                                                                                                                 | `false`             |
+| `WEB_REPLY_SUGGESTIONS`    | Show collapsed reply suggestions below responses                                                                                                                                                     | `false`             |
+| `WEB_REPLY_SUGGESTIONS_COUNT` | Number of reply suggestions (1-5)                                                                                                                                                                 | `3`                 |
 | `WEB_CHAT_PORT`            | Web Chat UI port                                                                                                                                                                                      | `18888`             |
 | `WEB_CHAT_HOST`            | Bind host. `0.0.0.0` exposes on all interfaces. The Web UI has no auth, so set `127.0.0.1` to restrict to loopback and reach it only via SSH port-forward, Tailscale, etc.                            | `0.0.0.0`           |
 | `WEB_CHAT_UPLOAD_ACCEPT`   | Upload allowlist (HTML `accept` syntax). Empty = allow all. `.ext` entries are also enforced server-side                                                                                              | (unset / allow all) |
@@ -1306,6 +1332,8 @@ Because Antigravity CLI does not currently expose a stable JSON/stream-json cont
 | `SLACK_REPLY_IN_THREAD`            | Reply in threads (default: `true`)                                                                         |
 | `SLACK_REPLY_IN_CHANNELS`          | Channel IDs to post replies directly in the channel even when thread replies are enabled (comma-separated) |
 | `SLACK_COMPLETION_NOTIFY_AFTER_MS` | Minimum elapsed time before sending a completion notice for non-thread Slack turns (ms)                    | `10000` |
+| `SLACK_REPLY_SUGGESTIONS`          | Show a user-only `返信候補` button for reply suggestions                                                   | `false` |
+| `SLACK_REPLY_SUGGESTIONS_COUNT`    | Number of reply suggestions (1-5)                                                                          | `3`     |
 
 ## Running Multiple Instances
 

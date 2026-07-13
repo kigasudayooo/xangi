@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, utimesSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Server } from 'http';
@@ -10,6 +10,7 @@ import {
   listAllSessions,
   getSessionEntry,
   createSession,
+  setProviderSessionId,
   WEB_CHAT_CONTEXT_PREFIX,
 } from '../src/sessions.js';
 import type { AgentRunner, RunOptions, RunResult, StreamCallbacks } from '../src/agent-runner.js';
@@ -23,21 +24,28 @@ class FakeRunner implements AgentRunner {
   destroyed = new Set<string>();
   pending = new Map<string, () => void>();
   callOrder: string[] = [];
+  prompts: string[] = [];
+  nextResult = 'ok';
 
   async run(): Promise<RunResult> {
     return { result: 'fake', sessionId: 'fake-sess' };
   }
 
   async runStream(
-    _prompt: string,
+    prompt: string,
     callbacks: StreamCallbacks,
     options?: RunOptions
   ): Promise<RunResult> {
     const channelId = options?.channelId || 'default';
     this.callOrder.push(channelId);
+    this.prompts.push(prompt);
     return new Promise<RunResult>((resolve) => {
       this.pending.set(channelId, () => {
-        const result: RunResult = { result: 'ok', sessionId: `provider-${channelId}` };
+        callbacks.onText?.(this.nextResult, this.nextResult);
+        const result: RunResult = {
+          result: this.nextResult,
+          sessionId: `provider-${channelId}`,
+        };
         callbacks.onComplete?.(result);
         resolve(result);
       });
@@ -139,7 +147,11 @@ describe('web-chat HTTP API', () => {
     const port = await freePort();
     // startWebChat は server を返さないので、内部で動作する http サーバの listen を待つために
     // setTimeout で次のティックを待ち、URL を保持する。
-    startWebChat({ agentRunner: runner, port });
+    startWebChat({
+      agentRunner: runner,
+      port,
+      replySuggestions: { replySuggestions: true, replySuggestionCount: 3 },
+    });
     baseUrl = `http://127.0.0.1:${port}`;
 
     // 起動完了を待つ（health チェック）
@@ -224,6 +236,31 @@ describe('web-chat HTTP API', () => {
     runner.release(`${WEB_CHAT_CONTEXT_PREFIX}${id}`);
     const r1 = await first;
     await readSSEUntilDone(r1.body);
+  });
+
+  it('hides reply suggestion markup from Web SSE and returns structured suggestions', async () => {
+    const id = (await (await fetch(`${baseUrl}/api/sessions`, { method: 'POST' })).json())
+      .sessionId as string;
+    runner.nextResult =
+      '回答本文\n<xangi_reply_suggestions>["続けて","詳しく","別案"]</xangi_reply_suggestions>';
+
+    const send = fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ appSessionId: id, message: '質問' }),
+    });
+    for (let i = 0; i < 50 && runner.pending.size === 0; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    runner.release(`${WEB_CHAT_CONTEXT_PREFIX}${id}`);
+    const events = (await readSSEUntilDone((await send).body)).events;
+    const textEvent = events.find((e) => e.event === 'text');
+    const done = events.find((e) => e.event === 'done');
+
+    expect(runner.prompts.at(-1)).toContain('<xangi_reply_suggestions>');
+    expect(textEvent?.data.fullText).toBe('回答本文');
+    expect(done?.data.response).toBe('回答本文');
+    expect(done?.data.replySuggestions).toEqual(['続けて', '詳しく', '別案']);
   });
 
   it('POST /api/chat allows two different sessions to stream concurrently', async () => {
@@ -406,6 +443,48 @@ describe('web-chat HTTP API', () => {
     expect(found?.title).toBe('最初のメッセージです');
   });
 
+  it('GET /api/sessions/:id hides internal prompt metadata and reply suggestion markup', async () => {
+    const id = createSession('web-chat:test-sanitize', {
+      platform: 'web',
+      title: '<prefetched-history platform="Web"> internal',
+    });
+    const logsDir = join(testDir, 'logs', 'sessions');
+    mkdirSync(logsDir, { recursive: true });
+    writeFileSync(
+      join(logsDir, `${id}.jsonl`),
+      [
+        {
+          id: 'u1',
+          role: 'user',
+          content:
+            '[プラットフォーム: Web]\n<prefetched-history platform="Web">internal</prefetched-history>\n初期文脈確認だけを目的に history コマンドを再実行しないでください。さらに古い履歴や追加件数が必要な場合だけ実行してください。\n本当の質問',
+          createdAt: '2026-07-13T00:00:00Z',
+        },
+        {
+          id: 'a1',
+          role: 'assistant',
+          content: {
+            result:
+              '回答本文\n<xangi_reply_suggestions>["続けて","詳しく","別案"]</xangi_reply_suggestions>',
+          },
+          createdAt: '2026-07-13T00:00:01Z',
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join('\n') + '\n'
+    );
+
+    const detail = await (await fetch(`${baseUrl}/api/sessions/${id}`)).json();
+    const list = await (await fetch(`${baseUrl}/api/sessions`)).json();
+    expect(list.sessions.find((session: { id: string }) => session.id === id)?.title).toBe(
+      '本当の質問'
+    );
+    expect(detail.title).toBe('本当の質問');
+    expect(detail.messages[0].content).toBe('本当の質問');
+    expect(detail.messages[1].content).toBe('回答本文');
+    expect(detail.messages[1].replySuggestions).toEqual(['続けて', '詳しく', '別案']);
+  });
+
   it('GET /api/sessions attaches Discord activity only to the current session', async () => {
     const channelId = '1469726038291386523';
     const oldId = createSession(channelId, { platform: 'discord', title: 'old discord turn' });
@@ -433,6 +512,64 @@ describe('web-chat HTTP API', () => {
     expect(oldSession?.activity).toBeUndefined();
     expect(currentSession?.activity?.state).toBe('thinking');
     expect(currentSession?.activity?.userTextPreview).toBe('モニターテストです');
+  });
+
+  it('GET /api/sessions sorts by transcript and current activity instead of metadata touches', async () => {
+    const oldId = createSession('old-channel', { platform: 'discord', title: 'old session' });
+    const logsDir = join(testDir, 'logs', 'sessions');
+    mkdirSync(logsDir, { recursive: true });
+    const oldLog = join(logsDir, `${oldId}.jsonl`);
+    writeFileSync(
+      oldLog,
+      JSON.stringify({
+        id: 'old-message',
+        role: 'user',
+        content: 'old session',
+        createdAt: '2026-05-17T00:00:00.000Z',
+      }) + '\n'
+    );
+    const oldTime = new Date('2026-05-17T00:00:00.000Z');
+    utimesSync(oldLog, oldTime, oldTime);
+
+    // Provider metadata updates must not make old content look recent in the sidebar.
+    setProviderSessionId(oldId, 'provider-touched-today');
+
+    const currentId = createSession('current-channel', {
+      platform: 'discord',
+      title: 'current session',
+    });
+    startActivity({
+      threadId: 'discord:current-channel',
+      turnId: 'current-turn',
+      platform: 'discord',
+      userText: 'running now',
+    });
+
+    const list = (await (await fetch(`${baseUrl}/api/sessions`)).json()) as {
+      sessions: Array<{ id: string; updatedAt: string }>;
+    };
+    expect(list.sessions[0]?.id).toBe(currentId);
+    expect(list.sessions.find((s) => s.id === oldId)?.updatedAt).toBe(oldTime.toISOString());
+  });
+
+  it('GET /api/sessions hides scheduler audit transcripts', async () => {
+    const logsDir = join(testDir, 'logs', 'sessions');
+    mkdirSync(logsDir, { recursive: true });
+    const schedulerId = 'scheduler-run-discord-1783929000000-12345678';
+    writeFileSync(
+      join(logsDir, `${schedulerId}.jsonl`),
+      JSON.stringify({
+        id: 'scheduled-message',
+        role: 'user',
+        content: 'scheduled task',
+        createdAt: '2026-07-13T00:00:00.000Z',
+      }) + '\n'
+    );
+
+    const list = (await (await fetch(`${baseUrl}/api/sessions`)).json()) as {
+      sessions: Array<{ id: string }>;
+    };
+    expect(list.sessions.some((s) => s.id === schedulerId)).toBe(false);
   });
 
   it('GET /api/sessions falls back to contextKey when no title and no log can be derived', async () => {

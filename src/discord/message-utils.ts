@@ -1,4 +1,37 @@
 import type { Client, Message } from 'discord.js';
+import { buildPrefetchedHistoryBlock } from '../prefetched-history.js';
+
+/** 初回 provider セッション用に、現在の発言より前の直近履歴を先読みする。 */
+export async function prefetchDiscordHistory(message: Message, count = 10): Promise<string> {
+  const channel = message.channel;
+  if (!('messages' in channel)) return buildPrefetchedHistoryBlock('Discord', []);
+  try {
+    const messages = await channel.messages.fetch({
+      limit: Math.max(1, Math.min(count, 100)),
+      before: message.id,
+    });
+    const entries = Array.from(messages.values())
+      .reverse()
+      .map((item) => ({
+        timestamp: item.createdAt,
+        id: item.id,
+        author: item.author.username,
+        content: sanitizeChannelMentions(item.content),
+        attachments: Array.from(item.attachments.values()).map((attachment) => ({
+          name: attachment.name ?? 'file',
+          url: attachment.url,
+        })),
+      }));
+    return buildPrefetchedHistoryBlock('Discord', entries);
+  } catch (error) {
+    console.warn(
+      `[xangi] Failed to prefetch Discord history: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return buildPrefetchedHistoryBlock('Discord', []);
+  }
+}
 
 /** Discordリンクからメッセージ内容を取得してテキストに展開する */
 export async function fetchDiscordLinkContent(client: Client, text: string): Promise<string> {

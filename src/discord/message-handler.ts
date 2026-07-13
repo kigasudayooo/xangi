@@ -1,4 +1,11 @@
-import { Events, Message, Client, ActionRowBuilder, ButtonBuilder } from 'discord.js';
+import {
+  Events,
+  Message,
+  Client,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonInteraction,
+} from 'discord.js';
 import type { Config } from '../config.js';
 import type { AgentRunner } from '../agent-runner.js';
 import { formatAgentErrorForUser, shouldSendErrorFollowUp } from '../errors.js';
@@ -16,9 +23,11 @@ import {
   getChannelAutoReply,
   getChannelCompletionNotifyMode,
   getChannelThreadMode,
+  loadReplySuggestionsEnabled,
   loadSettings,
 } from '../settings.js';
 import { waitBeforeFollowupDiscordSend } from './send-delay.js';
+import { TurnLatencyRecorder } from '../turn-latency.js';
 import {
   getSession,
   setSession,
@@ -48,7 +57,15 @@ import {
   getDiscordTimeoutInfoFor,
   discordProcessingMessages,
   discordToolHistoryByMessageId,
+  discordReplySuggestionsByMessageId,
 } from './ui.js';
+import {
+  appendReplySuggestionInstruction,
+  fallbackReplySuggestions,
+  resolveReplySuggestionSkipPermissions,
+  sanitizeReplySuggestionOutput,
+  stripReplySuggestionMarkup,
+} from '../reply-suggestions.js';
 import { appendToolHistory, addToolHistory } from '../tool-history.js';
 import {
   fetchDiscordLinkContent,
@@ -56,16 +73,19 @@ import {
   fetchThreadStarterContent,
   fetchChannelMessages,
   annotateChannelMentions,
+  prefetchDiscordHistory,
 } from './message-utils.js';
+import { buildPrefetchedHistoryBlock } from '../prefetched-history.js';
 
 export function shouldProcessDiscordMessage(input: { system?: boolean }): boolean {
   return !input.system;
 }
 
-interface DiscordMessageTarget {
+export interface DiscordMessageTarget {
   conversationChannelId: string;
   settingsChannelId: string;
   createdThreadName: string | null;
+  isThread: boolean;
   outputChannel: {
     send: (options: unknown) => Promise<Message>;
   };
@@ -120,11 +140,16 @@ async function resolveDiscordMessageTarget(
   const outputChannel = (newThread ?? (message.channel as unknown)) as {
     send: (options: unknown) => Promise<Message>;
   };
+  const sourceChannel = message.channel as unknown as { isThread?: () => boolean };
+  const isThread =
+    newThread !== null ||
+    (typeof sourceChannel.isThread === 'function' && sourceChannel.isThread());
 
   return {
     conversationChannelId,
     settingsChannelId,
     createdThreadName: newThread?.name ?? null,
+    isThread,
     outputChannel,
     sendInitial: (options: Parameters<Message['reply']>[0]) =>
       newThread ? newThread.send(options) : message.reply(options),
@@ -138,7 +163,8 @@ export async function processPrompt(
   skipPermissions: boolean,
   channelId: string,
   config: Config,
-  target: DiscordMessageTarget
+  target: DiscordMessageTarget,
+  actor?: { id: string; name: string; messageId: string; react?: boolean }
 ): Promise<string | null> {
   const startedAt = Date.now();
   let replyMessage: Message | null = null;
@@ -147,18 +173,30 @@ export async function processPrompt(
   let streamSession: StreamSession | null = null;
   // プロセス終了時に実行中表示を「中断」表示で確定させる finalizer の登録解除関数 (issue #293)
   let unregisterStreamFinalizer: (() => void) | undefined;
-  const turnId = turnIdFor('discord', message.id);
+  const sourceMessageId = actor?.messageId ?? message.id;
+  const turnId = turnIdFor('discord', sourceMessageId);
   const channelName = 'name' in message.channel ? (message.channel as { name: string }).name : null;
   const threadLabel = channelName ? `#${channelName}` : 'DM';
   // MessageCreate 側でスレッド作成を済ませ、確定済みの runKey を渡す。
   // 以降のセッション / runner / timeout UI / Stop はこのキーに揃える。
   const conversationChannelId = target.conversationChannelId;
   const settingsChannelId = target.settingsChannelId;
+  const existingProviderSessionId = getSession(conversationChannelId);
+  const latency = new TurnLatencyRecorder({
+    platform: 'discord',
+    turnId,
+    threadId: threadIdFor('discord', conversationChannelId),
+    configuredBackend: config.agent.backend,
+    configuredModel: config.agent.config.model,
+    firstTurn: !existingProviderSessionId,
+    receivedAt: message.createdTimestamp,
+    workdir: config.agent.config.workdir,
+  });
   try {
     console.log(
       `[xangi] Processing message in channel ${channelId}, runKey ${conversationChannelId}`
     );
-    await message.react('👀').catch(() => {});
+    if (actor?.react !== false) await message.react('👀').catch(() => {});
 
     const useStreaming = config.discord.streaming ?? true;
     const showThinking = config.discord.showThinking ?? true;
@@ -196,7 +234,10 @@ export async function processPrompt(
         const content =
           view.phase === 'thinking'
             ? `${view.toolLines.length > 0 ? `${view.toolLines.join('\n')}\n\n` : ''}${view.statusLine}`
-            : appendToolHistory(view.text, view.toolLines, ' ▌').slice(0, DISCORD_MAX_LENGTH);
+            : appendToolHistory(stripReplySuggestionMarkup(view.text), view.toolLines, ' ▌').slice(
+                0,
+                DISCORD_MAX_LENGTH
+              );
         const payload: { content: string; components?: ActionRowBuilder<ButtonBuilder>[] } = {
           content,
         };
@@ -214,8 +255,17 @@ export async function processPrompt(
 
     const settings = loadSettings();
 
+    if (!existingProviderSessionId && config.historyPrefetch?.enabled) {
+      const prefetchedHistory = target.createdThreadName
+        ? buildPrefetchedHistoryBlock('Discord', [])
+        : await prefetchDiscordHistory(message, config.historyPrefetch.count);
+      prompt = `${prefetchedHistory}\n\n${prompt}`;
+    }
+
     // チャンネル・ユーザー情報をプロンプトに付与
-    const userInfo = `[発言者: ${message.author.displayName ?? message.author.username} (ID: ${message.author.id})]`;
+    const actorName = actor?.name ?? message.author.displayName ?? message.author.username;
+    const actorId = actor?.id ?? message.author.id;
+    const userInfo = `[発言者: ${actorName} (ID: ${actorId})]`;
     const channelContextLine = buildDiscordChannelContextLine({
       channelName,
       conversationChannelId,
@@ -237,7 +287,7 @@ export async function processPrompt(
       userText: message.content || undefined,
     };
 
-    const sessionId = getSession(conversationChannelId);
+    const sessionId = existingProviderSessionId;
     const appSessionId = ensureSession(conversationChannelId, { platform: 'discord' });
 
     // 再起動直後の resume では、直前の未完了 tool 呼び出しが 'rejected' として
@@ -245,6 +295,13 @@ export async function processPrompt(
     const restartNote = consumeRestartNote(conversationChannelId, !!sessionId);
     if (restartNote) {
       prompt = `${restartNote}\n${prompt}`;
+    }
+
+    const replySuggestionCount = config.discord.replySuggestionCount ?? 3;
+    const replySuggestionsEnabled =
+      showButtons && loadReplySuggestionsEnabled(config.discord.replySuggestions !== false);
+    if (replySuggestionsEnabled) {
+      prompt = appendReplySuggestionInstruction(prompt, replySuggestionCount);
     }
 
     // 以降の追加投稿（続きチャンク・ファイル・完了通知）の送信先。
@@ -256,6 +313,7 @@ export async function processPrompt(
       ...(showButtons && { components: [createProcessingButtons()] }),
     };
     replyMessage = await target.sendInitial(firstPayload);
+    latency.markInitialReply();
 
     // タイムアウト UI の自動更新対象として登録 (runner.timeout-* で edit される)
     // runner が agentRunner (DynamicRunnerManager) 経由のときのみ — needsSkipRunner で
@@ -271,7 +329,8 @@ export async function processPrompt(
       if (!replyMessage) return;
       const view = session.view();
       const note = '⏸ プロセス再起動により中断されました';
-      const body = view.text ? `${view.text.trimEnd()}\n\n${note}` : note;
+      const visibleText = stripReplySuggestionMarkup(view.text);
+      const body = visibleText ? `${visibleText}\n\n${note}` : note;
       const content = appendToolHistory(body, view.toolLines).slice(0, DISCORD_MAX_LENGTH);
       await replyMessage.edit({ content, components: [] }).catch(() => {});
     });
@@ -282,14 +341,18 @@ export async function processPrompt(
 
     // 完了後ツール履歴の蓄積（表示は StreamSession 側、こちらは完了後の inline/button 表示用）
     const captureCallbacks = {
+      onBackendReady: () => latency.markBackendReady(),
       onToolUse: (toolName: string, toolInput: Record<string, unknown>) => {
+        latency.markActivity();
         if (captureToolUse) addToolHistory(toolHistory, toolName, toolInput);
       },
+      onText: () => latency.markText(),
     };
 
     if (useStreaming && showThinking && !needsSkipRunner) {
       // ストリーミング + 思考表示モード（persistent-runner のみ）
       session.start();
+      latency.markAgentStart();
       let streamResult: { result: string; sessionId: string };
       try {
         streamResult = await runWithBubbleEvents(
@@ -310,11 +373,13 @@ export async function processPrompt(
       }
       result = streamResult.result;
       newSessionId = streamResult.sessionId;
+      latency.markAgentComplete();
     } else {
       // 非ストリーミング or ワンショットskipランナー
       // useStreaming=false の意図（本文の逐次表示をしない）を保つため onText は渡さず、
       // 思考中アニメーションとツール行だけ更新する
       session.start();
+      latency.markAgentStart();
       const sessionCallbacks = session.callbacks(captureCallbacks);
       try {
         const runResult = await runWithBubbleEvents(
@@ -333,6 +398,7 @@ export async function processPrompt(
         result = runResult.result;
         newSessionId = runResult.sessionId;
         structuredAttachments = runResult.attachments;
+        latency.markAgentComplete();
       } finally {
         session.finish();
       }
@@ -345,7 +411,7 @@ export async function processPrompt(
     // 逆引きできる。runner 側を触らず post-hoc で attach する戦略。
     try {
       const tWorkdir = config.agent.config.workdir || process.cwd();
-      attachPlatformMessageIdToLast(tWorkdir, appSessionId, 'user', message.id);
+      attachPlatformMessageIdToLast(tWorkdir, appSessionId, 'user', sourceMessageId);
       if (replyMessage) {
         attachPlatformMessageIdToLast(tWorkdir, appSessionId, 'assistant', replyMessage.id);
       }
@@ -365,7 +431,15 @@ export async function processPrompt(
     );
 
     // ファイルパスを抽出して添付送信（テキスト由来 + 構造化 attachments を合算・重複排除）
-    const { filePaths, displayText } = buildAttachmentResult(result, structuredAttachments);
+    const extracted = sanitizeReplySuggestionOutput(
+      result,
+      replySuggestionsEnabled,
+      replySuggestionCount
+    );
+    if (replySuggestionsEnabled && extracted.suggestions.length === 0) {
+      extracted.suggestions = fallbackReplySuggestions(replySuggestionCount);
+    }
+    const { filePaths, displayText } = buildAttachmentResult(extracted.text, structuredAttachments);
     const displayTextWithTools =
       toolHistoryMode === 'inline' ? appendToolHistory(displayText, toolHistory) : displayText;
     const showToolsButton =
@@ -376,6 +450,11 @@ export async function processPrompt(
       discordToolHistoryByMessageId.set(replyMessage.id, [...toolHistory]);
     } else if (replyMessage) {
       discordToolHistoryByMessageId.delete(replyMessage.id);
+    }
+    if (replyMessage && showButtons && extracted.suggestions.length > 0) {
+      discordReplySuggestionsByMessageId.set(replyMessage.id, extracted.suggestions);
+    } else if (replyMessage) {
+      discordReplySuggestionsByMessageId.delete(replyMessage.id);
     }
 
     // === セパレータで明示的に分割（content-digest等で複数投稿を1応答に含める用途）
@@ -392,7 +471,15 @@ export async function processPrompt(
     const firstChunks = splitMessage(messageParts[0], DISCORD_SAFE_LENGTH);
     await replyMessage!.edit({
       content: firstChunks[0] || '✅',
-      ...(showButtons && { components: [createCompletedButtons({ showTools: showToolsButton })] }),
+      ...(showButtons && {
+        components: [
+          createCompletedButtons({
+            showTools: showToolsButton,
+            showLeave: target.isThread,
+            showReplySuggestions: extracted.suggestions.length > 0,
+          }),
+        ],
+      }),
     });
 
     if ('send' in outputChannel) {
@@ -450,8 +537,11 @@ export async function processPrompt(
       ).send(completionNotification);
     }
 
-    return result;
+    latency.finish('complete');
+
+    return extracted.text;
   } catch (error) {
+    latency.markAgentComplete();
     streamSession?.finish();
     if (error instanceof Error && error.message === 'Request cancelled by user') {
       console.log('[xangi] Request cancelled by user');
@@ -467,6 +557,7 @@ export async function processPrompt(
           components: [],
         })
         .catch(() => {});
+      latency.finish('cancelled');
       return null;
     }
     console.error('[xangi] Error:', error);
@@ -522,6 +613,7 @@ export async function processPrompt(
         console.error('[xangi] Error follow-up failed:', followUpError);
       }
     }
+    latency.finish('error');
 
     return null;
   } finally {
@@ -535,6 +627,49 @@ export async function processPrompt(
         console.error('[xangi] Failed to remove 👀 reaction:', err.message || err);
       });
   }
+}
+
+export async function processReplySuggestion(
+  interaction: ButtonInteraction,
+  agentRunner: AgentRunner,
+  config: Config,
+  suggestion: string
+): Promise<void> {
+  const channel = interaction.channel;
+  if (!channel || !('send' in channel)) throw new Error('返信先チャンネルを取得できません');
+
+  const selectedMessage = await channel.send({
+    content: `↪ ${suggestion}`,
+    allowedMentions: { parse: [] },
+  });
+  const sourceChannel = channel as unknown as {
+    isThread?: () => boolean;
+    parentId?: string | null;
+  };
+  const isThread = typeof sourceChannel.isThread === 'function' && sourceChannel.isThread();
+  const target: DiscordMessageTarget = {
+    conversationChannelId: interaction.channelId,
+    settingsChannelId: resolveDiscordSettingsChannelId(interaction.channelId, sourceChannel),
+    createdThreadName: null,
+    isThread,
+    outputChannel: channel as unknown as DiscordMessageTarget['outputChannel'],
+    sendInitial: (options) => selectedMessage.reply(options),
+  };
+  await processPrompt(
+    selectedMessage,
+    agentRunner,
+    suggestion,
+    resolveReplySuggestionSkipPermissions(config.agent.config.skipPermissions),
+    interaction.channelId,
+    config,
+    target,
+    {
+      id: interaction.user.id,
+      name: interaction.user.displayName ?? interaction.user.username,
+      messageId: selectedMessage.id,
+      react: false,
+    }
+  );
 }
 
 export interface MessageHandlerDeps {

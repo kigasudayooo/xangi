@@ -6,16 +6,18 @@ import { processManager } from './process-manager.js';
 import type { Skill } from './skills.js';
 import { formatSkillList } from './skills.js';
 import { downloadFile, buildAttachmentResult, buildPromptWithAttachments } from './file-utils.js';
-import { loadSettings, formatSettings } from './settings.js';
+import { loadReplySuggestionsEnabled, loadSettings, formatSettings } from './settings.js';
 import { canSelfRestart, getSelfLifecyclePermission } from './self-lifecycle.js';
 import { TIMEOUT_EXTEND_ENABLED } from './constants.js';
 import { threadIdFor, turnIdFor } from './events-emitter.js';
 import { runWithBubbleEvents } from './bubble-events-runner.js';
+import { prefetchSlackHistory } from './slack-history-prefetch.js';
 import { StreamSession } from './stream-session.js';
 import { registerStreamFinalizer } from './stream-finalizer.js';
 import { formatAgentErrorForUser } from './errors.js';
 import { addToolHistory, appendToolHistory, formatToolHistoryDisclosure } from './tool-history.js';
-import { ensureSession, getActiveSessionId, getProviderSessionId, setSession } from './sessions.js';
+import { ensureSession, getActiveSessionId, getProviderSessionId } from './sessions.js';
+import { createSchedulerRunId } from './scheduler-run.js';
 import {
   attachPlatformMessageIdToLast,
   findEntryByPlatformMessageId,
@@ -23,6 +25,13 @@ import {
   deleteMessage as deleteTranscriptMessage,
 } from './transcript-logger.js';
 import type { KnownBlock } from '@slack/types';
+import {
+  appendReplySuggestionInstruction,
+  fallbackReplySuggestions,
+  formatNumberedSuggestions,
+  sanitizeReplySuggestionOutput,
+  stripReplySuggestionMarkup,
+} from './reply-suggestions.js';
 
 export function shouldReplyInSlackThread(
   slackConfig: Pick<Config['slack'], 'replyInThread' | 'replyInChannels'>,
@@ -187,11 +196,16 @@ function getSlackTimeoutInfoFor(
 }
 
 /** Slack Block Kit: 完了後ボタン */
-function createSlackCompletedBlocks(options?: { showTools?: boolean }): KnownBlock[] {
+export function createSlackCompletedBlocks(options?: {
+  showTools?: boolean;
+  showReplySuggestions?: boolean;
+  replySuggestionPayload?: { messageKey: string; suggestions: string[]; threadTs?: string };
+}): KnownBlock[] {
   const elements: Array<{
     type: 'button';
     text: { type: 'plain_text'; text: string };
     action_id: string;
+    value?: string;
   }> = [
     {
       type: 'button',
@@ -206,10 +220,47 @@ function createSlackCompletedBlocks(options?: { showTools?: boolean }): KnownBlo
       action_id: 'xangi_tools',
     });
   }
+  if (options?.showReplySuggestions) {
+    const payload = options.replySuggestionPayload;
+    elements.push({
+      type: 'button',
+      text: { type: 'plain_text', text: '返信候補' },
+      action_id: 'xangi_reply_suggestions',
+      ...(payload && {
+        value: JSON.stringify({
+          messageKey: payload.messageKey,
+          suggestions: payload.suggestions.map((suggestion) => suggestion.slice(0, 400)),
+          ...(payload.threadTs && { threadTs: payload.threadTs }),
+        }),
+      }),
+    });
+  }
   return [
     {
       type: 'actions',
       elements,
+    },
+  ];
+}
+
+export function createSlackReplySuggestionBlocks(
+  messageKey: string,
+  suggestions: string[],
+  threadTs?: string
+): KnownBlock[] {
+  return [
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: formatNumberedSuggestions(suggestions) },
+    },
+    {
+      type: 'actions',
+      elements: suggestions.map((_, index) => ({
+        type: 'button' as const,
+        text: { type: 'plain_text' as const, text: String(index + 1) },
+        action_id: `xangi_reply_suggestion_${index}`,
+        value: JSON.stringify({ messageKey, index, ...(threadTs && { threadTs }) }),
+      })),
     },
   ];
 }
@@ -236,11 +287,13 @@ type SlackProcessingEntry = {
 };
 const slackProcessingMessages = new Map<string, SlackProcessingEntry>();
 const slackToolHistoryByMessageKey = new Map<string, string[]>();
+const slackReplySuggestionsByMessageKey = new Map<string, string[]>();
 const busySlackConversations = new Set<string>();
 const processedSlackMessages = new Set<string>();
 
-// Slack メッセージバイト数制限（chat.updateはバイト数で制限される）
-const SLACK_MAX_TEXT_BYTES = 3900;
+// chat.update の本文と Block Kit の section を同じ上限で分割する。
+// section text は最大3000文字のため、UTF-8で3000バイト以下なら両方の制限を満たす。
+const SLACK_MAX_TEXT_BYTES = 3000;
 
 function slackMessageKey(channelId: string, messageTs: string): string {
   return `${channelId}:${messageTs}`;
@@ -468,22 +521,26 @@ export function registerSlackSchedulerBridge(deps: {
     });
 
     try {
-      const appSessionId = ensureSession(channelId, {
-        platform: 'slack',
-        scope: 'scheduler',
-      });
-      const {
-        result,
-        sessionId: newSessionId,
-        attachments,
-      } = await agentRunner.run(prompt, {
-        skipPermissions: config.agent.config.skipPermissions ?? false,
-        sessionId: undefined,
-        channelId,
-        appSessionId: `${appSessionId}-${Date.now()}`,
-      });
+      const freshAppSessionId = createSchedulerRunId('slack');
+      const { result, attachments } = await runWithBubbleEvents(
+        agentRunner,
+        prompt,
+        {
+          threadId: `slack-schedule:${channelId}`,
+          turnId: turnIdFor('slack', `sched-${freshAppSessionId}`),
+          threadLabel: 'scheduled task',
+          platform: 'slack',
+          userText: prompt,
+        },
+        {},
+        {
+          skipPermissions: config.agent.config.skipPermissions ?? false,
+          sessionId: undefined,
+          channelId,
+          appSessionId: freshAppSessionId,
+        }
+      );
 
-      setSession(channelId, newSessionId, 'scheduler');
       const { displayText } = buildAttachmentResult(result, attachments);
       await sendSlackResult(client, channelId, messageTs, undefined, displayText || '✅', []);
       return result;
@@ -601,6 +658,110 @@ export async function startSlackBot(options: SlackChannelOptions): Promise<void>
     }
   });
 
+  app.action('xangi_reply_suggestions', async ({ ack, action, body, client: actionClient }) => {
+    await ack();
+    const channelId = body.channel?.id;
+    const userId = body.user?.id;
+    const message =
+      'message' in body ? (body.message as { ts?: string; thread_ts?: string }) : undefined;
+    if (!channelId || !userId || !message?.ts) return;
+    if (!config.slack.allowedUsers?.includes('*') && !config.slack.allowedUsers?.includes(userId)) {
+      return;
+    }
+    const messageKey = slackMessageKey(channelId, message.ts);
+    const value = 'value' in action ? action.value : undefined;
+    let embedded: { messageKey?: string; suggestions?: string[]; threadTs?: string } = {};
+    try {
+      embedded = JSON.parse(value || '{}') as {
+        messageKey?: string;
+        suggestions?: string[];
+        threadTs?: string;
+      };
+    } catch {
+      // 旧ボタンはプロセス内キャッシュへフォールバックする。
+    }
+    const embeddedSuggestions = Array.isArray(embedded.suggestions)
+      ? embedded.suggestions.filter(
+          (suggestion): suggestion is string => typeof suggestion === 'string'
+        )
+      : undefined;
+    const suggestions =
+      (embedded.messageKey === messageKey ? embeddedSuggestions : undefined) ??
+      slackReplySuggestionsByMessageKey.get(messageKey);
+    const threadTs = message.thread_ts ?? embedded.threadTs;
+    if (!suggestions || suggestions.length === 0) {
+      await actionClient.chat.postEphemeral({
+        channel: channelId,
+        user: userId,
+        text: 'この返信候補は期限切れです',
+        ...(threadTs && { thread_ts: threadTs }),
+      });
+      return;
+    }
+    await actionClient.chat.postEphemeral({
+      channel: channelId,
+      user: userId,
+      text: formatNumberedSuggestions(suggestions),
+      blocks: createSlackReplySuggestionBlocks(messageKey, suggestions, threadTs),
+      ...(threadTs && { thread_ts: threadTs }),
+    });
+  });
+
+  app.action(
+    /^xangi_reply_suggestion_\d+$/,
+    async ({ ack, action, body, respond, client: actionClient }) => {
+      await ack();
+      const channelId = body.channel?.id;
+      const userId = body.user?.id;
+      if (!channelId || !userId) return;
+      if (
+        !config.slack.allowedUsers?.includes('*') &&
+        !config.slack.allowedUsers?.includes(userId)
+      ) {
+        return;
+      }
+      const value = 'value' in action ? action.value : undefined;
+      let parsed: { messageKey?: string; index?: number; threadTs?: string } = {};
+      try {
+        parsed = JSON.parse(value || '{}') as {
+          messageKey?: string;
+          index?: number;
+          threadTs?: string;
+        };
+      } catch {
+        // 下の期限切れ処理へ流す。
+      }
+      const suggestions = parsed.messageKey
+        ? slackReplySuggestionsByMessageKey.get(parsed.messageKey)
+        : undefined;
+      const suggestion = Number.isInteger(parsed.index) ? suggestions?.[parsed.index!] : undefined;
+      if (!suggestion) {
+        await respond({ text: 'この返信候補は期限切れです', replace_original: true });
+        return;
+      }
+      await respond({ text: `送信: ${suggestion}`, replace_original: true });
+      const message =
+        'message' in body ? (body.message as { thread_ts?: string; ts?: string }) : undefined;
+      const threadTs = message?.thread_ts ?? parsed.threadTs;
+      const conversationKey = slackConversationKey(channelId, threadTs);
+      const selectedMessage = await actionClient.chat.postMessage({
+        channel: channelId,
+        text: `↪ ${suggestion}`,
+        ...(threadTs && { thread_ts: threadTs }),
+      });
+      await processMessage(
+        channelId,
+        conversationKey,
+        threadTs,
+        suggestion,
+        selectedMessage.ts ?? String(Date.now()),
+        actionClient,
+        agentRunner,
+        config
+      );
+    }
+  );
+
   // ボタンアクション: New Session
   app.action('xangi_new', async ({ ack, body, client: actionClient }) => {
     await ack();
@@ -620,6 +781,9 @@ export async function startSlackBot(options: SlackChannelOptions): Promise<void>
     // ボタンを消す
     if ('message' in body && body.message) {
       slackToolHistoryByMessageKey.delete(
+        slackMessageKey(channelId, (body.message as { ts: string }).ts)
+      );
+      slackReplySuggestionsByMessageKey.delete(
         slackMessageKey(channelId, (body.message as { ts: string }).ts)
       );
       await actionClient.chat
@@ -1221,10 +1385,27 @@ export async function processMessage(
     console.log(`[slack] Processing message: channel=${channelId}, runKey=${runKey}`);
 
     const sessionId = getProviderSessionId(conversationKey) ?? sessions.get(conversationKey);
+    if (!sessionId && config.historyPrefetch?.enabled) {
+      const prefetchedHistory = await prefetchSlackHistory(
+        client,
+        channelId,
+        threadTs,
+        originalTs,
+        config.historyPrefetch.count
+      );
+      prompt = `${prefetchedHistory}\n\n${prompt}`;
+    }
     const useStreaming = config.slack.streaming ?? true;
     const showThinking = config.slack.showThinking ?? true;
 
     const showButtons = config.slack.showThinking ?? true;
+    const replySuggestionCount = config.slack.replySuggestionCount ?? 3;
+    const replySuggestionsEnabled = loadReplySuggestionsEnabled(
+      config.slack.replySuggestions !== false
+    );
+    if (replySuggestionsEnabled) {
+      prompt = appendReplySuggestionInstruction(prompt, replySuggestionCount);
+    }
     const toolHistory: string[] = [];
     const captureCallbacks = {
       onToolUse: (toolName: string, toolInput: Record<string, unknown>) => {
@@ -1246,7 +1427,7 @@ export async function processMessage(
           view.phase === 'thinking'
             ? `${view.toolLines.length > 0 ? `${view.toolLines.join('\n')}\n\n` : ''}${view.statusLine}`
             : sliceByBytes(
-                appendToolHistory(view.text, view.toolLines, ' ▌'),
+                appendToolHistory(stripReplySuggestionMarkup(view.text), view.toolLines, ' ▌'),
                 SLACK_MAX_TEXT_BYTES
               );
         // 1 秒ごとの chat.update でタイムアウト UI を消さないよう、
@@ -1309,7 +1490,7 @@ export async function processMessage(
       session.finish();
       if (!messageTs) return;
       const note = '⏸ プロセス再起動により中断されました';
-      const lastText = session.lastText;
+      const lastText = stripReplySuggestionMarkup(session.lastText);
       const text = lastText ? `${lastText.trimEnd()}\n\n${note}` : note;
       await client.chat
         .update({ channel: channelId, ts: messageTs, text, blocks: [] })
@@ -1374,10 +1555,24 @@ export async function processMessage(
     console.log(`[slack] Final result length: ${result.length}`);
 
     // ファイルパスを抽出して添付送信（テキスト由来 + 構造化 attachments を合算・重複排除）
-    const { filePaths, displayText } = buildAttachmentResult(result, structuredAttachments);
+    const extracted = sanitizeReplySuggestionOutput(
+      result,
+      replySuggestionsEnabled,
+      replySuggestionCount
+    );
+    if (replySuggestionsEnabled && extracted.suggestions.length === 0) {
+      extracted.suggestions = fallbackReplySuggestions(replySuggestionCount);
+    }
+    const { filePaths, displayText } = buildAttachmentResult(extracted.text, structuredAttachments);
     const showToolsButton = toolHistory.length > 0;
     if (showToolsButton) {
       slackToolHistoryByMessageKey.set(slackMessageKey(channelId, messageTs), [...toolHistory]);
+    }
+    if (extracted.suggestions.length > 0) {
+      slackReplySuggestionsByMessageKey.set(
+        slackMessageKey(channelId, messageTs),
+        extracted.suggestions
+      );
     }
 
     // 最終結果を更新（長い場合は分割送信）
@@ -1402,9 +1597,20 @@ export async function processMessage(
           blocks: [
             {
               type: 'section',
-              text: { type: 'mrkdwn', text: sliceByBytes(displayText || '✅', 3000) },
+              text: {
+                type: 'mrkdwn',
+                text: sliceByBytes(displayText || '✅', SLACK_MAX_TEXT_BYTES),
+              },
             },
-            ...createSlackCompletedBlocks({ showTools: showToolsButton }),
+            ...createSlackCompletedBlocks({
+              showTools: showToolsButton,
+              showReplySuggestions: extracted.suggestions.length > 0,
+              replySuggestionPayload: {
+                messageKey: slackMessageKey(channelId, messageTs),
+                suggestions: extracted.suggestions,
+                threadTs,
+              },
+            }),
           ],
         })
         .catch(() => {});
@@ -1494,6 +1700,7 @@ export function _resetSlackStateForTest(): void {
   }
   slackProcessingMessages.clear();
   slackToolHistoryByMessageKey.clear();
+  slackReplySuggestionsByMessageKey.clear();
   busySlackConversations.clear();
   processedSlackMessages.clear();
 }

@@ -1,15 +1,26 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { registerDiscordSchedulerBridge } from '../src/discord/scheduler-bridge.js';
 import { finalizeActiveStreams, activeStreamFinalizerCount } from '../src/stream-finalizer.js';
-
-vi.mock('../src/sessions.js', () => ({
-  ensureSession: vi.fn(() => 'app-session-id'),
-  setSession: vi.fn(),
-}));
+import {
+  clearSessions,
+  createSession,
+  getActiveSessionId,
+  getSessionEntry,
+  initSessions,
+} from '../src/sessions.js';
 
 type AgentRunResult = { result: string; sessionId: string; attachments?: string[] };
+type StreamCallbacks = {
+  onText?: (chunk: string, fullText: string) => void;
+  onToolUse?: (name: string, input: Record<string, unknown>) => void;
+  onComplete?: (result: AgentRunResult) => void;
+  onError?: (error: Error) => void;
+};
 
-function buildBridge(runImpl: () => Promise<AgentRunResult>) {
+function buildBridge(runImpl: (callbacks: StreamCallbacks) => Promise<AgentRunResult>) {
   let capturedRunner: ((prompt: string, channelId: string) => Promise<string>) | undefined;
   const thinkingMsg = {
     edit: vi.fn(async (_content: string) => {}),
@@ -29,7 +40,18 @@ function buildBridge(runImpl: () => Promise<AgentRunResult>) {
     discord: { injectTimestamp: false },
     agent: { config: { skipPermissions: true } },
   };
-  const agentRunner = { run: vi.fn(runImpl) };
+  const agentRunner = {
+    runStream: vi.fn(async (_prompt: string, callbacks: StreamCallbacks) => {
+      try {
+        const result = await runImpl(callbacks);
+        callbacks.onComplete?.(result);
+        return result;
+      } catch (error) {
+        callbacks.onError?.(error instanceof Error ? error : new Error(String(error)));
+        throw error;
+      }
+    }),
+  };
   registerDiscordSchedulerBridge({
     scheduler,
     client,
@@ -37,7 +59,7 @@ function buildBridge(runImpl: () => Promise<AgentRunResult>) {
     agentRunner,
   } as unknown as Parameters<typeof registerDiscordSchedulerBridge>[0]);
   if (!capturedRunner) throw new Error('agent runner not registered');
-  return { runner: capturedRunner, thinkingMsg, channel };
+  return { runner: capturedRunner, thinkingMsg, channel, agentRunner };
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -109,5 +131,50 @@ describe('scheduler-bridge stream finalizer (issue #293)', () => {
       content: '🤔 考え中...',
       components: expect.any(Array),
     });
+  });
+
+  it('スケジューラ起点の tool event をストリーミング経路で受け取る', async () => {
+    const { runner, agentRunner } = buildBridge(async (callbacks) => {
+      callbacks.onToolUse?.('Read', { file_path: 'skills/xs-example/SKILL.md' });
+      callbacks.onToolUse?.('Bash', { command: 'uv run example.py' });
+      return { result: 'done', sessionId: 's1' };
+    });
+
+    await runner('xs-example を実行して', 'channel-1');
+
+    const activity = await import('../src/activity-store.js');
+    const snapshot = activity.getActivity('discord-schedule:channel-1');
+    expect(snapshot?.toolLines).toEqual([
+      'Read: skills/xs-example/SKILL.md',
+      'Bash: uv run example.py',
+    ]);
+    expect(snapshot?.state).toBe('complete');
+    expect(agentRunner.runStream).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Object),
+      expect.objectContaining({
+        sessionId: undefined,
+        channelId: 'channel-1',
+        appSessionId: expect.stringMatching(/^scheduler-run-discord-/),
+      })
+    );
+  });
+
+  it('スケジューラ実行で同じDiscordチャンネルの通常セッションを更新しない', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'xangi-discord-scheduler-'));
+    try {
+      initSessions(tmpDir);
+      const interactiveId = createSession('channel-1', { platform: 'discord' });
+      const interactiveBefore = structuredClone(getSessionEntry(interactiveId));
+      const { runner } = buildBridge(async () => ({ result: 'done', sessionId: 'scheduled' }));
+
+      await runner('scheduled prompt', 'channel-1');
+
+      expect(getActiveSessionId('channel-1')).toBe(interactiveId);
+      expect(getSessionEntry(interactiveId)).toEqual(interactiveBefore);
+    } finally {
+      clearSessions();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

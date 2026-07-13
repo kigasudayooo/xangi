@@ -32,6 +32,11 @@ export interface AgentConfig {
 export type EffortLevel = 'low' | 'medium' | 'high' | 'max';
 
 export interface Config {
+  /** 初回providerセッションの会話履歴先読み。全チャットプラットフォーム共通。 */
+  historyPrefetch?: {
+    enabled: boolean;
+    count: number;
+  };
   discord: {
     enabled: boolean;
     token: string;
@@ -49,6 +54,8 @@ export interface Config {
     injectChannelTopic?: boolean;
     injectTimestamp?: boolean;
     showButtons?: boolean;
+    replySuggestions?: boolean;
+    replySuggestionCount?: number;
     allowAutoreplyCommand?: boolean;
     /**
      * 反応する他 bot の ID ホワイトリスト (設定値、事前に env で指定)。
@@ -88,10 +95,16 @@ export interface Config {
     completionNotifyAfterMs?: number;
     streaming?: boolean;
     showThinking?: boolean;
+    replySuggestions?: boolean;
+    replySuggestionCount?: number;
     /** Slack reaction-based bot message deletion (default: true) */
     reactionDeleteEnabled?: boolean;
     /** Emoji reaction names that trigger deletion (default: wastebasket,x) */
     deleteReactions?: string[];
+  };
+  web: {
+    replySuggestions: boolean;
+    replySuggestionCount: number;
   };
   line: {
     enabled: boolean;
@@ -306,6 +319,10 @@ export function loadConfig(): Config {
     : undefined;
 
   const config: Config = {
+    historyPrefetch: {
+      enabled: process.env.HISTORY_PREFETCH_ENABLED !== 'false',
+      count: v.int('HISTORY_PREFETCH_COUNT', 10, { min: 1, max: 100 }),
+    },
     discord: {
       enabled: !!discordToken,
       token: discordToken || '',
@@ -343,6 +360,8 @@ export function loadConfig(): Config {
       injectChannelTopic: process.env.INJECT_CHANNEL_TOPIC !== 'false', // デフォルトON
       injectTimestamp: process.env.INJECT_TIMESTAMP !== 'false', // デフォルトON
       showButtons: process.env.DISCORD_SHOW_BUTTONS !== 'false', // デフォルトON
+      replySuggestions: process.env.DISCORD_REPLY_SUGGESTIONS === 'true',
+      replySuggestionCount: v.int('DISCORD_REPLY_SUGGESTIONS_COUNT', 3, { min: 1, max: 5 }),
       allowAutoreplyCommand: process.env.ALLOW_AUTOREPLY_COMMAND !== 'false', // デフォルトON
       respondToBots:
         process.env.RESPOND_TO_BOTS?.split(',')
@@ -375,10 +394,16 @@ export function loadConfig(): Config {
       ),
       streaming: process.env.SLACK_STREAMING !== 'false',
       showThinking: process.env.SLACK_SHOW_THINKING !== 'false',
+      replySuggestions: process.env.SLACK_REPLY_SUGGESTIONS === 'true',
+      replySuggestionCount: v.int('SLACK_REPLY_SUGGESTIONS_COUNT', 3, { min: 1, max: 5 }),
       reactionDeleteEnabled: process.env.SLACK_REACTION_DELETE_ENABLED !== 'false',
       deleteReactions: process.env.SLACK_DELETE_REACTIONS?.split(',')
         .map((s) => s.trim())
         .filter(Boolean) || ['wastebasket', 'x'],
+    },
+    web: {
+      replySuggestions: process.env.WEB_REPLY_SUGGESTIONS === 'true',
+      replySuggestionCount: v.int('WEB_REPLY_SUGGESTIONS_COUNT', 3, { min: 1, max: 5 }),
     },
     line: {
       enabled: lineEnabled,

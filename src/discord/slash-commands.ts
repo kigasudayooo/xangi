@@ -3,7 +3,9 @@ import {
   ChatInputCommandInteraction,
   AutocompleteInteraction,
   Interaction,
+  MessageFlags,
 } from 'discord.js';
+import type { ButtonInteraction } from 'discord.js';
 import {
   ALL_AGENT_BACKENDS,
   type Config,
@@ -23,6 +25,7 @@ import {
   getChannelAutoReply,
   getChannelCompletionNotifyMode,
   getChannelThreadMode,
+  getReplySuggestionsEnabled,
   loadSettings,
   formatSettings,
   saveSettings,
@@ -41,10 +44,15 @@ import {
   type Platform,
   type ScheduleType,
 } from '../scheduler.js';
-import { discordToolHistoryByMessageId } from './ui.js';
+import {
+  createReplySuggestionButtons,
+  discordReplySuggestionsByMessageId,
+  discordToolHistoryByMessageId,
+} from './ui.js';
 import { formatToolHistoryDisclosure } from '../tool-history.js';
 import { waitBeforeFollowupDiscordSend } from './send-delay.js';
 import { resolveDiscordSettingsChannelId } from './thread-context.js';
+import { formatNumberedSuggestions } from '../reply-suggestions.js';
 
 /** スキル一覧を保持する可変参照。`/skills` での再読込を呼び出し元と共有する */
 export interface SkillsRef {
@@ -129,6 +137,22 @@ export function buildSlashCommands(
       .addStringOption((option) => option.setName('args').setDescription('引数').setRequired(false))
       .toJSON(),
     new SlashCommandBuilder().setName('settings').setDescription('現在の設定を表示する').toJSON(),
+    new SlashCommandBuilder()
+      .setName('replysuggestions')
+      .setDescription('回答候補の全体ON/OFFを設定する')
+      .addStringOption((option) =>
+        option
+          .setName('mode')
+          .setDescription('回答候補モード')
+          .setRequired(true)
+          .addChoices(
+            { name: 'show (現在の設定を表示)', value: 'show' },
+            { name: 'on (全プラットフォームで生成)', value: 'on' },
+            { name: 'off (生成せずトークンを使わない)', value: 'off' },
+            { name: 'default (起動時設定に戻す)', value: 'default' }
+          )
+      )
+      .toJSON(),
     new SlashCommandBuilder()
       .setName('notify')
       .setDescription('このチャンネルの完了通知を設定する')
@@ -495,6 +519,24 @@ export interface InteractionHandlerDeps {
   scheduler: Scheduler;
   workdir: string;
   skillsRef: SkillsRef;
+  onReplySuggestion?: (interaction: ButtonInteraction, suggestion: string) => Promise<void>;
+}
+
+export async function removeUserFromDiscordThread(
+  channel: Interaction['channel'],
+  userId: string
+): Promise<boolean> {
+  if (!channel?.isThread()) return false;
+  await channel.members.remove(userId);
+  return true;
+}
+
+export function formatThreadLeaveError(error: unknown): string {
+  const code = (error as { code?: number } | null)?.code;
+  if (code === 50001 || code === 50013) {
+    return '❌ Botに「スレッドの管理」権限が必要です';
+  }
+  return '❌ スレッドから退出できませんでした';
 }
 
 /**
@@ -504,7 +546,7 @@ export interface InteractionHandlerDeps {
 export function createInteractionHandler(
   deps: InteractionHandlerDeps
 ): (interaction: Interaction) => Promise<void> {
-  const { config, resolver, agentRunner, scheduler, workdir, skillsRef } = deps;
+  const { config, resolver, agentRunner, scheduler, workdir, skillsRef, onReplySuggestion } = deps;
 
   return async (interaction: Interaction) => {
     // オートコンプリート処理
@@ -568,6 +610,7 @@ export function createInteractionHandler(
         deleteSession(channelId);
         agentRunner.destroy?.(channelId);
         discordToolHistoryByMessageId.delete(interaction.message.id);
+        discordReplySuggestionsByMessageId.delete(interaction.message.id);
         // ボタンを消してメッセージを更新
         await interaction
           .update({
@@ -595,6 +638,65 @@ export function createInteractionHandler(
         });
         for (let i = 1; i < chunks.length; i++) {
           await interaction.followUp({ content: chunks[i], ephemeral: true }).catch(() => {});
+        }
+        return;
+      }
+
+      if (interaction.customId === 'xangi_reply_suggestions') {
+        const suggestions = discordReplySuggestionsByMessageId.get(interaction.message.id);
+        if (!suggestions || suggestions.length === 0) {
+          await interaction.reply({
+            content: 'この返信候補は期限切れです',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+        await interaction.reply({
+          content: formatNumberedSuggestions(suggestions),
+          components: [createReplySuggestionButtons(interaction.message.id, suggestions.length)],
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (interaction.customId.startsWith('xangi_reply_suggestion_')) {
+        const match = /^xangi_reply_suggestion_(\d+)_(\d+)$/.exec(interaction.customId);
+        const sourceMessageId = match?.[1];
+        const index = Number(match?.[2]);
+        const suggestions = sourceMessageId
+          ? discordReplySuggestionsByMessageId.get(sourceMessageId)
+          : undefined;
+        const suggestion = Number.isInteger(index) ? suggestions?.[index] : undefined;
+        if (!suggestion || !onReplySuggestion) {
+          await interaction.reply({
+            content: 'この返信候補は期限切れです',
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+        await interaction.update({ content: `送信: ${suggestion}`, components: [] });
+        await onReplySuggestion(interaction, suggestion).catch(async (error) => {
+          console.error('[xangi] Reply suggestion failed:', error);
+          await interaction.followUp({
+            content: formatAgentErrorForUser(error),
+            flags: MessageFlags.Ephemeral,
+          });
+        });
+        return;
+      }
+
+      if (interaction.customId === 'xangi_thread_leave') {
+        await interaction.deferReply({ ephemeral: true }).catch(() => {});
+        if (!interaction.channel?.isThread()) {
+          await interaction.editReply('❌ このボタンはスレッド内でのみ使えます').catch(() => {});
+          return;
+        }
+        try {
+          await removeUserFromDiscordThread(interaction.channel, interaction.user.id);
+          await interaction.editReply('🚪 このスレッドから退出しました').catch(() => {});
+        } catch (error) {
+          console.error('[xangi] Failed to leave Discord thread:', error);
+          await interaction.editReply(formatThreadLeaveError(error)).catch(() => {});
         }
         return;
       }
@@ -1041,6 +1143,48 @@ export function createInteractionHandler(
       await interaction.reply(
         `💬 <#${chId}> のメンションなし応答を${action}\n現在の適用値: \`${effective ? 'on' : 'off'}\``
       );
+      return;
+    }
+
+    if (interaction.commandName === 'replysuggestions') {
+      const mode = interaction.options.getString('mode', true) as 'show' | 'on' | 'off' | 'default';
+      const settings = loadSettings();
+      const platformDefaults = {
+        Discord: config.discord.replySuggestions !== false,
+        Slack: config.slack.replySuggestions !== false,
+        Web: config.web.replySuggestions,
+      };
+
+      if (mode === 'show') {
+        const override = settings.replySuggestionsEnabled;
+        const effective = Object.entries(platformDefaults)
+          .map(
+            ([platform, defaultEnabled]) =>
+              `${platform}: ${getReplySuggestionsEnabled(settings, defaultEnabled) ? 'ON' : 'OFF'}`
+          )
+          .join(' / ');
+        await interaction.reply(
+          `💬 回答候補の全体設定: ${override === undefined ? '起動時設定' : override ? 'ON' : 'OFF'}\n` +
+            `現在の適用値: ${effective}\n` +
+            `OFF時は候補生成指示をプロンプトへ追加しないため、追加トークン・待ち時間は発生しません。`
+        );
+        return;
+      }
+
+      const saved = saveSettings({
+        replySuggestionsEnabled: mode === 'default' ? undefined : mode === 'on',
+      });
+      const status =
+        mode === 'default'
+          ? '起動時設定に戻しました'
+          : `${mode === 'on' ? 'ON' : 'OFF'} に設定しました`;
+      const effective = Object.entries(platformDefaults)
+        .map(
+          ([platform, defaultEnabled]) =>
+            `${platform}: ${getReplySuggestionsEnabled(saved, defaultEnabled) ? 'ON' : 'OFF'}`
+        )
+        .join(' / ');
+      await interaction.reply(`💬 回答候補を${status}\n現在の適用値: ${effective}`);
       return;
     }
 

@@ -6,7 +6,13 @@ import type { WebClient } from '@slack/web-api';
 import type { AgentRunner } from '../src/agent-runner.js';
 import type { Config } from '../src/config.js';
 import { Scheduler } from '../src/scheduler.js';
-import { initSessions, clearSessions } from '../src/sessions.js';
+import {
+  initSessions,
+  clearSessions,
+  createSession,
+  getActiveSessionId,
+  getSessionEntry,
+} from '../src/sessions.js';
 import { registerSlackSchedulerBridge } from '../src/slack.js';
 
 describe('registerSlackSchedulerBridge', () => {
@@ -23,6 +29,8 @@ describe('registerSlackSchedulerBridge', () => {
   });
 
   it('registers a Slack agent runner for scheduler and trigger paths', async () => {
+    const interactiveId = createSession('C123', { platform: 'slack' });
+    const interactiveBefore = structuredClone(getSessionEntry(interactiveId));
     const scheduler = new Scheduler(tmpDir, { quiet: true });
     const postMessage = vi.fn().mockResolvedValue({ ts: '1700000000.000100' });
     const update = vi.fn().mockResolvedValue({});
@@ -30,7 +38,13 @@ describe('registerSlackSchedulerBridge', () => {
       chat: { postMessage, update },
     } as unknown as WebClient;
     const agentRunner = {
-      run: vi.fn().mockResolvedValue({ result: 'done', sessionId: 'provider-1' }),
+      runStream: vi.fn(async (_prompt, callbacks) => {
+        callbacks.onToolUse?.('Read', { file_path: 'skills/xs-example/SKILL.md' });
+        callbacks.onToolUse?.('Bash', { command: 'uv run example.py' });
+        const result = { result: 'done', sessionId: 'provider-1' };
+        callbacks.onComplete?.(result);
+        return result;
+      }),
     } as unknown as AgentRunner;
     const config = {
       agent: { config: { skipPermissions: true } },
@@ -51,12 +65,14 @@ describe('registerSlackSchedulerBridge', () => {
     });
     const initialPayload = postMessage.mock.calls[0][0] as { blocks: unknown[] };
     expect(JSON.stringify(initialPayload.blocks)).toContain('Stop');
-    expect(agentRunner.run).toHaveBeenCalledWith(
+    expect(agentRunner.runStream).toHaveBeenCalledWith(
       'trigger payload',
+      expect.any(Object),
       expect.objectContaining({
         skipPermissions: true,
         sessionId: undefined,
         channelId: 'C123',
+        appSessionId: expect.stringMatching(/^scheduler-run-slack-/),
       })
     );
     expect(update).toHaveBeenCalledWith({
@@ -65,5 +81,15 @@ describe('registerSlackSchedulerBridge', () => {
       text: 'done',
       blocks: [],
     });
+
+    const activity = await import('../src/activity-store.js');
+    const snapshot = activity.getActivity('slack-schedule:C123');
+    expect(snapshot?.toolLines).toEqual([
+      'Read: skills/xs-example/SKILL.md',
+      'Bash: uv run example.py',
+    ]);
+    expect(snapshot?.state).toBe('complete');
+    expect(getActiveSessionId('C123')).toBe(interactiveId);
+    expect(getSessionEntry(interactiveId)).toEqual(interactiveBefore);
   });
 });

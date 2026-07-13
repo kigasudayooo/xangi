@@ -813,6 +813,42 @@
       .msg-action-btn.danger {
         color: var(--danger);
       }
+      .reply-suggestions {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+        margin-top: 6px;
+      }
+      .reply-suggestions-toggle,
+      .reply-suggestion-option {
+        border: 1px solid var(--hairline);
+        border-radius: var(--radius-md);
+        background: var(--surface-1);
+        color: var(--ink-secondary);
+        padding: 5px 9px;
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .reply-suggestions-toggle:hover,
+      .reply-suggestion-option:hover {
+        background: var(--surface-2);
+        color: var(--ink);
+      }
+      .reply-suggestions-options {
+        display: none;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 4px;
+        max-width: min(100%, 520px);
+      }
+      .reply-suggestions.open .reply-suggestions-options {
+        display: flex;
+      }
+      .reply-suggestion-option {
+        text-align: left;
+      }
       /* インライン編集 textarea */
       .msg-edit {
         width: 100%;
@@ -1804,6 +1840,10 @@
             }
           }
 
+          if (role === 'assistant' && opts.replySuggestions?.length) {
+            this._addReplySuggestions(wrapper, opts.replySuggestions);
+          }
+
           this.messagesEl.appendChild(wrapper);
           // 自分のメッセージ (user) 送信時は強制で下に追従させる
           // (followBottom フラグを true に戻して以降の AI 更新も追従)
@@ -1879,6 +1919,39 @@
           actions.appendChild(delBtn);
 
           return actions;
+        }
+
+        _addReplySuggestions(wrapper, suggestions) {
+          if (!wrapper || !Array.isArray(suggestions) || suggestions.length === 0) return;
+          if (wrapper.querySelector('.reply-suggestions')) return;
+          var self = this;
+          var box = document.createElement('div');
+          box.className = 'reply-suggestions';
+          var toggle = document.createElement('button');
+          toggle.type = 'button';
+          toggle.className = 'reply-suggestions-toggle';
+          toggle.textContent = '返信候補';
+          toggle.addEventListener('click', function () {
+            box.classList.toggle('open');
+          });
+          var options = document.createElement('div');
+          options.className = 'reply-suggestions-options';
+          suggestions.forEach(function (suggestion, index) {
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'reply-suggestion-option';
+            btn.textContent = index + 1 + '. ' + suggestion;
+            btn.addEventListener('click', function () {
+              self.inputEl.value = suggestion;
+              self.inputEl.dispatchEvent(new Event('input'));
+              box.remove();
+              self.send();
+            });
+            options.appendChild(btn);
+          });
+          box.appendChild(toggle);
+          box.appendChild(options);
+          wrapper.appendChild(box);
         }
 
         _beginEdit(wrapper, contentDiv) {
@@ -1998,6 +2071,7 @@
                 createdAt: m.createdAt,
                 usage: m.usage,
                 edited: m.edited,
+                replySuggestions: this.platform === 'web' ? m.replySuggestions : [],
               });
             }
           } catch (_) {}
@@ -2033,6 +2107,7 @@
                 createdAt: m.createdAt,
                 usage: m.usage,
                 edited: m.edited,
+                replySuggestions: data.platform === 'web' ? m.replySuggestions : [],
               });
             }
             var info = allSessions.find(function (s) {
@@ -2261,6 +2336,9 @@
                             self._buildMsgActions(assistantWrapper, 'assistant', assistantDiv)
                           );
                         }
+                      }
+                      if (assistantWrapper && d.replySuggestions?.length) {
+                        self._addReplySuggestions(assistantWrapper, d.replySuggestions);
                       }
                       loadSessions();
                     } else if (eventType === 'timeout') {
