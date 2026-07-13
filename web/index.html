@@ -1218,7 +1218,13 @@
         <button id="menu-btn" onclick="toggleSidebar()">&#9776;</button>
         <h1>xangi</h1>
         <span class="spacer"></span>
-        <a class="tool-link" href="/inter-chat" title="inter-instance-chat 履歴ビューア">
+        <a
+          class="tool-link"
+          href="/inter-chat"
+          target="_blank"
+          rel="noopener"
+          title="inter-instance-chat 履歴ビューア (別タブで開く)"
+        >
           🔁 inter-chat
         </a>
         <a class="tool-link" href="/monitor" title="セッション監視">
@@ -1247,6 +1253,7 @@
       const addPaneBtn = document.getElementById('add-pane-btn');
 
       const MAX_PANES = 8;
+      const PANE_STATE_KEY = 'xangi_pane_state_v1';
       let allSessions = [];
 
       // ─── タイムアウト管理 ───
@@ -2368,6 +2375,7 @@
                 b.remove();
               });
               loadSessions();
+              if (typeof paneManager !== 'undefined') paneManager._renderTabs();
               this.inputEl.focus();
             }
           } catch (e) {}
@@ -2423,7 +2431,24 @@
           }
         }
 
+        // 開いているペインの並び（各ペインの sessionId）と現在フォーカス中のペインを
+        // localStorage に保存し、ブラウザ更新後も同じ状態を復元できるようにする。
+        // _renderTabs はペイン追加・削除・フォーカス変更・タイトル更新の全経路から
+        // 呼ばれるので、ここに載せておけば個別に persist 呼び出しを散らばせずに済む。
+        _persist() {
+          try {
+            var ids = this.panes.map(function (p) {
+              return p.sessionId || null;
+            });
+            var activeIdx = this.panes.indexOf(this.activePane);
+            localStorage.setItem(PANE_STATE_KEY, JSON.stringify({ ids: ids, activeIdx: activeIdx }));
+          } catch (_) {
+            // localStorage 不可 (プライベートブラウジング等) でも致命的ではないので無視
+          }
+        }
+
         _renderTabs() {
+          this._persist();
           paneTabsEl.innerHTML = '';
           if (this.panes.length === 0) return;
           var self = this;
@@ -2556,6 +2581,10 @@
         var pane = paneManager.activePane;
         if (!pane) {
           pane = paneManager.add({ sessionId: id });
+        } else if (pane.sending) {
+          // アクティブペインが送信中なら中断せず新しいペインで開く
+          // (中断すると裏でバックエンドの処理が走ったまま画面から消えてしまうため)
+          paneManager.add({ sessionId: id });
         } else {
           pane.loadSession(id);
         }
@@ -2580,6 +2609,11 @@
         var pane = paneManager.activePane;
         if (!pane) {
           pane = paneManager.add({});
+        } else if (pane.sending) {
+          // アクティブペインが送信中なら中断せず新しいペインで開く
+          // (上限到達で add() が null を返した場合は何もせず諦める)
+          pane = paneManager.add({});
+          if (!pane) return;
         }
         await pane.newSession();
       }
@@ -2893,8 +2927,30 @@
           /* 失敗時はフィルタ無し (全許可) のまま */
         }
         loadSessions();
-        // 起動時に空ペイン1個を用意
-        paneManager.add({});
+        // 前回開いていたペイン構成を localStorage から復元する。
+        // 保存が無い（初回訪問 or 全ペインを閉じた状態で更新した）場合のみ、
+        // 従来通り空ペイン1個を用意する。
+        var restored = false;
+        try {
+          var raw = localStorage.getItem(PANE_STATE_KEY);
+          if (raw) {
+            var saved = JSON.parse(raw);
+            if (saved && Array.isArray(saved.ids) && saved.ids.length > 0) {
+              // add() は上限超過時に alert() を出すので、復元時は静かに切り詰める
+              saved.ids.slice(0, MAX_PANES).forEach(function (id) {
+                paneManager.add(id ? { sessionId: id } : {});
+              });
+              var activePane = paneManager.panes[saved.activeIdx];
+              if (activePane) paneManager.focus(activePane);
+              restored = true;
+            }
+          }
+        } catch (_) {
+          // 壊れた保存データは無視してデフォルト動作にフォールバック
+        }
+        if (!restored) {
+          paneManager.add({});
+        }
       })();
       // ドラッグ&ドロップ：アクティブペインに添付
       document.body.addEventListener('dragover', function (e) {
