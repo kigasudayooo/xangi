@@ -32,8 +32,31 @@ interface AntigravityJsonResponse {
   message?: string | { content?: unknown };
 }
 
+interface AntigravityStreamEvent {
+  event?: string;
+  conversation_id?: string;
+  init?: {
+    conversation_id?: string;
+  };
+  step_update?: {
+    conversation_id?: string;
+    step_index?: number;
+    state?: string;
+    step_type?: string;
+    text_delta?: string;
+    tool_name?: string;
+    tool_info?: {
+      name?: string;
+      parameters?: unknown;
+      error?: string | { message?: string; type?: string };
+    };
+  };
+  result?: AntigravityJsonResponse;
+}
+
 type ConversationSnapshot = Map<string, number>;
 type OutputCapability = 'unknown' | 'json' | 'legacy';
+type StreamOutputCapability = 'unknown' | 'stream-json' | 'legacy';
 
 interface AntigravityOutputError extends Error {
   antigravityStdout?: string;
@@ -49,14 +72,20 @@ export class AntigravityRunner extends CliRunnerBase {
   private readonly printTimeout: string;
   /** Capability is intentionally per runner: different agy binaries may be used by different runners. */
   private outputCapability: OutputCapability = 'unknown';
+  private streamOutputCapability: StreamOutputCapability = 'unknown';
 
   constructor(options?: AntigravityOptions) {
     super(options);
     this.systemPrompt = buildSystemPrompt(options?.platform);
-    this.printTimeout = process.env.ANTIGRAVITY_PRINT_TIMEOUT || '5m';
+    this.printTimeout =
+      process.env.ANTIGRAVITY_PRINT_TIMEOUT || `${Math.ceil(this.timeoutMs / 1000)}s`;
   }
 
-  private buildArgs(prompt: string, options?: RunOptions, outputFormat?: 'json'): string[] {
+  private buildArgs(
+    prompt: string,
+    options?: RunOptions,
+    outputFormat?: 'json' | 'stream-json'
+  ): string[] {
     const args: string[] = [];
 
     const skip = options?.skipPermissions ?? this.skipPermissions;
@@ -189,19 +218,197 @@ export class AntigravityRunner extends CliRunnerBase {
     callbacks: StreamCallbacks,
     options?: RunOptions
   ): Promise<RunResult> {
-    const result = await this.run(prompt, options);
-    if (result.result) {
-      callbacks.onText?.(result.result, result.result);
+    if (this.streamOutputCapability === 'legacy') {
+      return this.runPseudoStream(prompt, callbacks, options);
     }
-    callbacks.onComplete?.(result);
-    return result;
+
+    const fullPrompt = this.buildFullPrompt(prompt);
+    this.logExecution('Streaming', options);
+
+    if (options?.appSessionId && this.workdir) {
+      logPrompt(this.workdir, options.appSessionId, fullPrompt);
+    }
+
+    const onComplete = (result: RunResult) => {
+      if (options?.appSessionId && this.workdir) {
+        logResponse(this.workdir, options.appSessionId, {
+          result: result.result,
+          sessionId: result.sessionId,
+        });
+      }
+    };
+
+    try {
+      return await this.executeStreamCore(
+        this.buildArgs(fullPrompt, options, 'stream-json'),
+        callbacks,
+        {
+          channelId: options?.channelId,
+          notifyOnError: false,
+          onComplete,
+        }
+      );
+    } catch (error) {
+      if (this.isUnsupportedOutputFormat(error)) {
+        // This failure happens during flag parsing, before agy executes the prompt.
+        this.streamOutputCapability = 'legacy';
+        this.outputCapability = 'legacy';
+        const fallbackOptions = options?.appSessionId
+          ? { ...options, appSessionId: undefined }
+          : options;
+        const result = await this.runPseudoStream(prompt, callbacks, fallbackOptions);
+        onComplete(result);
+        return result;
+      }
+
+      const err = error instanceof Error ? error : new Error(String(error));
+      callbacks.onError?.(err);
+      throw error;
+    }
   }
 
-  protected createStreamParser(_callbacks: StreamCallbacks): CliStreamParser {
+  protected createStreamParser(callbacks: StreamCallbacks): CliStreamParser {
+    let fullText = '';
+    let sessionId = '';
+    let rawOutput = '';
+    let errorDetail: string | undefined;
+    let lastToolError: string | undefined;
+    let sawResult = false;
+    let sawNativeEvent = false;
+    let backendReady = false;
+    const emittedToolSteps = new Set<string>();
+
     return {
-      handleEvent: () => undefined,
-      finalize: () => ({ result: '', sessionId: '' }),
+      handleRawLine: (line, phase) => {
+        rawOutput += phase === 'stream' ? `${line}\n` : line;
+      },
+      handleEvent: (json, phase) => {
+        const event = json as AntigravityStreamEvent;
+        const isNativeEvent =
+          (event.event === 'init' && Boolean(event.init)) ||
+          (event.event === 'step_update' && Boolean(event.step_update)) ||
+          (event.event === 'result' && Boolean(event.result?.status));
+        if (!isNativeEvent) {
+          return false;
+        }
+
+        sawNativeEvent = true;
+        this.streamOutputCapability = 'stream-json';
+        this.outputCapability = 'json';
+        sessionId = event.conversation_id ?? sessionId;
+
+        if (event.event === 'init') {
+          sessionId = event.init?.conversation_id ?? sessionId;
+          if (!backendReady) {
+            backendReady = true;
+            callbacks.onBackendReady?.();
+          }
+          return undefined;
+        }
+
+        if (event.event === 'step_update' && event.step_update) {
+          const step = event.step_update;
+          sessionId = step.conversation_id ?? sessionId;
+
+          if (step.step_type === 'agent_response' && typeof step.text_delta === 'string') {
+            fullText += step.text_delta;
+            if (step.text_delta) {
+              callbacks.onText?.(step.text_delta, fullText);
+            }
+          }
+
+          if (step.step_type === 'tool') {
+            const toolName = step.tool_name ?? step.tool_info?.name ?? 'tool';
+            const input = this.toRecord(step.tool_info?.parameters);
+            const toolId =
+              step.step_index !== undefined
+                ? `${sessionId}:${step.step_index}`
+                : `${toolName}:${JSON.stringify(input)}`;
+
+            if (step.state === 'ACTIVE' && !emittedToolSteps.has(toolId)) {
+              emittedToolSteps.add(toolId);
+              callbacks.onToolUse?.(toolName, input);
+            }
+
+            if (step.state === 'ERROR') {
+              lastToolError = this.extractToolError(step.tool_info?.error, toolName);
+            }
+          }
+          return undefined;
+        }
+
+        if (event.event === 'result' && event.result) {
+          sawResult = true;
+          const result = event.result;
+          sessionId = result.conversation_id ?? sessionId;
+
+          if (result.status === 'ERROR') {
+            errorDetail = this.extractErrorMessage(result) ?? 'Antigravity CLI returned ERROR';
+            return phase === 'stream' ? new Error(errorDetail) : undefined;
+          }
+          if (result.status !== 'SUCCESS') {
+            errorDetail = `Antigravity CLI returned unknown stream status${
+              result.status ? `: ${result.status}` : ''
+            }`;
+            return phase === 'stream' ? new Error(errorDetail) : undefined;
+          }
+
+          const response = typeof result.response === 'string' ? result.response : '';
+          if (!response) {
+            errorDetail =
+              lastToolError ?? 'Antigravity CLI returned SUCCESS JSON without a response';
+            return phase === 'stream' ? new Error(errorDetail) : undefined;
+          }
+
+          if (response.startsWith(fullText)) {
+            const remaining = response.slice(fullText.length);
+            fullText = response;
+            if (remaining) callbacks.onText?.(remaining, fullText);
+          } else if (response !== fullText) {
+            // The final response is canonical. Do not emit it again after already emitted deltas.
+            fullText = response;
+          }
+        }
+
+        return undefined;
+      },
+      finalize: () => {
+        if (!sawNativeEvent) {
+          this.streamOutputCapability = 'legacy';
+          const result = rawOutput.trim();
+          if (!result) {
+            throw new Error('Antigravity CLI returned no output');
+          }
+          callbacks.onText?.(result, result);
+          return { result, sessionId };
+        }
+        if (!sawResult) {
+          throw new Error('Antigravity CLI stream ended without a result event');
+        }
+        if (errorDetail) {
+          throw new Error(errorDetail);
+        }
+        return { result: fullText, sessionId };
+      },
+      exitErrorDetail: () => errorDetail,
     };
+  }
+
+  private async runPseudoStream(
+    prompt: string,
+    callbacks: StreamCallbacks,
+    options?: RunOptions
+  ): Promise<RunResult> {
+    try {
+      const result = await this.run(prompt, options);
+      callbacks.onText?.(result.result, result.result);
+      callbacks.onComplete?.(result);
+      return result;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      callbacks.onError?.(err);
+      throw error;
+    }
   }
 
   private interpretOutput(
@@ -412,6 +619,21 @@ export class AntigravityRunner extends CliRunnerBase {
   private extractConversationIdFromFilename(filename: string): string {
     const id = basename(filename, '.db');
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : '';
+  }
+
+  private toRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  }
+
+  private extractToolError(
+    error: string | { message?: string; type?: string } | undefined,
+    toolName: string
+  ): string {
+    if (typeof error === 'string') return error || `Antigravity tool failed: ${toolName}`;
+    if (error?.message) return error.message;
+    return `Antigravity tool failed: ${toolName}`;
   }
 
   private extractErrorMessage(event: AntigravityJsonResponse): string | undefined {

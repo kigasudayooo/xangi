@@ -81,7 +81,12 @@ class TestRunner extends CliRunnerBase {
 
     return {
       handleEvent: (json, phase) => {
-        const event = json as { text?: string; fail?: string; detail?: string; session_id?: string };
+        const event = json as {
+          text?: string;
+          fail?: string;
+          detail?: string;
+          session_id?: string;
+        };
         if (event.session_id) sessionId = event.session_id;
         if (event.detail) detail = event.detail;
         if (event.fail && phase === 'stream') {
@@ -104,8 +109,8 @@ class TestRunner extends CliRunnerBase {
 async function getMockProcess() {
   const { getMockProcess } = (await import('child_process')) as unknown as {
     getMockProcess: () => {
-      stdout: { emit: (event: string, data: string) => void };
-      stderr: { emit: (event: string, data: string) => void };
+      stdout: { emit: (event: string, data: string | Buffer) => void };
+      stderr: { emit: (event: string, data: string | Buffer) => void };
       emit: (event: string, ...args: unknown[]) => void;
       killed: boolean;
     };
@@ -204,6 +209,20 @@ describe('CliRunnerBase executeStreamCore', () => {
     proc.emit('close', 0);
     const result = await promise;
     expect(result.result).toBe('tail');
+  });
+
+  it('UTF-8文字がstdoutチャンク境界で分割されてもJSONLを保持する', async () => {
+    const runner = new TestRunner({ timeoutMs: 5000 });
+    const promise = runner.runStream('p', {}, { channelId: 'ch1' });
+    await tick();
+    const proc = await getMockProcess();
+    const output = Buffer.from('{"text":"水田チェック"}\n');
+    const splitAt = output.indexOf(Buffer.from('水')) + 1;
+    proc.stdout.emit('data', output.subarray(0, splitAt));
+    proc.stdout.emit('data', output.subarray(splitAt));
+    proc.emit('close', 0);
+
+    await expect(promise).resolves.toEqual({ result: '水田チェック', sessionId: '' });
   });
 
   it('パーサが Error を返したら onError 通知の上で reject する', async () => {

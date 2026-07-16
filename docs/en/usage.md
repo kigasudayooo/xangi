@@ -420,7 +420,7 @@ Runtime settings are saved in `${DATA_DIR}/settings.json` (default: `${WORKSPACE
 | Command                                          | Description                                                                                                           |
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
 | `/settings`                                      | Show current settings                                                                                                 |
-| `/restart`                                       | Restart the bot only when `.env` has `XANGI_SELF_LIFECYCLE=restart-only`                                           |
+| `/restart`                                       | Restart the bot only when `.env` has `XANGI_SELF_LIFECYCLE=restart-only`                                              |
 | `/autoreply <on\|off\|default\|show>`            | Configure mention-free auto-reply for this channel (no restart needed, persisted to `settings.json`)                  |
 | `/notify <off\|message\|mention\|default\|show>` | Configure completion notifications for this channel (no restart needed, persisted to `settings.json`)                 |
 | `/respondtobots`                                 | Toggle bot-to-bot reply ON/OFF (whitelist set via `RESPOND_TO_BOTS` env)                                              |
@@ -1089,10 +1089,10 @@ To modify the whitelist, edit `ALLOWED_ENV_KEYS` in `src/safe-env.ts`.
 
 ### First-turn history prefetch (Discord / Slack / Web)
 
-| Variable                     | Description                                                        | Default |
-| ---------------------------- | ------------------------------------------------------------------ | ------- |
-| `HISTORY_PREFETCH_ENABLED`   | Prefetch recent history before the first provider turn             | `true`  |
-| `HISTORY_PREFETCH_COUNT`     | Number of messages to prefetch (`1` to `100`)                       | `10`    |
+| Variable                   | Description                                            | Default |
+| -------------------------- | ------------------------------------------------------ | ------- |
+| `HISTORY_PREFETCH_ENABLED` | Prefetch recent history before the first provider turn | `true`  |
+| `HISTORY_PREFETCH_COUNT`   | Number of messages to prefetch (`1` to `100`)          | `10`    |
 
 Prefetch runs only when no provider session ID exists. Continuing turns use the provider session's existing context. When disabled, xangi does not inject first-turn history.
 
@@ -1150,7 +1150,7 @@ Prefetch runs only when no provider session ID exists. Continuing turns use the 
 | `TIMEOUT_EXTEND_ENABLED`     | Enable / disable the `延長` button                                                                                             | `true`                  |
 | `ALLOWED_BACKENDS`           | Allowed backends for `/backend` switching (comma-separated). If unset, all backends are allowed                                | all backends            |
 | `ALLOWED_MODELS`             | Allowed models for `/backend` switching (comma-separated)                                                                      | -                       |
-| `CHANNEL_OVERRIDES`          | Per-channel backend settings (JSON). Discord threads inherit the parent channel's entry                                                   | -                       |
+| `CHANNEL_OVERRIDES`          | Per-channel backend settings (JSON). Discord threads inherit the parent channel's entry                                        | -                       |
 | `ANTHROPIC_API_KEY`          | Anthropic API key passed only to the Claude Code backend                                                                       | -                       |
 | `CLAUDE_CODE_BARE`           | Pass `--bare` to Claude Code and force API-key auth instead of OAuth/keychain auth                                             | `false`                 |
 | `CLAUDE_CODE_MAX_BUDGET_USD` | Pass `--max-budget-usd` to Claude Code to cap API spend                                                                        | -                       |
@@ -1180,15 +1180,15 @@ Prefetch runs only when no provider session ID exists. Continuing turns use the 
 
 ### Web Chat UI
 
-| Variable                   | Description                                                                                                                                                                                           | Default             |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
-| `WEB_CHAT_ENABLED`         | Enable Web Chat UI. `true` exposes `http://localhost:<WEB_CHAT_PORT>`                                                                                                                                 | `false`             |
-| `WEB_REPLY_SUGGESTIONS`    | Show collapsed reply suggestions below responses                                                                                                                                                     | `false`             |
-| `WEB_REPLY_SUGGESTIONS_COUNT` | Number of reply suggestions (1-5)                                                                                                                                                                 | `3`                 |
-| `WEB_CHAT_PORT`            | Web Chat UI port                                                                                                                                                                                      | `18888`             |
-| `WEB_CHAT_HOST`            | Bind host. `0.0.0.0` exposes on all interfaces. The Web UI has no auth, so set `127.0.0.1` to restrict to loopback and reach it only via SSH port-forward, Tailscale, etc.                            | `0.0.0.0`           |
-| `WEB_CHAT_UPLOAD_ACCEPT`   | Upload allowlist (HTML `accept` syntax). Empty = allow all. `.ext` entries are also enforced server-side                                                                                              | (unset / allow all) |
-| `WEB_CHAT_DOWNLOAD_ACCEPT` | Download allowlist of extensions (e.g. `.html,.txt,.md`). Empty = allow all. Known extensions are served inline with proper Content-Type; unknown ones fall back to `Content-Disposition: attachment` | (unset / allow all) |
+| Variable                      | Description                                                                                                                                                                                           | Default             |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| `WEB_CHAT_ENABLED`            | Enable Web Chat UI. `true` exposes `http://localhost:<WEB_CHAT_PORT>`                                                                                                                                 | `false`             |
+| `WEB_REPLY_SUGGESTIONS`       | Show collapsed reply suggestions below responses                                                                                                                                                      | `false`             |
+| `WEB_REPLY_SUGGESTIONS_COUNT` | Number of reply suggestions (1-5)                                                                                                                                                                     | `3`                 |
+| `WEB_CHAT_PORT`               | Web Chat UI port                                                                                                                                                                                      | `18888`             |
+| `WEB_CHAT_HOST`               | Bind host. `0.0.0.0` exposes on all interfaces. The Web UI has no auth, so set `127.0.0.1` to restrict to loopback and reach it only via SSH port-forward, Tailscale, etc.                            | `0.0.0.0`           |
+| `WEB_CHAT_UPLOAD_ACCEPT`      | Upload allowlist (HTML `accept` syntax). Empty = allow all. `.ext` entries are also enforced server-side                                                                                              | (unset / allow all) |
+| `WEB_CHAT_DOWNLOAD_ACCEPT`    | Download allowlist of extensions (e.g. `.html,.txt,.md`). Empty = allow all. Known extensions are served inline with proper Content-Type; unknown ones fall back to `Content-Disposition: attachment` | (unset / allow all) |
 
 When Web Chat is enabled, the same server also exposes `http://localhost:<WEB_CHAT_PORT>/monitor`. `/monitor` is a read-only session monitor that lists Web / Discord / Slack sessions with the current turn summary, recent tool lines, elapsed seconds, and runner state.
 
@@ -1281,15 +1281,15 @@ When `SKIP_PERMISSIONS=true` (the default), xangi passes `--always-approve` to a
 
 The Antigravity backend uses Google's `agy` command. Install it with `curl -fsSL https://antigravity.google/cli/install.sh | bash` and complete the first-run `agy` authentication flow.
 
-Non-interactive execution uses `agy --print-timeout <timeout> --output-format json -p ...`. xangi reads `status`, `response`, and `conversation_id` from Agy CLI 1.1.2 final JSON and returns `conversation_id` as the provider session. Set `ANTIGRAVITY_PRINT_TIMEOUT` (default: `5m`) to control agy's own print-mode timeout. xangi passes `--model` when `AGENT_MODEL` is set and `--conversation` when a provider session id is available. When a workdir is configured, it also passes `--add-dir .` for that same child-process cwd.
+Non-interactive execution uses `agy --print-timeout <timeout> --output-format json -p ...`. xangi reads `status`, `response`, and `conversation_id` from Agy CLI 1.1.2 and later final JSON and returns `conversation_id` as the provider session. Set `ANTIGRAVITY_PRINT_TIMEOUT` to control agy's own print-mode timeout. When unset, it matches xangi's execution timeout (normally `1800s`). xangi passes `--model` when `AGENT_MODEL` is set and `--conversation` when a provider session id is available. When a workdir is configured, it also passes `--add-dir .` for that same child-process cwd.
 
-If an older agy explicitly reports that `--output-format` is unsupported, xangi retries once in legacy plain-output mode and caches that mode for the runner. It does not retry ordinary execution errors such as timeouts, authentication or quota errors, or an invalid model.
+For streaming, xangi uses `--output-format stream-json` with Agy CLI 1.1.3 and later. It emits `step_update.text_delta` incrementally and retains the `conversation_id` from `init` and `result` as the provider session. Tool `ACTIVE` events are reported as progress. A tool-level `ERROR` does not immediately fail the conversation because the agent may recover; xangi waits for the final `result` event.
+
+If Agy CLI 1.1.2 ignores `stream-json` and returns plain text, xangi uses that output as the final response without executing the prompt again. If an even older agy explicitly reports that `--output-format` is unsupported, xangi retries once in legacy plain-output mode. The detected capabilities are cached for the runner. xangi does not retry ordinary execution errors such as timeouts, authentication or quota errors, or an invalid model.
 
 If agy exits successfully with empty stdout, xangi surfaces timeout, quota, authentication, or other details written to stderr as the error message.
 
 When `SKIP_PERMISSIONS=true` (the default), xangi passes `--dangerously-skip-permissions` to avoid blocking on permission prompts in non-interactive chat operation. Use this only for trusted personal workspaces.
-
-True incremental Antigravity streaming (`stream-json`) is not implemented. `runStream` emits the final response once.
 
 ### Local LLM (when `AGENT_BACKEND=local-llm`)
 
@@ -1326,7 +1326,7 @@ True incremental Antigravity streaming (`stream-json`) is not implemented. `runS
 ### Slack
 
 | Variable                           | Description                                                                                                |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------- |
 | `SLACK_BOT_TOKEN`                  | Slack Bot Token (xoxb-...)                                                                                 |
 | `SLACK_APP_TOKEN`                  | Slack App Token (xapp-...)                                                                                 |
 | `SLACK_ALLOWED_USER`               | Allowed user ID                                                                                            |

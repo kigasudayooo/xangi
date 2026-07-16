@@ -116,7 +116,7 @@ describe('AntigravityRunner', () => {
 
     expect(command).toBe('agy');
     expect(args).toContain('--dangerously-skip-permissions');
-    expect(args[args.indexOf('--print-timeout') + 1]).toBe('5m');
+    expect(args[args.indexOf('--print-timeout') + 1]).toBe('1800s');
     expect(args).toContain('-p');
     expect(args[args.indexOf('--output-format') + 1]).toBe('json');
   });
@@ -127,6 +127,13 @@ describe('AntigravityRunner', () => {
     const { args } = await getSpawnArgs(runner, 'run');
 
     expect(args[args.indexOf('--print-timeout') + 1]).toBe('30s');
+  });
+
+  it('matches the Agy print timeout to the runner timeout by default', async () => {
+    const runner = new AntigravityRunner({ timeoutMs: 90_000 });
+    const { args } = await getSpawnArgs(runner, 'run');
+
+    expect(args[args.indexOf('--print-timeout') + 1]).toBe('90s');
   });
 
   it('includes model, cwd, add-dir, and conversation args', async () => {
@@ -390,18 +397,249 @@ describe('AntigravityRunner', () => {
     expect(spawn).toHaveBeenCalledTimes(1);
   });
 
-  it('runStream emits the final result once without stream-json', async () => {
+  it('streams Agy 1.1.3 text deltas, tool starts, and the conversation id', async () => {
+    const { spawn } = await import('child_process');
     const runner = new AntigravityRunner({});
     const onText = vi.fn();
+    const onToolUse = vi.fn();
+    const onBackendReady = vi.fn();
     const onComplete = vi.fn();
-    const promise = runner.runStream('hello', { onText, onComplete });
+    const promise = runner.runStream('hello', {
+      onText,
+      onToolUse,
+      onBackendReady,
+      onComplete,
+    });
     const mockProcess = await waitForProcess();
-    mockProcess.stdout.emit('data', Buffer.from(success('stream final', 'conv-stream')));
+
+    const events = [
+      { event: 'init', conversation_id: 'conv-stream', init: {} },
+      {
+        event: 'step_update',
+        step_update: {
+          conversation_id: 'conv-stream',
+          step_index: 3,
+          state: 'ACTIVE',
+          step_type: 'tool',
+          tool_name: 'list_dir',
+          tool_info: { name: 'list_dir', parameters: { DirectoryPath: '.' } },
+        },
+      },
+      {
+        event: 'step_update',
+        step_update: {
+          conversation_id: 'conv-stream',
+          step_index: 3,
+          state: 'DONE',
+          step_type: 'tool',
+          tool_name: 'list_dir',
+          tool_info: { name: 'list_dir', parameters: { DirectoryPath: '.' }, output: 'files' },
+        },
+      },
+      {
+        event: 'step_update',
+        step_update: {
+          conversation_id: 'conv-stream',
+          step_index: 4,
+          state: 'ACTIVE',
+          step_type: 'agent_response',
+          text_delta: '水田',
+        },
+      },
+      {
+        event: 'step_update',
+        step_update: {
+          conversation_id: 'conv-stream',
+          step_index: 4,
+          state: 'DONE',
+          step_type: 'agent_response',
+          text_delta: 'チェック\n',
+        },
+      },
+      {
+        event: 'result',
+        result: {
+          conversation_id: 'conv-stream',
+          status: 'SUCCESS',
+          response: '水田チェック\n',
+        },
+      },
+    ];
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(`${events.map((event) => JSON.stringify(event)).join('\n')}\n`)
+    );
     mockProcess.emit('close', 0);
 
-    await expect(promise).resolves.toEqual({ result: 'stream final', sessionId: 'conv-stream' });
-    expect(onText).toHaveBeenCalledTimes(1);
-    expect(onText).toHaveBeenCalledWith('stream final', 'stream final');
+    await expect(promise).resolves.toEqual({ result: '水田チェック\n', sessionId: 'conv-stream' });
+    expect((spawn as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('stream-json');
+    expect(onBackendReady).toHaveBeenCalledTimes(1);
+    expect(onToolUse).toHaveBeenCalledTimes(1);
+    expect(onToolUse).toHaveBeenCalledWith('list_dir', { DirectoryPath: '.' });
+    expect(onText.mock.calls).toEqual([
+      ['水田', '水田'],
+      ['チェック\n', '水田チェック\n'],
+    ]);
     expect(onComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a tool error non-fatal when Agy later returns an answer', async () => {
+    const runner = new AntigravityRunner({});
+    const promise = runner.runStream('hello', {});
+    const mockProcess = await waitForProcess();
+    const events = [
+      { event: 'init', conversation_id: 'conv-tool', init: {} },
+      {
+        event: 'step_update',
+        step_update: {
+          conversation_id: 'conv-tool',
+          step_index: 2,
+          state: 'ERROR',
+          step_type: 'tool',
+          tool_name: 'run_command',
+          tool_info: { error: { type: 'TOOL_ERROR', message: 'permission denied' } },
+        },
+      },
+      {
+        event: 'result',
+        result: { conversation_id: 'conv-tool', status: 'SUCCESS', response: 'recovered' },
+      },
+    ];
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(`${events.map((event) => JSON.stringify(event)).join('\n')}\n`)
+    );
+    mockProcess.emit('close', 0);
+
+    await expect(promise).resolves.toEqual({ result: 'recovered', sessionId: 'conv-tool' });
+  });
+
+  it('uses the tool error when SUCCESS has no response', async () => {
+    const runner = new AntigravityRunner({});
+    const onError = vi.fn();
+    const promise = runner.runStream('hello', { onError });
+    const mockProcess = await waitForProcess();
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        `${JSON.stringify({
+          event: 'step_update',
+          step_update: {
+            conversation_id: 'conv-tool',
+            step_index: 2,
+            state: 'ERROR',
+            step_type: 'tool',
+            tool_name: 'run_command',
+            tool_info: { error: { message: 'permission denied' } },
+          },
+        })}\n${JSON.stringify({
+          event: 'result',
+          result: { conversation_id: 'conv-tool', status: 'SUCCESS', response: '' },
+        })}\n`
+      )
+    );
+    mockProcess.emit('close', 0);
+
+    await expect(promise).rejects.toThrow('permission denied');
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a structured Agy 1.1.3 stream error once', async () => {
+    const runner = new AntigravityRunner({});
+    const onError = vi.fn();
+    const promise = runner.runStream('hello', { onError });
+    const mockProcess = await waitForProcess();
+    mockProcess.stdout.emit(
+      'data',
+      Buffer.from(
+        `${JSON.stringify({
+          event: 'result',
+          result: {
+            conversation_id: '',
+            status: 'ERROR',
+            response: '',
+            error: 'invalid model',
+          },
+        })}\n`
+      )
+    );
+    mockProcess.emit('close', 1);
+
+    await expect(promise).rejects.toThrow('invalid model');
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts Agy 1.1.2 plain output without re-running the prompt', async () => {
+    const { spawn } = await import('child_process');
+    const runner = new AntigravityRunner({});
+    const onText = vi.fn();
+    const promise = runner.runStream('hello', { onText });
+    const mockProcess = await waitForProcess();
+    mockProcess.stdout.emit('data', Buffer.from('legacy line 1\n\nlegacy line 2\n'));
+    mockProcess.emit('close', 0);
+
+    await expect(promise).resolves.toEqual({
+      result: 'legacy line 1\n\nlegacy line 2',
+      sessionId: '',
+    });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(onText).toHaveBeenCalledWith(
+      'legacy line 1\n\nlegacy line 2',
+      'legacy line 1\n\nlegacy line 2'
+    );
+  });
+
+  it('preserves an ordinary JSON answer returned as Agy 1.1.2 plain output', async () => {
+    const runner = new AntigravityRunner({});
+    const answer = '{"weather":"sunny","temperature":24}';
+    const promise = runner.runStream('return JSON', {});
+    const mockProcess = await waitForProcess();
+    mockProcess.stdout.emit('data', Buffer.from(`${answer}\n`));
+    mockProcess.emit('close', 0);
+
+    await expect(promise).resolves.toEqual({ result: answer, sessionId: '' });
+  });
+
+  it('caches plain stream capability and uses final JSON on the next stream call', async () => {
+    const { spawn } = await import('child_process');
+    const runner = new AntigravityRunner({});
+
+    let promise = runner.runStream('first', {});
+    let mockProcess = await waitForProcess();
+    mockProcess.stdout.emit('data', Buffer.from('first legacy answer'));
+    mockProcess.emit('close', 0);
+    await promise;
+
+    promise = runner.runStream('second', {});
+    mockProcess = await waitForProcess(2);
+    mockProcess.stdout.emit('data', Buffer.from(success('second JSON answer', 'conv-2')));
+    mockProcess.emit('close', 0);
+    await expect(promise).resolves.toEqual({ result: 'second JSON answer', sessionId: 'conv-2' });
+
+    const calls = (spawn as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls[0][1][calls[0][1].indexOf('--output-format') + 1]).toBe('stream-json');
+    expect(calls[1][1][calls[1][1].indexOf('--output-format') + 1]).toBe('json');
+  });
+
+  it('falls back once when an older Agy rejects stream output-format', async () => {
+    const { spawn } = await import('child_process');
+    const runner = new AntigravityRunner({});
+    const promise = runner.runStream('hello', {});
+    const streamProcess = await waitForProcess();
+    streamProcess.stderr.emit(
+      'data',
+      Buffer.from('flags provided but not defined: -output-format')
+    );
+    streamProcess.emit('close', 2);
+
+    const legacyProcess = await waitForProcess(2);
+    legacyProcess.stdout.emit('data', Buffer.from('old Agy answer'));
+    legacyProcess.emit('close', 0);
+
+    await expect(promise).resolves.toEqual({ result: 'old Agy answer', sessionId: '' });
+    expect(spawn).toHaveBeenCalledTimes(2);
+    const calls = (spawn as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls[0][1]).toContain('--output-format');
+    expect(calls[1][1]).not.toContain('--output-format');
   });
 });

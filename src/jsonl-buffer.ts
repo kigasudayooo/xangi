@@ -4,7 +4,7 @@ export function appendJsonlChunk(
 ): { lines: string[]; buffer: string } {
   const parts = `${buffer}${chunk}`.split('\n');
   return {
-    lines: parts.slice(0, -1).filter((line) => line.trim()),
+    lines: parts.slice(0, -1),
     buffer: parts[parts.length - 1] ?? '',
   };
 }

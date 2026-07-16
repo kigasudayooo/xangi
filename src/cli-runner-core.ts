@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import { spawn, ChildProcess } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import type {
   AgentRunner,
   RunOptions,
@@ -26,7 +27,10 @@ export interface CliStreamParser {
    * 即 reject する。flush 中に返した Error は無視される。
    * パーサ側からは callbacks.onError を直接呼ばないこと（二重通知になる）。
    */
-  handleEvent(json: unknown, phase: 'stream' | 'flush'): Error | undefined | void;
+  /** false を返すと、その行を handleRawLine に渡す */
+  handleEvent(json: unknown, phase: 'stream' | 'flush'): Error | false | undefined | void;
+  /** JSON ではない行を扱う必要があるランナー向け（旧 CLI のプレーン出力など） */
+  handleRawLine?(line: string, phase: 'stream' | 'flush'): void;
   /** 正常終了時の結果テキストとセッション ID を返す */
   finalize(): { result: string; sessionId: string };
   /** exit code != 0 のとき、エラーメッセージに添える詳細（CLI の error イベント本文など） */
@@ -237,6 +241,8 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
       let buffer = '';
       let stderr = '';
       let fatalError: Error | null = null;
+      const stdoutDecoder = new StringDecoder('utf8');
+      const stderrDecoder = new StringDecoder('utf8');
 
       const notifyError = (error: Error) => {
         if (opts.notifyOnError !== false) {
@@ -255,9 +261,14 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
         try {
           json = JSON.parse(line);
         } catch {
-          return; // JSONパースエラーは無視
+          parser.handleRawLine?.(line, phase);
+          return;
         }
         const result = parser.handleEvent(json, phase);
+        if (result === false) {
+          parser.handleRawLine?.(line, phase);
+          return;
+        }
         if (result instanceof Error && phase === 'stream') {
           fatalError = result;
           notifyError(result);
@@ -266,7 +277,8 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
       };
 
       proc.stdout?.on('data', (data) => {
-        const parsed = appendJsonlChunk(buffer, data.toString());
+        const chunk = typeof data === 'string' ? data : stdoutDecoder.write(data);
+        const parsed = appendJsonlChunk(buffer, chunk);
         buffer = parsed.buffer;
         for (const line of parsed.lines) {
           processLine(line, 'stream');
@@ -274,13 +286,23 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
       });
 
       proc.stderr?.on('data', (data) => {
-        const chunk = data.toString();
+        const chunk = typeof data === 'string' ? data : stderrDecoder.write(data);
         stderr += chunk;
         console.error(`[${this.logPrefix}] stderr:`, chunk);
       });
 
       proc.on('close', (code) => {
         this.finishProcess(proc, opts.channelId, fallbackTimer, code === 0 ? 'completed' : 'error');
+
+        const stdoutTail = stdoutDecoder.end();
+        if (stdoutTail) {
+          const parsed = appendJsonlChunk(buffer, stdoutTail);
+          buffer = parsed.buffer;
+          for (const line of parsed.lines) {
+            processLine(line, 'flush');
+          }
+        }
+        stderr += stderrDecoder.end();
 
         // 残りのバッファを処理
         for (const line of flushJsonlBuffer(buffer)) {
@@ -296,7 +318,16 @@ export abstract class CliRunnerBase extends EventEmitter implements AgentRunner 
           return;
         }
 
-        const { result, sessionId } = parser.finalize();
+        let result: string;
+        let sessionId: string;
+        try {
+          ({ result, sessionId } = parser.finalize());
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          notifyError(err);
+          reject(err);
+          return;
+        }
         const runResult: RunResult = { result, sessionId };
         opts.onComplete?.(runResult);
         callbacks.onComplete?.(runResult);
