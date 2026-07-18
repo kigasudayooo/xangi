@@ -216,6 +216,8 @@ xangi を使ったAIアシスタント構築のノウハウをまとめた書籍
 - [Slack セットアップ](docs/slack-setup.md) - Slack連携
 - [Telegram セットアップ](docs/telegram-setup.md) - Telegram Bot連携
 - [LINE セットアップ](docs/line-setup.md) - LINE Messaging API 連携 (Tailscale Funnel での外部公開含む)
+- [Google Workspace セットアップ](docs/google-workspace-setup.md) - カレンダー / Drive / Docs / Gmail 連携の OAuth 設定
+- [N100 セットアップ](docs/n100-setup.md) - N100 ミニPC (Ubuntu Server, CPU only) でのローカルLLM運用手順
 - [設計ドキュメント](docs/design.md) - アーキテクチャ・設計思想・データフロー
 - [外部イベントストリーム](docs/events.md) - 応答ライフサイクルのイベント配信仕様
 - [インスタンス間チャット](docs/inter-instance-chat.md) - 複数インスタンス間のメッセージ交換・auto-talk

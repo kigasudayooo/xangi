@@ -506,6 +506,238 @@ const slackDeleteHandler: ToolHandler = {
   },
 };
 
+// ─── Google Workspace Tools ─────────────────────────────────────────
+// 1〜4Bの小型ローカルLLMが呼ぶ前提のため parameters はフラット・最小限。
+// 安全ポリシー: 削除はユーザーの明示指示時のみ / gmail_draft は下書き作成のみ（送信しない）。
+
+const gcalListEventsHandler: ToolHandler = {
+  name: 'gcal_list_events',
+  description:
+    'Googleカレンダーの予定を一覧取得する。例: gcal_list_events() で今後の予定を取得。max_resultsで件数指定（既定10）。',
+  parameters: {
+    type: 'object',
+    properties: {
+      max_results: { type: 'string', description: '取得件数（既定10、最大50）' },
+    },
+  },
+  async execute(args): Promise<ToolResult> {
+    const flags: Record<string, string> = {};
+    if (args.max_results) flags['max-results'] = String(args.max_results);
+    return runXangiCmd(['google_calendar_list', ...flagsToArgs(flags)]);
+  },
+};
+
+const gcalCreateEventHandler: ToolHandler = {
+  name: 'gcal_create_event',
+  description:
+    'Googleカレンダーに予定を作成する。例: gcal_create_event(title="会議", start="2026-07-20T15:00:00+09:00")。end省略時は開始から60分。',
+  parameters: {
+    type: 'object',
+    properties: {
+      title: { type: 'string', description: '予定のタイトル' },
+      start: { type: 'string', description: '開始日時（ISO8601、例: 2026-07-20T15:00:00+09:00）' },
+      end: { type: 'string', description: '終了日時（ISO8601、省略時は開始+60分）' },
+      description: { type: 'string', description: '予定の詳細（任意）' },
+    },
+    required: ['title', 'start'],
+  },
+  async execute(args): Promise<ToolResult> {
+    const flags: Record<string, string> = {
+      summary: String(args.title),
+      start: String(args.start),
+    };
+    if (args.end) flags.end = String(args.end);
+    if (args.description) flags.description = String(args.description);
+    return runXangiCmd(['google_calendar_create', ...flagsToArgs(flags)]);
+  },
+};
+
+const gcalUpdateEventHandler: ToolHandler = {
+  name: 'gcal_update_event',
+  description:
+    'Googleカレンダーの予定を更新する。event_idは必須。変更したい項目（title/start/end/description）だけ渡す。',
+  parameters: {
+    type: 'object',
+    properties: {
+      event_id: { type: 'string', description: '予定のID（gcal_list_eventsで確認）' },
+      title: { type: 'string', description: '新しいタイトル（任意）' },
+      start: { type: 'string', description: '新しい開始日時 ISO8601（任意）' },
+      end: { type: 'string', description: '新しい終了日時 ISO8601（任意）' },
+      description: { type: 'string', description: '新しい詳細（任意）' },
+    },
+    required: ['event_id'],
+  },
+  async execute(args): Promise<ToolResult> {
+    const flags: Record<string, string> = { 'event-id': String(args.event_id) };
+    if (args.title) flags.summary = String(args.title);
+    if (args.start) flags.start = String(args.start);
+    if (args.end) flags.end = String(args.end);
+    if (args.description) flags.description = String(args.description);
+    return runXangiCmd(['google_calendar_update', ...flagsToArgs(flags)]);
+  },
+};
+
+const gcalDeleteEventHandler: ToolHandler = {
+  name: 'gcal_delete_event',
+  description:
+    'Googleカレンダーの予定を削除する。安全ポリシー: 削除はユーザーが明示的に依頼したときのみ実行すること。event_idは必須。',
+  parameters: {
+    type: 'object',
+    properties: {
+      event_id: { type: 'string', description: '削除する予定のID' },
+    },
+    required: ['event_id'],
+  },
+  async execute(args): Promise<ToolResult> {
+    return runXangiCmd(['google_calendar_delete', '--event-id', String(args.event_id)]);
+  },
+};
+
+const gdriveSearchHandler: ToolHandler = {
+  name: 'gdrive_search',
+  description:
+    'Google Driveのファイルを検索する。例: gdrive_search(name="議事録") でファイル名検索、gdrive_search(fulltext="予算") で全文検索。最大10件。',
+  parameters: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'ファイル名に含まれる語（任意）' },
+      fulltext: { type: 'string', description: '本文に含まれる語（任意）' },
+    },
+  },
+  async execute(args): Promise<ToolResult> {
+    const flags: Record<string, string> = {};
+    if (args.name) flags.name = String(args.name);
+    if (args.fulltext) flags.fulltext = String(args.fulltext);
+    return runXangiCmd(['google_drive_search', ...flagsToArgs(flags)]);
+  },
+};
+
+const gdriveReadHandler: ToolHandler = {
+  name: 'gdrive_read',
+  description:
+    'Google Driveのファイル内容を取得する。file_idはgdrive_searchで確認。Google Docsやテキスト系のみ対応（バイナリは取得不可）。',
+  parameters: {
+    type: 'object',
+    properties: {
+      file_id: { type: 'string', description: '読み取るファイルのID' },
+    },
+    required: ['file_id'],
+  },
+  async execute(args): Promise<ToolResult> {
+    return runXangiCmd(['google_drive_read', '--file-id', String(args.file_id)]);
+  },
+};
+
+const gdocsCreateHandler: ToolHandler = {
+  name: 'gdocs_create',
+  description:
+    'Google Docsのドキュメントを新規作成する。例: gdocs_create(title="メモ", body="本文")。作成後の編集URLを返す。',
+  parameters: {
+    type: 'object',
+    properties: {
+      title: { type: 'string', description: 'ドキュメントのタイトル' },
+      body: { type: 'string', description: '初期本文（任意）' },
+    },
+    required: ['title'],
+  },
+  async execute(args): Promise<ToolResult> {
+    const flags: Record<string, string> = { title: String(args.title) };
+    if (args.body) flags.body = String(args.body);
+    return runXangiCmd(['google_docs_create', ...flagsToArgs(flags)]);
+  },
+};
+
+const gdocsReadHandler: ToolHandler = {
+  name: 'gdocs_read',
+  description:
+    'Google Docsのドキュメント本文を読み取る。document_idはURL（.../document/d/ID/edit）のID部分。',
+  parameters: {
+    type: 'object',
+    properties: {
+      document_id: { type: 'string', description: 'ドキュメントのID' },
+    },
+    required: ['document_id'],
+  },
+  async execute(args): Promise<ToolResult> {
+    return runXangiCmd(['google_docs_read', '--document-id', String(args.document_id)]);
+  },
+};
+
+const gdocsAppendHandler: ToolHandler = {
+  name: 'gdocs_append',
+  description:
+    'Google Docsのドキュメント末尾にテキストを追記する。例: gdocs_append(document_id="...", text="追記内容")。',
+  parameters: {
+    type: 'object',
+    properties: {
+      document_id: { type: 'string', description: 'ドキュメントのID' },
+      text: { type: 'string', description: '追記するテキスト' },
+    },
+    required: ['document_id', 'text'],
+  },
+  async execute(args): Promise<ToolResult> {
+    return runXangiCmd([
+      'google_docs_append',
+      '--document-id',
+      String(args.document_id),
+      '--text',
+      String(args.text),
+    ]);
+  },
+};
+
+const gmailSearchHandler: ToolHandler = {
+  name: 'gmail_search',
+  description:
+    'Gmailのメールを検索する。例: gmail_search(query="from:boss@example.com 予算")。Gmail検索構文が使える。最大10件。',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Gmail検索クエリ（例: "from:xxx is:unread"）' },
+    },
+    required: ['query'],
+  },
+  async execute(args): Promise<ToolResult> {
+    return runXangiCmd(['google_gmail_search', '--query', String(args.query)]);
+  },
+};
+
+const gmailReadHandler: ToolHandler = {
+  name: 'gmail_read',
+  description: 'Gmailの1通のメール本文を読み取る。message_idはgmail_searchの結果に含まれるID。',
+  parameters: {
+    type: 'object',
+    properties: {
+      message_id: { type: 'string', description: '読み取るメールのID' },
+    },
+    required: ['message_id'],
+  },
+  async execute(args): Promise<ToolResult> {
+    return runXangiCmd(['google_gmail_read', '--message-id', String(args.message_id)]);
+  },
+};
+
+const gmailDraftHandler: ToolHandler = {
+  name: 'gmail_draft',
+  description:
+    'Gmailの下書きを作成する。安全ポリシー: これは下書き作成のみで、メールの送信は絶対に行わない（送信APIは存在しない）。例: gmail_draft(to="a@example.com", subject="件名", body="本文")。',
+  parameters: {
+    type: 'object',
+    properties: {
+      to: { type: 'string', description: '宛先メールアドレス' },
+      subject: { type: 'string', description: '件名（任意）' },
+      body: { type: 'string', description: '本文（任意）' },
+    },
+    required: ['to'],
+  },
+  async execute(args): Promise<ToolResult> {
+    const flags: Record<string, string> = { to: String(args.to) };
+    if (args.subject) flags.subject = String(args.subject);
+    if (args.body) flags.body = String(args.body);
+    return runXangiCmd(['google_gmail_draft', ...flagsToArgs(flags)]);
+  },
+};
+
 // ─── Export ─────────────────────────────────────────────────────────
 
 /** Discord接続時に追加するツール */
@@ -539,6 +771,24 @@ export function getSlackTools(): ToolHandler[] {
   ];
 }
 
+/** Google Workspace 関連ツール（プラットフォーム非依存、deferred で提供） */
+export function getGoogleTools(): ToolHandler[] {
+  return [
+    gcalListEventsHandler,
+    gcalCreateEventHandler,
+    gcalUpdateEventHandler,
+    gcalDeleteEventHandler,
+    gdriveSearchHandler,
+    gdriveReadHandler,
+    gdocsCreateHandler,
+    gdocsReadHandler,
+    gdocsAppendHandler,
+    gmailSearchHandler,
+    gmailReadHandler,
+    gmailDraftHandler,
+  ];
+}
+
 /** スケジュール関連ツール */
 export function getScheduleTools(platform?: ChatPlatform): ToolHandler[] {
   return [
@@ -565,6 +815,7 @@ export function getAllXangiTools(): ToolHandler[] {
     ...getDiscordTools(),
     ...getSlackTools(),
     webHistoryHandler,
+    ...getGoogleTools(),
     ...getScheduleTools(),
     ...getSystemTools(),
   ];
@@ -572,7 +823,7 @@ export function getAllXangiTools(): ToolHandler[] {
 
 /** 実行プラットフォームに応じたxangiツール */
 export function getXangiTools(platform?: ChatPlatform): ToolHandler[] {
-  const commonTools = [...getScheduleTools(platform), ...getSystemTools()];
+  const commonTools = [...getGoogleTools(), ...getScheduleTools(platform), ...getSystemTools()];
 
   if (platform === 'web') {
     return [...getWebTools(), ...commonTools];

@@ -10,6 +10,7 @@ import { getSafeEnv } from '../safe-env.js';
 import { getGitHubEnv } from '../github-auth.js';
 import { loadSkills, type Skill } from '../skills.js';
 import { resolveAttachmentPath } from '../file-utils.js';
+import { webSearchToolHandler } from './web-search.js';
 
 // child_process を遅延ロード（テストのvi.mockとの衝突を避けるため）
 async function shellExec(
@@ -743,6 +744,7 @@ const ALL_TOOLS: ToolHandler[] = [
   grepToolHandler,
   sendFileToolHandler,
   webFetchToolHandler,
+  webSearchToolHandler,
   toolSearchToolHandler,
 ];
 
