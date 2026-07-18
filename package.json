@@ -50,6 +50,7 @@
     "grammy": "^1.31.0",
     "node-cron": "^4.6.0",
     "proper-lockfile": "^4.1.2",
+    "undici": "6.27.0",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
@@ -71,8 +72,5 @@
   },
   "engines": {
     "node": ">=22.0.0"
-  },
-  "overrides": {
-    "undici": "6.27.0"
   }
 }
