@@ -1,7 +1,12 @@
 /**
  * OpenAI互換 + Ollama ネイティブAPI 対応 LLMクライアント
  */
+import { Agent } from 'undici';
 import type { LLMMessage, LLMToolCall, LLMChatOptions, LLMChatResponse } from './types.js';
+
+// 低速ローカルLLM（N100等）では応答開始までに undici 既定の headersTimeout/bodyTimeout（各300秒）を
+// 超えることがあるため、この dispatcher で無効化する。全体の打ち切りは既存の AbortController が担う。
+const llmDispatcher = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
 
 /**
  * OpenAI 形式 (chat completions / streaming 共通) の tools / tool_choice を
@@ -220,7 +225,8 @@ export class LLMClient {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
         signal: controller.signal,
-      });
+        dispatcher: llmDispatcher,
+      } as RequestInit);
     } finally {
       clearTimeout(timeoutId);
     }
@@ -302,7 +308,8 @@ export class LLMClient {
         headers,
         body: JSON.stringify(body),
         signal: controller.signal,
-      });
+        dispatcher: llmDispatcher,
+      } as RequestInit);
     } finally {
       clearTimeout(timeoutId);
     }
@@ -388,7 +395,8 @@ export class LLMClient {
       headers,
       body: JSON.stringify(body),
       signal: options?.signal,
-    });
+      dispatcher: llmDispatcher,
+    } as RequestInit);
 
     if (!response.ok) {
       throw new Error(`LLM API error ${response.status}: ${await response.text()}`);
@@ -480,7 +488,8 @@ export class LLMClient {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
+      dispatcher: llmDispatcher,
+    } as RequestInit);
 
     if (!response.ok) {
       throw new Error(`Ollama API error ${response.status}: ${await response.text()}`);
