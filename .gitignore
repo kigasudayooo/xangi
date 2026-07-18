@@ -31,3 +31,7 @@ models/
 
 # Local dev overrides (Compose 標準, per-developer)
 docker-compose.override.yml
+
+# ワークスペース方針ドキュメントは workspace/* の除外対象から明示的に除く
+!workspace/AGENTS.md
+!workspace/CLAUDE.md

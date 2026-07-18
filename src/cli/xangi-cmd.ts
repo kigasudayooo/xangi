@@ -24,6 +24,18 @@
  *   node xangi-cmd.js slack_search --channel <id> --keyword <text> [--count <n>]
  *   node xangi-cmd.js slack_edit --channel <id> --message-ts <ts> --content <text>
  *   node xangi-cmd.js slack_delete --channel <id> --message-ts <ts>
+ *   node xangi-cmd.js google_calendar_list [--time-min <ISO>] [--time-max <ISO>] [--max-results <n>]
+ *   node xangi-cmd.js google_calendar_create --summary <text> --start <ISO> [--end <ISO>] [--description <text>]
+ *   node xangi-cmd.js google_calendar_update --event-id <id> [--summary <text>] [--start <ISO>] [--end <ISO>] [--description <text>]
+ *   node xangi-cmd.js google_calendar_delete --event-id <id>
+ *   node xangi-cmd.js google_drive_search [--name <text>] [--fulltext <text>] [--mime-type <type>]
+ *   node xangi-cmd.js google_drive_read --file-id <id>
+ *   node xangi-cmd.js google_docs_create --title <text> [--body <text>]
+ *   node xangi-cmd.js google_docs_read --document-id <id>
+ *   node xangi-cmd.js google_docs_append --document-id <id> --text <text>
+ *   node xangi-cmd.js google_gmail_search --query <gmail query>
+ *   node xangi-cmd.js google_gmail_read --message-id <id>
+ *   node xangi-cmd.js google_gmail_draft --to <addr> [--subject <text>] [--body <text>]
  *   node xangi-cmd.js web_history [--count <n>] [--previous]
  *   node xangi-cmd.js schedule_list
  *   node xangi-cmd.js schedule_add --input <text> --channel <id> --platform <discord|slack>
@@ -40,6 +52,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { discordApi } from './discord-api.js';
 import { slackApi } from './slack-api.js';
+import { googleApi } from './google-api.js';
 import { scheduleCmd } from './schedule-cmd.js';
 import { systemCmd } from './system-cmd.js';
 import { interChatCmd } from './inter-chat-cmd.js';
@@ -157,6 +170,20 @@ Slack操作:
   slack_edit         メッセージ編集
   slack_delete       メッセージ削除
 
+Google Workspace操作:
+  google_calendar_list     予定一覧
+  google_calendar_create   予定作成
+  google_calendar_update   予定更新
+  google_calendar_delete   予定削除（明示指示時のみ）
+  google_drive_search      ファイル検索
+  google_drive_read        ファイル内容取得
+  google_docs_create       ドキュメント新規作成
+  google_docs_read         ドキュメント読み取り
+  google_docs_append       ドキュメント末尾追記
+  google_gmail_search      メール検索
+  google_gmail_read        メール読み取り
+  google_gmail_draft       メール下書き作成（送信はしない）
+
 Web Chat操作:
   web_history       Web Chat の現セッション履歴取得
 
@@ -191,6 +218,8 @@ Web Chat操作:
       result = slackHistoryCmd(flags);
     } else if (command.startsWith('slack_')) {
       result = await slackApi(command, flags);
+    } else if (command.startsWith('google_')) {
+      result = await googleApi(command, flags);
     } else if (command.startsWith('schedule_')) {
       result = await scheduleCmd(command, flags);
     } else if (command === 'media_send') {
