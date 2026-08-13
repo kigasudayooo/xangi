@@ -113,7 +113,7 @@ podman run -d --name searxng `
   searxng/searxng
 ```
 
-生成された `settings.yml` に以下を追記し、JSON APIを有効化する（`web_search`ツール利用に必須）。Googleエンジンはブロック（CAPTCHA）が発生しやすいため無効化しておく。
+生成された `settings.yml` に以下を追記し、JSON APIを有効化する（`web_search`ツール利用に必須）。Google・Brave・Startpage・Wikidataはブロック（CAPTCHA・レート制限・初期化失敗）が頻発するため無効化しておく。
 
 ```yaml
 search:
@@ -128,7 +128,18 @@ engines:
     disabled: false
   - name: duckduckgo
     disabled: false
+  # brave: レート制限(Too many request)が頻発するため無効化
+  - name: brave
+    disabled: true
+  # startpage: CAPTCHAリダイレクトが頻発するため無効化
+  - name: startpage
+    disabled: true
+  # wikidata: エンジン初期化に失敗しログを汚すため無効化（wikipediaは維持）
+  - name: wikidata
+    disabled: true
 ```
+
+> ⚠️ **不安定なエンジンを無効化しないと何が起きるか**: `brave`/`startpage`がブロックされた状態で運用すると、`web_search`ツールの呼び出しが約半分の頻度で失敗する。AIはその都度クエリを変えてリトライするため、1つの調査タスクで検索呼び出しが十数回に膨らみ、コンテキストが急速に肥大化して応答が極端に遅くなる（実測: 1タスクで`llama-server`のメモリが11GB→22.59GBまで増加し、システム空きRAMが枯渇）。「複雑な調査で途中で止まる」ような症状が出た場合は、まず`podman logs searxng`で `SearxEngineTooManyRequestsException` / `SearxEngineCaptchaException` が出ていないか確認すること。
 
 設定変更後はコンテナを再起動する。
 
@@ -185,3 +196,5 @@ npm start
 | VRAM不足でモデルロードに失敗 | `--cpu-moe` を付けているか確認。それでも足りない場合は `-ngl` を下げてより多くの層をCPU側に逃がす |
 | 応答はあるが文脈を全く覚えていない | 起動ログの `historyTokens` がマイナスになっていないか確認。`LOCAL_LLM_NUM_CTX` と `-c` を上げる |
 | `web_search` が使えない | `SEARXNG_BASE_URL` のポートが `llama-server` と衝突していないか、`settings.yml` の `formats` に `json` があるか確認 |
+| 複雑な調査タスクの途中で応答が極端に遅くなる・止まる | `podman logs searxng` で検索エンジンのレート制限/CAPTCHAエラーが出ていないか確認（→上記のエンジン無効化）。あわせて空きRAMも確認し、逼迫していれば `llama-server` を再起動してメモリを解放する |
+| `[xangi] Failed to acquire dataDir lock` / `Another xangi process is using the same dataDir` | 前回の起動プロセスが完全に終了していない（`Stop-Process -Force` で親プロセスのみ止め子プロセスが孤児化した場合など）。`Get-CimInstance Win32_Process -Filter "Name='node.exe'"` で `CommandLine` を確認し、`dist/index.js` を含む全プロセスを停止してから再起動する |
