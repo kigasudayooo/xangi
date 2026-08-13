@@ -59,13 +59,27 @@ VRAMに収まらない大型MoEモデルは、`--cpu-moe`（または `-ncmoe N`
 
 ```powershell
 cd C:\path\to\tools\llama.cpp
-.\llama-server.exe -m models\<model>.gguf --host 127.0.0.1 --port 8080 -c 32000 -ngl 999 --cpu-moe
+.\llama-server.exe -m models\<model>.gguf --host 127.0.0.1 --port 8080 -c 48000 -ngl 999 --cpu-moe -ctk q8_0 -ctv q8_0 --parallel 1
 ```
 
 - `-ngl 999`: 可能な限りの層をGPUへ（`--cpu-moe`併用時はMoE以外の層が対象）
 - `--cpu-moe`: MoEのexpert重みを常にCPU側に保持
 - `-c`: コンテキストサイズ。xangi側の `LOCAL_LLM_NUM_CTX` と必ず一致させる（後述）
+- `-ctk q8_0 -ctv q8_0`: KVキャッシュを8bit量子化。RAMが厳しい環境でコンテキストを伸ばすのに効果が大きい（後述）
+- `--parallel 1`（`-np 1`）: 同時スロット数をデフォルト（4、または自動）から1に絞り、余分なKVキャッシュ予約を削る。家族等で同時に複数人がリクエストを送る想定がある場合は2〜3に増やす（その分メモリ消費は倍増する）
 - 起動ログに `model loaded` / `listening on http://127.0.0.1:8080` が出れば成功。ウィンドウは起動したままにする
+
+### RAM逼迫時はKVキャッシュ量子化 + スロット数削減
+
+VRAM 6GB級のGPUで30B級MoEモデルを`--cpu-moe`運用すると、KVキャッシュも含めてRAMの消費が支配的になる。デフォルト設定（KVキャッシュ非量子化、`--parallel`自動＝複数スロット）のままコンテキストを伸ばすと、システムの空きRAMが数百MB単位まで枯渇することがある（実測: `-c 32000`・量子化なし・4スロットで空きRAM 0.7GB、実運用に耐えない水準）。
+
+`-ctk q8_0 -ctv q8_0 --parallel 1` を付けると、同じ`-c 48000`でも実推論後の空きRAMが10GB以上確保できた（実測）。コンテキストサイズを上げる前に、まずこの2つのフラグを検討すること。
+
+起動後は必ずWindowsの空きメモリを確認し、余裕があるか確かめる。
+
+```powershell
+Get-CimInstance Win32_OperatingSystem | ForEach-Object { "{0:N2} GB free / {1:N2} GB total" -f ($_.FreePhysicalMemory/1MB), ($_.TotalVisibleMemorySize/1MB) }
+```
 
 ### コンテキストサイズの落とし穴
 
@@ -136,7 +150,7 @@ Invoke-WebRequest -Uri "http://localhost:8090/search?q=test&format=json" -UseBas
 AGENT_BACKEND=local-llm
 LOCAL_LLM_BASE_URL=http://localhost:8080
 LOCAL_LLM_MODEL=<任意の識別用文字列>   # llama-serverは起動時ロード済みモデルを使うため実際のモデル名と一致していなくてよい
-LOCAL_LLM_NUM_CTX=32000                # llama-server起動時の -c と揃える
+LOCAL_LLM_NUM_CTX=48000                # llama-server起動時の -c と揃える
 
 SEARXNG_BASE_URL=http://localhost:8090
 ```
@@ -154,7 +168,7 @@ podman start searxng
 
 # 2. llama-server
 cd C:\path\to\tools\llama.cpp
-.\llama-server.exe -m models\<model>.gguf --host 127.0.0.1 --port 8080 -c 32000 -ngl 999 --cpu-moe
+.\llama-server.exe -m models\<model>.gguf --host 127.0.0.1 --port 8080 -c 48000 -ngl 999 --cpu-moe -ctk q8_0 -ctv q8_0 --parallel 1
 
 # 3. xangi
 cd C:\path\to\xangi

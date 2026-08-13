@@ -20,6 +20,7 @@
 - [x] Web検索（SearXNG）セットアップ・ポート衝突回避（Podman、ポート8090、llama-server:8080と分離、JSON API動作確認済み）
 - [x] xangi起動・Discord動作確認（`おうちアシスタントbot` としてログイン成功）
 - [x] `LOCAL_LLM_NUM_CTX` を 8192→32000 に修正（historyTokensがマイナスだった問題を解消）
+- [x] `LOCAL_LLM_NUM_CTX` を 32000→48000 に再引き上げ。RAM逼迫（空き0.7GB）を`-ctk/-ctv q8_0`（KVキャッシュ量子化）+ `--parallel 1`で解消し、実推論後も空きRAM 11GB確保
 - [ ] 家族2人目のDiscordユーザーIDを取得し `DISCORD_ALLOWED_USER` に追加するか検討
       - 論点: 現状 `LOCAL_LLM_TOOLS=true` のため exec（コマンド実行）権限も両者に付与される
       - 現状は `*`（全員許可）のまま運用中。将来的に絞る場合は本タスクで対応
